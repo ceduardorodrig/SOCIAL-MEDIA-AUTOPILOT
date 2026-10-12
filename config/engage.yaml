@@ -1,0 +1,59 @@
+# Social Media Autopilot — engagement stage configuration
+#
+# This stage behaves like a person, not a bot: it runs on its own schedule
+# (separate from publishing), acts sporadically over time and never bursts.
+# All values are data; there is no secret here (only the NAME of the kill-switch
+# environment variable).
+#
+# Hard caps chosen conservatively for a public "curiosities" account:
+#   - a handful of replies a day (answers to people who talked to us);
+#   - likes ONLY on the posts we reply to (never a timeline sweep);
+#   - at most one follow a day and three a week (a person grows slowly).
+# There is deliberately no mass follow/unfollow, no mass likes and no auto-DM.
+
+# Truthy value ("1", "true", "yes", "on") stops the stage immediately.
+kill_switch_env: AUTOPILOT_ENGAGE_KILL_SWITCH
+
+# Separate execution windows (24h clock) — never the publishing windows.
+windows: ["09:30", "13:30", "20:30"]
+window_minutes: 45
+
+caps:
+  replies_per_day: 4
+  likes_per_day: 6
+  follows_per_day: 1
+  follows_per_week: 3
+  # Total writes (reply + like + follow) in a single run.
+  max_actions_per_run: 6
+
+pacing:
+  # A scheduled run sometimes does nothing at all (sporadic behaviour).
+  run_skip_probability: 0.35
+  delay_min_secs: 45
+  delay_max_secs: 240
+  # Follows are spaced much further apart than replies: never a burst.
+  follow_delay_min_secs: 600
+  follow_delay_max_secs: 1800
+
+interests:
+  # Curated accounts of interest in the Linux / FOSS / AI space. They are
+  # followed slowly (see the caps above), never all at once. Handles are
+  # resolved to DIDs only when a follow is actually planned.
+  accounts:
+    - "gnome.org"
+    - "mozilla.org"
+    - "rust-lang.org"
+    - "python.org"
+    - "golang.org"
+    - "opensource.org"
+    - "eff.org"
+    - "anthropic.com"
+    - "simonwillison.net"
+    - "swyx.io"
+
+# Notification reasons treated as "someone talked to us".
+notification_reasons: ["mention", "reply"]
+notification_limit: 50
+# How many of our own recent posts to scan for comments.
+own_posts_to_scan: 5
+thread_depth: 2

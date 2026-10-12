@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use autopilot_core::{Platform, ValidationIssue, load_dir, load_persona, now_unix};
+use autopilot_engage::{EngageOptions, EngageReport};
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{DEFAULT_SEARXNG_ENDPOINT, SearxngClient};
 use autopilot_learn::{
@@ -94,6 +95,11 @@ enum Command {
     Learn {
         #[command(subcommand)]
         command: LearnCommand,
+    },
+    /// Engagement — reply, like contextually and follow slowly, on its own schedule.
+    Engage {
+        #[command(subcommand)]
+        command: EngageCommand,
     },
 }
 
@@ -393,6 +399,39 @@ enum LearnCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum EngageCommand {
+    /// Run the engagement stage for one persona (separate from publishing).
+    Run(EngageRunArgs),
+    /// Print the local engagement state (what was already answered/liked/followed).
+    State {
+        #[arg(long, default_value = "var/engage/state.jsonl")]
+        state: PathBuf,
+    },
+}
+
+#[derive(Args)]
+struct EngageRunArgs {
+    /// Persona pack to engage as.
+    #[arg(long)]
+    persona: PathBuf,
+    /// Engagement configuration (caps, windows, pacing).
+    #[arg(long, default_value = "config/engage.yaml")]
+    config: PathBuf,
+    /// JSONL state under `var/` (gitignored) so nothing repeats.
+    #[arg(long, default_value = "var/engage/state.jsonl")]
+    state: PathBuf,
+    /// Provider registry used to draft replies.
+    #[arg(long, default_value = "config/providers.yaml")]
+    providers: PathBuf,
+    /// Offline fixture for `--dry-run` (notifications, threads, profiles).
+    #[arg(long)]
+    fixture: Option<PathBuf>,
+    /// Describe the plan with no network call and no write.
+    #[arg(long)]
+    dry_run: bool,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
@@ -423,6 +462,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Publish { command } => run_publish(command).await,
         Command::Metrics { command } => run_metrics(command).await,
         Command::Learn { command } => run_learn(command).await,
+        Command::Engage { command } => run_engage(command).await,
     }
 }
 
@@ -1102,4 +1142,82 @@ async fn run_learn(command: LearnCommand) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Run the engagement stage (`autopilot engage run`) or print its state.
+async fn run_engage(command: EngageCommand) -> Result<ExitCode> {
+    match command {
+        EngageCommand::Run(args) => {
+            let options = EngageOptions {
+                persona_path: args.persona,
+                config_path: args.config,
+                state_path: args.state,
+                providers_path: args.providers,
+                fixture: args.fixture,
+                dry_run: args.dry_run,
+            };
+            let report = autopilot_engage::run(options).await?;
+            print_engage_report(&report);
+            if report.failed {
+                Ok(ExitCode::FAILURE)
+            } else {
+                Ok(ExitCode::SUCCESS)
+            }
+        }
+        EngageCommand::State { state } => {
+            let log = autopilot_engage::ActionLog::load(&state).await?;
+            println!("state   : {}", state.display());
+            println!("entries : {}", log.entries().len());
+            for kind in [
+                autopilot_engage::ActionKind::Reply,
+                autopilot_engage::ActionKind::Like,
+                autopilot_engage::ActionKind::Follow,
+            ] {
+                println!("  {:<7} {}", kind.as_str(), log.count_since(kind, 0));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Render an engagement report as structured console output.
+fn print_engage_report(report: &EngageReport) {
+    println!("persona  : {}", report.persona);
+    println!(
+        "mode     : {}",
+        if report.dry_run {
+            "dry-run (no network, no write)"
+        } else {
+            "live"
+        }
+    );
+    println!(
+        "window   : {}",
+        if report.in_window {
+            "inside"
+        } else {
+            "outside"
+        }
+    );
+    println!(
+        "kill-switch: {}",
+        if report.kill_switch { "ENGAGED" } else { "off" }
+    );
+    println!("state    : {}", report.state_path.display());
+    if report.skipped_run {
+        println!("result   : sporadic skip — nothing to do this run");
+    }
+    for note in &report.notes {
+        println!("note     : {note}");
+    }
+    for line in &report.planned {
+        println!("planned  : {line}");
+    }
+    for action in &report.executed {
+        println!(
+            "[{:<9}] {:<8} {:<45} {}",
+            action.action, action.status, action.target, action.detail
+        );
+    }
+    println!("result   : {} action(s) executed", report.executed.len());
 }

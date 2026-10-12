@@ -11,6 +11,7 @@ members = [
     "crates/autopilot-publish",
     "crates/autopilot-media",
     "crates/autopilot-run",
+    "crates/autopilot-engage",
     "crates/autopilot-cli",
 ]
 

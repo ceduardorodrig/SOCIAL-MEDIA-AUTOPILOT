@@ -13,8 +13,8 @@ pub mod x;
 pub use bluesky::{
     BlobLink, BlobRef, BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, MAX_IMAGE_BYTES,
     MAX_IMAGES_PER_POST, PostImage, Session, build_image_embed, build_post_record,
-    build_post_record_with_images, create_post, create_session, now_rfc3339_millis, post_url,
-    upload_blob, validate_alt, validate_image,
+    build_post_record_with_images, create_post, create_record, create_session, now_rfc3339_millis,
+    post_url, upload_blob, validate_alt, validate_image,
 };
 pub use card::{
     CARD_HEIGHT, CARD_MIME_TYPE, CARD_TEMPLATE_VERSION, CARD_WIDTH, CardSpec, DEFAULT_RSVG_BINARY,

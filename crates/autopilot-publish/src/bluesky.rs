@@ -271,10 +271,24 @@ pub async fn create_post(
     record: &serde_json::Value,
     timeout: Duration,
 ) -> Result<String> {
+    create_record(base_url, session, COLLECTION, record, timeout).await
+}
+
+/// Create any `app.bsky.*` record in the session's repo, returning its AT-URI.
+///
+/// The publication stage (posts) and the engagement stage (replies, likes,
+/// follows) share this single XRPC transport, so no adapter duplicates it.
+pub async fn create_record(
+    base_url: &str,
+    session: &Session,
+    collection: &str,
+    record: &serde_json::Value,
+    timeout: Duration,
+) -> Result<String> {
     let url = format!("{base_url}/xrpc/com.atproto.repo.createRecord");
     let body = serde_json::json!({
         "repo": session.did,
-        "collection": COLLECTION,
+        "collection": collection,
         "record": record,
     });
 
@@ -287,14 +301,14 @@ pub async fn create_post(
             .send(),
     )
     .await
-    .context("bluesky post request timed out")?
-    .context("bluesky post request failed")?;
+    .context("bluesky write request timed out")?
+    .context("bluesky write request failed")?;
 
     let status = response.status();
     let payload: serde_json::Value = response.json().await.context("invalid bluesky JSON")?;
     if !status.is_success() {
         bail!(
-            "bluesky rejected the post (HTTP {status}): {}",
+            "bluesky rejected the `{collection}` write (HTTP {status}): {}",
             api_error_message(&payload)
         );
     }
@@ -303,7 +317,7 @@ pub async fn create_post(
         .get("uri")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .context("bluesky did not return a post uri")
+        .context("bluesky did not return a record uri")
 }
 
 /// Human-readable URL for a post AT-URI.

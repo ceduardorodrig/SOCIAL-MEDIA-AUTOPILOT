@@ -1,0 +1,22 @@
+[package]
+name = "autopilot-engage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json = "1"
+serde_yaml_ng.workspace = true
+tokio.workspace = true
+
+autopilot-core = { path = "../autopilot-core" }
+autopilot-guardrail = { path = "../autopilot-guardrail" }
+autopilot-providers = { path = "../autopilot-providers" }
+autopilot-publish = { path = "../autopilot-publish" }
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { workspace = true, features = ["net"] }

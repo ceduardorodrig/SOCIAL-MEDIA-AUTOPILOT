@@ -94,6 +94,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "autopilot-core",
+ "autopilot-engage",
  "autopilot-guardrail",
  "autopilot-harvest",
  "autopilot-learn",
@@ -114,6 +115,23 @@ name = "autopilot-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tokio",
+]
+
+[[package]]
+name = "autopilot-engage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "autopilot-core",
+ "autopilot-guardrail",
+ "autopilot-providers",
+ "autopilot-publish",
+ "axum",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml_ng",
