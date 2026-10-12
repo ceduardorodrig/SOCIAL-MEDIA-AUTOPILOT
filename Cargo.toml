@@ -4,9 +4,12 @@ members = [
     "crates/autopilot-core",
     "crates/autopilot-guardrail",
     "crates/autopilot-harvest",
+    "crates/autopilot-learn",
+    "crates/autopilot-metrics",
     "crates/autopilot-pipeline",
     "crates/autopilot-providers",
     "crates/autopilot-publish",
+    "crates/autopilot-media",
     "crates/autopilot-cli",
 ]
 

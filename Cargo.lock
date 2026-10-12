@@ -96,6 +96,8 @@ dependencies = [
  "autopilot-core",
  "autopilot-guardrail",
  "autopilot-harvest",
+ "autopilot-learn",
+ "autopilot-metrics",
  "autopilot-pipeline",
  "autopilot-providers",
  "autopilot-publish",
@@ -112,6 +114,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "tokio",
 ]
@@ -136,6 +139,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "autopilot-learn"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "autopilot-core",
+ "autopilot-metrics",
+ "serde",
+ "serde_yaml_ng",
+ "tokio",
+]
+
+[[package]]
+name = "autopilot-media"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "autopilot-metrics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "autopilot-core",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "autopilot-pipeline"
 version = "0.1.0"
 dependencies = [
@@ -151,6 +190,7 @@ name = "autopilot-providers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "autopilot-core",
  "axum",
  "reqwest",
  "serde",

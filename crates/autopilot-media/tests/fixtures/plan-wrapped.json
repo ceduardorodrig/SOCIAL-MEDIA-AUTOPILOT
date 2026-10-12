@@ -1,0 +1,12 @@
+{
+  "video_plan": {
+    "hook": "A luz do Sol demora oito minutos para chegar aqui.",
+    "scenes": [
+      {
+        "narration": "Mas a energia que ela carrega nasceu no núcleo do Sol há milhares de anos.",
+        "image_prompt": "a golden sun over a dark horizon"
+      }
+    ],
+    "call_to_action": "Curta se você aprendeu algo novo."
+  }
+}

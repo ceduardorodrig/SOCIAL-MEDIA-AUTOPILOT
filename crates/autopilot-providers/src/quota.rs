@@ -11,7 +11,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 /// Aggregated usage for one model over a time window.
@@ -168,25 +167,7 @@ pub fn check_budget(usage: &ModelUsage, budget_tokens: Option<u64>) -> BudgetChe
 
 /// Append a snapshot to the append-only quota ledger.
 pub async fn append_ledger(path: &Path, entry: &LedgerEntry) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("creating ledger directory {}", parent.display()))?;
-    }
-
-    let mut line = serde_json::to_string(entry).context("serializing ledger entry")?;
-    line.push('\n');
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-        .with_context(|| format!("opening ledger {}", path.display()))?;
-    file.write_all(line.as_bytes())
-        .await
-        .context("writing ledger entry")?;
-    Ok(())
+    autopilot_core::store::append_line(path, entry, "ledger").await
 }
 
 /// Build a ledger entry from a usage window.
@@ -263,15 +244,8 @@ pub async fn read_baseline(path: &Path) -> Result<Option<LedgerEntry>> {
 
 /// Persist the current usage as the new baseline.
 pub async fn write_baseline(path: &Path, entry: &LedgerEntry) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("creating baseline directory {}", parent.display()))?;
-    }
     let body = serde_json::to_string_pretty(entry).context("serializing baseline")?;
-    tokio::fs::write(path, body)
-        .await
-        .with_context(|| format!("writing baseline {}", path.display()))
+    autopilot_core::store::write_text(path, &body, "baseline").await
 }
 
 fn string_field(value: &serde_json::Value, key: &str) -> String {

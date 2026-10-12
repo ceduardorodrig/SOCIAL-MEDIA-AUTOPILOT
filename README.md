@@ -50,9 +50,12 @@ crates/
   autopilot-pipeline/   triage (score topics) and creation (A/B variants) prompts + parsers
   autopilot-providers/  provider registry, availability probes, fallback chain, quota, completion
   autopilot-publish/    platform adapters (Bluesky / AT Protocol)
+  autopilot-metrics/    stage [5] — engagement collection (adapter trait) + JSONL store
+  autopilot-learn/      stage [6] — pure A/B scoring + persona memory proposal
   autopilot-cli/        `autopilot` binary
 config/providers.yaml   LLM chain (data, no secrets — env var names only)
 personas/*.yaml         persona packs
+var/                    local stores (gitignored): metrics JSONL, memory proposals
 ```
 
 ## Usage
@@ -103,6 +106,23 @@ autopilot create run \
 autopilot publish auth                                         # verify credentials
 autopilot publish bluesky --persona personas/ciencia-curiosidades.yaml \
   --text "Draft" --dry-run                                    # print the record only
+
+# Stage [5] — metrics: collect engagement for published posts into a JSONL store.
+# `--fixture <file>` replays a saved payload with no network call (offline mode);
+# `--dry-run` only prints the request that would be made.
+autopilot metrics collect \
+  --platform bluesky --persona ciencia-curiosidades --topic "cérebro" \
+  --post A=at://did:plc:.../3ka --post B=at://did:plc:.../3kb \
+  --store var/metrics.jsonl
+
+# Stage [6] — learning: score the A/B variants and propose a persona memory update.
+# Without `--write` it only prints the proposal; the persona pack is never rewritten silently.
+autopilot learn run \
+  --persona personas/ciencia-curiosidades.yaml \
+  --platform bluesky \
+  --metrics var/metrics.jsonl \
+  --min-samples 2 \
+  --write var/memory/ciencia-curiosidades.yaml
 ```
 
 Publishing credentials come from the environment (SOPS store), never from the repository:
@@ -123,9 +143,11 @@ export GEMINI_API_KEY=...   # from the SOPS store (never committed)
 **Phase 0 — harness foundation.** Implemented: persona pack model + validation, provider
 registry with live health probes, fallback-chain resolution and completion across the chain,
 trend harvesting (SearXNG), free-tier quota instrumentation (snapshot, budget, JSONL ledger,
-delta and project-scoped attribution), the deterministic guardrail, and the triage (stage 2)
-and creation (stage 3) prompts + parsers, and the **Bluesky publisher** (stage 4, AT Protocol)
-with a mandatory guardrail gate. Next: metrics + learning loop, then X and the remaining channels.
+delta and project-scoped attribution), the deterministic guardrail, the triage (stage 2)
+and creation (stage 3) prompts + parsers, the **Bluesky publisher** (stage 4, AT Protocol)
+with a mandatory guardrail gate, and the **metrics** (stage 5, platform adapter trait +
+JSONL store) and **learning** (stage 6, pure A/B scoring + persona memory proposal) stages.
+Next: X and the remaining channels.
 
 | Phase | Scope |
 |---|---|

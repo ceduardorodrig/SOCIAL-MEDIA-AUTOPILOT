@@ -1,0 +1,14 @@
+{
+  "hook": "Seu cérebro gasta mais energia do que você imagina.",
+  "scenes": [
+    {
+      "narration": "Em repouso, o cérebro consome cerca de vinte por cento da energia do corpo.",
+      "image_prompt": "a glowing brain at night"
+    },
+    {
+      "narration": "Isso acontece mesmo enquanto você dorme.",
+      "image_prompt": "a sleeping person under soft blue light"
+    }
+  ],
+  "call_to_action": "Siga para mais curiosidades sobre o cérebro."
+}

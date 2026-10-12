@@ -1,0 +1,16 @@
+Claro! Aqui está o plano:
+
+```json
+{
+  "hook": "Você sabia?",
+  "scenes": [
+    {
+      "narration": "O polvo tem três corações.",
+      "image_prompt": "an octopus in a deep blue reef"
+    }
+  ],
+  "call_to_action": "Siga para mais fatos do oceano."
+}
+```
+
+Espero ter ajudado.

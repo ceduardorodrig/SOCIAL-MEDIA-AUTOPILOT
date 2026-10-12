@@ -4,10 +4,18 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use autopilot_core::{Platform, ValidationIssue, load_dir, load_persona};
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{DEFAULT_SEARXNG_ENDPOINT, SearxngClient};
+use autopilot_learn::{
+    DEFAULT_MAX_FEW_SHOT, DEFAULT_MIN_SAMPLES, compare_variants, propose_memory, render_memory,
+    write_memory,
+};
+use autopilot_metrics::{
+    BlueskyMetrics, DEFAULT_BLUESKY_READ_URL, DEFAULT_METRICS_TIMEOUT, MetricsRecord,
+    MetricsSource, RecordContext, append_metrics, collect, read_metrics,
+};
 use autopilot_pipeline::{
     build_creation_prompt, build_triage_prompt, parse_shortlist, parse_variants,
 };
@@ -71,6 +79,16 @@ enum Command {
     Publish {
         #[command(subcommand)]
         command: PublishCommand,
+    },
+    /// Stage [5] — collect engagement metrics for published posts.
+    Metrics {
+        #[command(subcommand)]
+        command: MetricsCommand,
+    },
+    /// Stage [6] — learn from A/B performance and propose a memory update.
+    Learn {
+        #[command(subcommand)]
+        command: LearnCommand,
     },
 }
 
@@ -233,6 +251,81 @@ enum PublishCommand {
     },
 }
 
+/// A published post as `VARIANT=URI` (for example `A=at://did:plc:.../3kxyz`).
+#[derive(Debug, Clone)]
+struct PostArg {
+    variant: String,
+    uri: String,
+}
+
+fn parse_post_arg(value: &str) -> Result<PostArg, String> {
+    let (variant, uri) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected VARIANT=URI, got `{value}`"))?;
+    if variant.trim().is_empty() || uri.trim().is_empty() {
+        return Err(format!("both variant and URI are required in `{value}`"));
+    }
+    Ok(PostArg {
+        variant: variant.trim().to_string(),
+        uri: uri.trim().to_string(),
+    })
+}
+
+#[derive(Subcommand)]
+enum MetricsCommand {
+    /// Collect engagement for published posts and append them to the store.
+    Collect {
+        #[arg(long, value_parser = parse_platform)]
+        platform: Platform,
+        /// Persona slug that produced the posts.
+        #[arg(long)]
+        persona: String,
+        #[arg(long, default_value = "")]
+        topic: String,
+        /// A published post as `VARIANT=URI` (repeat for A/B).
+        #[arg(long = "post", value_parser = parse_post_arg)]
+        posts: Vec<PostArg>,
+        /// JSONL store for the samples (under `var/`, which is gitignored).
+        #[arg(long, default_value = "var/metrics.jsonl")]
+        store: PathBuf,
+        /// Base URL of the platform's public read API.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Read the payload from a local file instead of the network (offline).
+        #[arg(long, conflicts_with = "dry_run")]
+        fixture: Option<PathBuf>,
+        /// When the posts were published (Unix seconds), for schedule hints.
+        #[arg(long)]
+        published_at: Option<u64>,
+        /// Print the request without calling the API or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum LearnCommand {
+    /// Analyse A/B metrics and propose a persona memory update.
+    Run {
+        #[arg(long)]
+        persona: PathBuf,
+        #[arg(long, value_parser = parse_platform)]
+        platform: Platform,
+        /// JSONL store written by the metrics stage.
+        #[arg(long, default_value = "var/metrics.jsonl")]
+        metrics: PathBuf,
+        /// Minimum samples per variant before the comparison is conclusive.
+        #[arg(long, default_value_t = DEFAULT_MIN_SAMPLES)]
+        min_samples: usize,
+        /// Persist the proposal here (omit to only print it).
+        #[arg(long)]
+        write: Option<PathBuf>,
+        /// Print the proposal and never write, even if `--write` is given.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
@@ -260,6 +353,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Triage { command } => run_triage(command).await,
         Command::Create { command } => run_create(command).await,
         Command::Publish { command } => run_publish(command).await,
+        Command::Metrics { command } => run_metrics(command).await,
+        Command::Learn { command } => run_learn(command).await,
     }
 }
 
@@ -670,6 +765,154 @@ async fn run_publish(command: PublishCommand) -> Result<ExitCode> {
             let session = create_session(&base_url, &credentials, PUBLISH_TIMEOUT).await?;
             let uri = create_post(&base_url, &session, &record, PUBLISH_TIMEOUT).await?;
             println!("published : {}", post_url(&session.handle, &uri));
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Current time as Unix seconds (used to stamp collected samples).
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Build the metrics adapter for a platform (Bluesky is the only one so far).
+fn build_metrics_source(
+    platform: Platform,
+    base_url: Option<String>,
+) -> Result<Box<dyn MetricsSource>> {
+    match platform {
+        Platform::Bluesky => Ok(Box::new(BlueskyMetrics::new(
+            base_url.unwrap_or_else(|| DEFAULT_BLUESKY_READ_URL.to_string()),
+        ))),
+        other => bail!(
+            "metrics collection for `{}` is not implemented yet",
+            other.as_str()
+        ),
+    }
+}
+
+async fn run_metrics(command: MetricsCommand) -> Result<ExitCode> {
+    match command {
+        MetricsCommand::Collect {
+            platform,
+            persona,
+            topic,
+            posts,
+            store,
+            base_url,
+            fixture,
+            published_at,
+            dry_run,
+        } => {
+            if posts.is_empty() {
+                eprintln!("provide at least one --post VARIANT=URI");
+                return Ok(ExitCode::FAILURE);
+            }
+
+            let source = build_metrics_source(platform, base_url)?;
+            let ids: Vec<String> = posts.iter().map(|post| post.uri.clone()).collect();
+            let request = source.request(&ids)?;
+
+            if dry_run {
+                println!("--- request (dry run, no API call, nothing written) ---");
+                println!("GET {}", request.url);
+                for (key, value) in &request.query {
+                    println!("  {key}={value}");
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            let parsed = match fixture {
+                Some(path) => {
+                    let raw = tokio::fs::read_to_string(&path)
+                        .await
+                        .with_context(|| format!("reading fixture {}", path.display()))?;
+                    source.parse(&raw)?
+                }
+                None => collect(&*source, &ids, DEFAULT_METRICS_TIMEOUT).await?,
+            };
+
+            let captured_at_unix = now_unix();
+            let mut stored = 0usize;
+            for post in &posts {
+                let Some(metrics) = parsed.iter().find(|item| item.uri == post.uri) else {
+                    println!("missing : {} (no metrics returned)", post.uri);
+                    continue;
+                };
+                let context = RecordContext {
+                    captured_at_unix,
+                    persona: persona.clone(),
+                    variant: post.variant.clone(),
+                    topic: topic.clone(),
+                    published_at_unix: published_at,
+                };
+                let record = MetricsRecord::from_post(platform, metrics, context);
+                append_metrics(&store, &record).await?;
+                stored += 1;
+                println!(
+                    "variant {}: {} like(s), {} reply(ies), {} repost(s), {} quote(s) -> {}",
+                    record.variant,
+                    record.likes,
+                    record.replies,
+                    record.reposts,
+                    record.quotes,
+                    record.uri
+                );
+            }
+            println!("stored  : {stored} sample(s) in {}", store.display());
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+async fn run_learn(command: LearnCommand) -> Result<ExitCode> {
+    match command {
+        LearnCommand::Run {
+            persona,
+            platform,
+            metrics,
+            min_samples,
+            write,
+            dry_run,
+        } => {
+            let pack = load_persona(&persona).await?;
+            let records: Vec<MetricsRecord> = read_metrics(&metrics)
+                .await?
+                .into_iter()
+                .filter(|record| record.platform == platform)
+                .collect();
+            if records.is_empty() {
+                println!(
+                    "no metrics for {} in {} — nothing to learn yet",
+                    platform.as_str(),
+                    metrics.display()
+                );
+            }
+
+            let outcome = compare_variants(&records, min_samples);
+            let update = propose_memory(
+                &records,
+                &pack.persona,
+                platform,
+                &outcome,
+                DEFAULT_MAX_FEW_SHOT,
+                now_unix(),
+            );
+
+            println!("--- proposed memory update ---");
+            print!("{}", render_memory(&update)?);
+            println!("outcome : {}", update.reason);
+
+            match (dry_run, write) {
+                (false, Some(path)) => {
+                    write_memory(&path, &update).await?;
+                    println!("memory  : written to {}", path.display());
+                }
+                _ => println!("memory  : proposal only — pass --write <path> to persist it"),
+            }
             Ok(ExitCode::SUCCESS)
         }
     }

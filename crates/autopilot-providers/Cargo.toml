@@ -12,6 +12,8 @@ serde_yaml_ng.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 
+autopilot-core = { path = "../autopilot-core" }
+
 [dev-dependencies]
 axum = "0.8"
 tokio = { workspace = true, features = ["net"] }

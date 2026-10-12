@@ -5,6 +5,7 @@
 //! adapting the master content per channel.
 
 pub mod persona;
+pub mod store;
 
 pub use persona::{
     Channel, PersonaPack, Platform, Rubric, ValidationIssue, Voice, load_dir, load_persona,

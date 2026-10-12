@@ -1,0 +1,18 @@
+[package]
+name = "autopilot-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json = "1"
+tokio.workspace = true
+
+autopilot-core = { path = "../autopilot-core" }
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { workspace = true, features = ["net"] }
