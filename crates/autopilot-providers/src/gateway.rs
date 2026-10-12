@@ -83,8 +83,17 @@ struct LeaseRequest<'a> {
 pub struct GatewayClient {
     base_url: String,
     timeout: Duration,
+    /// How long the gateway may block waiting for admission. The waiting policy
+    /// is centralized in the gateway; consumers only declare their patience.
+    wait_secs: u64,
     http: reqwest::Client,
 }
+
+/// Default patience when the gateway has no free VRAM yet (seconds).
+pub const DEFAULT_WAIT_SECS: u64 = 600;
+
+/// Environment variable that overrides [`DEFAULT_WAIT_SECS`].
+pub const WAIT_ENV: &str = "HL_INFER_WAIT_SECS";
 
 impl GatewayClient {
     /// Build a client for `base_url` with a per-call timeout.
@@ -92,15 +101,26 @@ impl GatewayClient {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             timeout,
+            wait_secs: DEFAULT_WAIT_SECS,
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Override how long the gateway may block waiting for a lease.
+    pub fn with_wait_secs(mut self, wait_secs: u64) -> Self {
+        self.wait_secs = wait_secs;
+        self
     }
 
     /// Build a client from `HL_INFER_URL`, falling back to the local default.
     pub fn from_env(timeout: Duration) -> Self {
         let base_url =
             std::env::var(GATEWAY_URL_ENV).unwrap_or_else(|_| DEFAULT_GATEWAY_URL.to_string());
-        Self::new(base_url, timeout)
+        let wait_secs = std::env::var(WAIT_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_WAIT_SECS);
+        Self::new(base_url, timeout).with_wait_secs(wait_secs)
     }
 
     /// Base URL this client targets.
@@ -109,8 +129,13 @@ impl GatewayClient {
     }
 
     /// Request a VRAM lease and return the created job.
+    ///
+    /// The gateway blocks until the job is admitted (or its wait expires), so the
+    /// "wait for VRAM" policy lives in one place instead of in every consumer. A
+    /// job still `queued` after the wait is an **error**: local GPU work must
+    /// never proceed unarbitrated.
     pub async fn submit(&self, kind: JobKind, required_bytes: u64, label: &str) -> Result<Job> {
-        let url = format!("{}/v1/jobs", self.base_url);
+        let url = format!("{}/v1/jobs?wait_secs={}", self.base_url, self.wait_secs);
         let body = LeaseRequest {
             kind,
             required_bytes,
@@ -131,7 +156,17 @@ impl GatewayClient {
             let snippet: String = text.chars().take(200).collect();
             bail!("GPU gateway rejected the lease with HTTP {status}: {snippet}");
         }
-        serde_json::from_str(&text).context("invalid job JSON from the GPU gateway")
+
+        let job: Job =
+            serde_json::from_str(&text).context("invalid job JSON from the GPU gateway")?;
+        if job.state != "admitted" {
+            bail!(
+                "GPU gateway did not admit the lease (state `{}`) after waiting {}s: the GPU is busy or the batch window is closed",
+                job.state,
+                self.wait_secs
+            );
+        }
+        Ok(job)
     }
 
     /// Request a VRAM lease and return a handle that releases it on drop.
@@ -279,6 +314,35 @@ mod tests {
                 .expect("serve mock gateway");
         });
         format!("http://{addr}")
+    }
+
+    /// Mock gateway that never admits: the job stays queued.
+    async fn queued_submit(
+        Json(_body): Json<serde_json::Value>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "id": "job-000099",
+                "kind": "other",
+                "required_bytes": 1,
+                "label": "",
+                "state": "queued",
+                "seq": 1,
+                "enqueued_at_unix": 0
+            })),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_queued_lease_is_an_error() {
+        let base = spawn(Router::new().route("/v1/jobs", post(queued_submit))).await;
+        let client = GatewayClient::new(base, Duration::from_secs(5)).with_wait_secs(0);
+        let result = client.submit(JobKind::Create, 1_000_000, "test").await;
+        assert!(
+            result.is_err(),
+            "a queued lease must never be accepted — GPU work cannot proceed unarbitrated"
+        );
     }
 
     async fn echo_submit(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
