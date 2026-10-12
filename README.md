@@ -94,3 +94,16 @@ create → guardrail pipeline and the quota instrumentation for the OpenCode fre
   convention, municipality services follow `hl-`, hosts carry Tupi-Guarani names.
 - **No plaintext secrets** in this repo — SOPS store only.
 - Rust-first: no Python; errors are handled with `?`/`match`, never `unwrap()`/`expect()`.
+
+<div align="center">
+
+### 🛡️ Human-in-the-Loop Agentic Engineering & Deterministic Governance
+
+> **Architected by an Anthropologist, Built with Autonomous AI Agents, Governed by Deterministic Code.**
+> 
+> This project was developed through rigorous human-AI pair programming led by **Carlos Eduardo Rodrigues** ([@ceduardorodrig](https://github.com/ceduardorodrig)) — an anthropologist and product architect using autonomous coding agents under strict, sub-millisecond static governance.
+>
+> Every commit, driver, and system architecture is continuously audited and enforced by 🤖 **[StenioSentinel](https://github.com/ceduardorodrig/STENIO-SENTINEL)** (our native Rust quality gate) with zero tolerance for hallucinated tests, blind merges, or bypassed checks.
+
+</div>
+
