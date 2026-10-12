@@ -18,12 +18,12 @@ providers:
 
   - id: gemini
     kind: gemini
-    model: gemini-3.5-flash
+    model: gemini-3.8-flash
     endpoint: https://generativelanguage.googleapis.com
     api_key_env: GEMINI_API_KEY
     priority: 200
     timeout_ms: 15000
-    role: "Fail-safe 1 — Gemini Developer API free tier"
+    role: "Fail-safe 1 — Gemini Developer API (note: the project must have free-tier access or credits; a depleted prepay balance answers 402)"
 
   - id: ollama
     kind: ollama

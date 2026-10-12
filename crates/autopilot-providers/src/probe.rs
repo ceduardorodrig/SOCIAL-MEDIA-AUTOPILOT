@@ -82,26 +82,48 @@ async fn probe_opencode(cfg: &ProviderConfig) -> Result<String> {
     }
 }
 
-/// Gemini Developer API: validates the API key with a models listing call.
+/// Gemini Developer API: validates that the key can actually **generate**.
+///
+/// Listing models is not enough — a project with a depleted prepay balance
+/// answers `402` to generation while the key still lists models, so a shallow
+/// probe would advertise a fail-safe that cannot fail over.
 async fn probe_gemini(cfg: &ProviderConfig) -> Result<String> {
     let key_env = cfg.api_key_env.as_deref().unwrap_or("GEMINI_API_KEY");
     let key = std::env::var(key_env)
         .with_context(|| format!("missing environment variable {key_env}"))?;
     let endpoint = cfg.endpoint_or_default(DEFAULT_GEMINI_ENDPOINT);
-    let url = format!("{endpoint}/v1beta/models?key={key}");
+    let url = format!(
+        "{endpoint}/v1beta/models/{}:generateContent?key={key}",
+        cfg.model
+    );
+    let body = serde_json::json!({
+        "contents": [{ "parts": [{ "text": "ok" }] }]
+    });
 
     let response = reqwest::Client::new()
-        .get(&url)
+        .post(&url)
+        .json(&body)
         .send()
         .await
         .context("gemini request failed")?;
 
     let status = response.status();
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .context("invalid gemini JSON response")?;
+
     if status.is_success() {
-        Ok(format!("api key valid (HTTP {status})"))
+        Ok(format!("generation ok (HTTP {status})"))
     } else {
-        let body = response.text().await.unwrap_or_default();
-        bail!("gemini returned HTTP {status}: {}", truncate(&body, 160))
+        let message = payload
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown error");
+        bail!(
+            "gemini cannot generate (HTTP {status}): {}",
+            truncate(message, 140)
+        )
     }
 }
 
