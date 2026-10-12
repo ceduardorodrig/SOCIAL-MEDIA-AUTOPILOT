@@ -49,7 +49,7 @@ crates/
   autopilot-harvest/    trend collection (SearXNG JSON API)
   autopilot-pipeline/   triage (score topics) and creation (A/B variants) prompts + parsers
   autopilot-providers/  provider registry, availability probes, fallback chain, quota, completion
-  autopilot-publish/    platform adapters (Bluesky / AT Protocol)
+  autopilot-publish/    platform adapters (Bluesky / AT Protocol, X / OAuth 1.0a)
   autopilot-metrics/    stage [5] — engagement collection (adapter trait) + JSONL store
   autopilot-learn/      stage [6] — pure A/B scoring + persona memory proposal
   autopilot-run/        `autopilot run` — chains the stages for one persona
@@ -112,9 +112,16 @@ autopilot create run \
   --guard
 
 # Stage [4] — publish to Bluesky (the guardrail runs first and may refuse)
-autopilot publish auth                                         # verify credentials
+autopilot publish auth                                         # verify Bluesky credentials
 autopilot publish bluesky --persona personas/ciencia-curiosidades.yaml \
   --text "Draft" --dry-run                                    # print the record only
+
+# Stage [4] — publish to X (Twitter). OAuth 1.0a signing is pure Rust and
+# unit-tested against the published reference vectors; `--dry-run` prints the
+# request with no API call and needs no credentials.
+autopilot publish auth --platform x                            # check the X credentials (offline)
+autopilot publish x --persona personas/ciencia-curiosidades.yaml \
+  --text "Draft" --dry-run                                     # print the request only
 
 # Stage [5] — metrics: collect engagement for published posts into a JSONL store.
 # `--fixture <file>` replays a saved payload with no network call (offline mode);
@@ -139,6 +146,11 @@ Publishing credentials come from the environment (SOPS store), never from the re
 ```bash
 export BLUESKY_HANDLE=...        # handle
 export BLUESKY_APP_PASSWORD=...  # an app password, not the account password
+
+export X_API_KEY=...             # OAuth 1.0a consumer key
+export X_API_SECRET=...          # OAuth 1.0a consumer secret
+export X_ACCESS_TOKEN=...        # OAuth 1.0a access token (user context)
+export X_ACCESS_TOKEN_SECRET=... # OAuth 1.0a access token secret
 ```
 
 Provider credentials are read from the environment, never from the repo:
@@ -154,12 +166,15 @@ registry with live health probes, fallback-chain resolution and completion acros
 trend harvesting (SearXNG), free-tier quota instrumentation (snapshot, budget, JSONL ledger,
 delta and project-scoped attribution), the deterministic guardrail, the triage (stage 2)
 and creation (stage 3) prompts + parsers, the **Bluesky publisher** (stage 4, AT Protocol)
-with a mandatory guardrail gate, and the **metrics** (stage 5, platform adapter trait +
+and the **X (Twitter) publisher** (stage 4, API v2 with pure-Rust OAuth 1.0a signing,
+offline-tested against the RFC 5849 and classic Twitter reference vectors), both with a
+mandatory guardrail gate, and the **metrics** (stage 5, platform adapter trait +
 JSONL store) and **learning** (stage 6, pure A/B scoring + persona memory proposal) stages. The
 **`autopilot run` orchestrator** now chains harvest → triage → creation → guardrail →
 publish for one persona, with a safe `--dry-run` and a per-run JSONL journal under
 `var/runs/`; a non-admitted `hl-infer` lease aborts a stage instead of running the
-GPU unarbitrated. Next: X and the remaining channels.
+GPU unarbitrated. Next: the remaining channels (LinkedIn, Instagram, TikTok, Kwai) and the
+live credentials (HB-026) that let the X path run for real.
 
 | Phase | Scope |
 |---|---|

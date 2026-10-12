@@ -16,7 +16,7 @@ pub use bluesky::{
 // X shares the `create_post` / `post_url` names with Bluesky, so those two stay
 // module-qualified (`x::create_post`); the rest are re-exported for symmetry.
 pub use x::{
-    DEFAULT_X_API_BASE_URL, PublishedPost, XCredentials, X_ENV_VARS, authorization_header,
+    DEFAULT_X_API_BASE_URL, PublishedPost, X_ENV_VARS, XCredentials, authorization_header,
     build_tweet_body, missing_env_vars, post_endpoint,
 };
 

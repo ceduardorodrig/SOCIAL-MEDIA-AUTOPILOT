@@ -24,12 +24,12 @@ use autopilot_providers::{
     ledger_entry, load_config, opencode_usage, probe, read_baseline, resolve_chain, usage_for,
     write_baseline,
 };
+use autopilot_publish::x::create_post as create_x_post;
 use autopilot_publish::{
-    BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, DEFAULT_X_API_BASE_URL, XCredentials, X_ENV_VARS,
+    BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, DEFAULT_X_API_BASE_URL, X_ENV_VARS, XCredentials,
     build_post_record, build_tweet_body, create_post, create_session, missing_env_vars,
     now_rfc3339_millis, post_endpoint, post_url,
 };
-use autopilot_publish::x::create_post as create_x_post;
 use autopilot_run::{RunOptions, RunReport, StageOutcome};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -850,13 +850,36 @@ async fn run_create(command: CreateCommand) -> Result<ExitCode> {
 
 async fn run_publish(command: PublishCommand) -> Result<ExitCode> {
     match command {
-        PublishCommand::Auth { base_url } => {
-            let credentials = BlueskyCredentials::from_env()?;
-            let session = create_session(&base_url, &credentials, PUBLISH_TIMEOUT).await?;
-            println!("authenticated : {}", session.handle);
-            println!("did           : {}", session.did);
-            Ok(ExitCode::SUCCESS)
-        }
+        PublishCommand::Auth { platform, base_url } => match platform {
+            Platform::Bluesky => {
+                let base_url = base_url.unwrap_or_else(|| DEFAULT_BLUESKY_BASE_URL.to_string());
+                let credentials = BlueskyCredentials::from_env()?;
+                let session = create_session(&base_url, &credentials, PUBLISH_TIMEOUT).await?;
+                println!("authenticated : {}", session.handle);
+                println!("did           : {}", session.did);
+                Ok(ExitCode::SUCCESS)
+            }
+            Platform::X => {
+                let missing = missing_env_vars();
+                if !missing.is_empty() {
+                    eprintln!("missing X credential variable(s): {}", missing.join(", "));
+                    return Ok(ExitCode::FAILURE);
+                }
+                println!("platform      : x");
+                println!("credentials   : present (OAuth 1.0a user context)");
+                for name in X_ENV_VARS {
+                    println!("  {name}: set");
+                }
+                println!(
+                    "note          : presence check only — a live round-trip needs HB-026 credentials"
+                );
+                Ok(ExitCode::SUCCESS)
+            }
+            other => bail!(
+                "credential check for `{}` is not implemented yet",
+                other.as_str()
+            ),
+        },
         PublishCommand::Bluesky {
             persona,
             text,
@@ -887,6 +910,38 @@ async fn run_publish(command: PublishCommand) -> Result<ExitCode> {
             let session = create_session(&base_url, &credentials, PUBLISH_TIMEOUT).await?;
             let uri = create_post(&base_url, &session, &record, PUBLISH_TIMEOUT).await?;
             println!("published : {}", post_url(&session.handle, &uri));
+            Ok(ExitCode::SUCCESS)
+        }
+        PublishCommand::X {
+            persona,
+            text,
+            base_url,
+            dry_run,
+        } => {
+            let pack = load_persona(&persona).await?;
+
+            // The guardrail is mandatory: an unvalidated draft is never published.
+            let verdict = evaluate(&pack, Platform::X, &text);
+            if !verdict.approved {
+                for issue in &verdict.issues {
+                    println!("  x [{}] {}", issue.rule, issue.detail);
+                }
+                eprintln!("refusing to publish: the guardrail rejected the draft");
+                return Ok(ExitCode::FAILURE);
+            }
+            println!("guardrail : APPROVED");
+
+            let body = build_tweet_body(&text);
+            if dry_run {
+                println!("--- would post (dry run, no API call) ---");
+                println!("POST {}", post_endpoint(&base_url));
+                println!("{}", serde_json::to_string_pretty(&body)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            let credentials = XCredentials::from_env()?;
+            let post = create_x_post(&base_url, &credentials, &text, PUBLISH_TIMEOUT).await?;
+            println!("published : {}", post.url);
             Ok(ExitCode::SUCCESS)
         }
     }

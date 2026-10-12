@@ -159,7 +159,10 @@ pub fn authorization_header(
     let oauth_params: Vec<(String, String)> = vec![
         ("oauth_consumer_key".into(), credentials.api_key.clone()),
         ("oauth_nonce".into(), nonce.to_string()),
-        ("oauth_signature_method".into(), SIGNATURE_METHOD.to_string()),
+        (
+            "oauth_signature_method".into(),
+            SIGNATURE_METHOD.to_string(),
+        ),
         ("oauth_timestamp".into(), timestamp.to_string()),
         ("oauth_token".into(), credentials.access_token.clone()),
         ("oauth_version".into(), OAUTH_VERSION.to_string()),
@@ -195,7 +198,8 @@ pub fn authorization_header(
 /// A random nonce (32 lowercase hex characters) for a single request.
 pub fn generate_nonce() -> Result<String> {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).context("generating an OAuth nonce")?;
+    getrandom::getrandom(&mut bytes)
+        .map_err(|err| anyhow::anyhow!("generating an OAuth nonce: {err}"))?;
 
     let mut nonce = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -256,11 +260,7 @@ pub fn parse_create_response(raw: &str) -> Result<PublishedPost> {
         .and_then(|errors| errors.first())
         .and_then(|error| error.get("detail"))
         .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            payload
-                .get("detail")
-                .and_then(serde_json::Value::as_str)
-        })
+        .or_else(|| payload.get("detail").and_then(serde_json::Value::as_str))
         .unwrap_or("unknown error");
     bail!("X rejected the post: {message}");
 }
@@ -273,12 +273,8 @@ pub async fn create_post(
     timeout: Duration,
 ) -> Result<PublishedPost> {
     let url = post_endpoint(base_url);
-    let authorization = credentials.authorization_header(
-        "POST",
-        &url,
-        &generate_nonce()?,
-        now_unix_seconds(),
-    )?;
+    let authorization =
+        credentials.authorization_header("POST", &url, &generate_nonce()?, now_unix_seconds())?;
     let body = build_tweet_body(text);
 
     let response = tokio::time::timeout(
@@ -300,7 +296,10 @@ pub async fn create_post(
         return parse_create_response(&raw);
     }
     match parse_create_response(&raw) {
-        Ok(post) => bail!("X returned HTTP {status} with an unexpected post id {}", post.id),
+        Ok(post) => bail!(
+            "X returned HTTP {status} with an unexpected post id {}",
+            post.id
+        ),
         Err(err) => Err(err.context(format!("X post failed (HTTP {status})"))),
     }
 }
@@ -417,7 +416,10 @@ mod tests {
             "https://api.twitter.com/1/statuses/update.json",
             &[
                 ("include_entities", "true"),
-                ("status", "Hello Ladies + Gentlemen, a signed OAuth request!"),
+                (
+                    "status",
+                    "Hello Ladies + Gentlemen, a signed OAuth request!",
+                ),
             ],
             "kYjzVBB8Y0ZFabxSWbWovY3uYSQ2pTgmZeNu2VS4cg",
             1318622958,
@@ -500,8 +502,10 @@ mod tests {
 
     #[test]
     fn parse_create_response_reports_api_error() {
-        let err = parse_create_response(r#"{"errors":[{"title":"Unauthorized","detail":"Unauthorized"}]}"#)
-            .expect_err("an error payload is rejected");
+        let err = parse_create_response(
+            r#"{"errors":[{"title":"Unauthorized","detail":"Unauthorized"}]}"#,
+        )
+        .expect_err("an error payload is rejected");
         assert!(
             err.to_string().contains("Unauthorized"),
             "unexpected error: {err}"
@@ -517,7 +521,10 @@ mod tests {
 
     #[test]
     fn post_endpoint_trims_trailing_slash() {
-        assert_eq!(post_endpoint("https://api.x.com"), "https://api.x.com/2/tweets");
+        assert_eq!(
+            post_endpoint("https://api.x.com"),
+            "https://api.x.com/2/tweets"
+        );
         assert_eq!(
             post_endpoint("https://api.x.com/"),
             "https://api.x.com/2/tweets"
