@@ -17,8 +17,8 @@ pub use bluesky::{
     post_url, upload_blob, validate_alt, validate_image,
 };
 pub use card::{
-    CARD_HEIGHT, CARD_MIME_TYPE, CARD_TEMPLATE_VERSION, CARD_WIDTH, CardSpec, DEFAULT_RSVG_BINARY,
-    alt_text, render_png, render_svg,
+    CARD_HEIGHT, CARD_MIME_TYPE, CARD_TEMPLATE_VERSION, CARD_WIDTH, CardSpec, CardTheme,
+    DEFAULT_RSVG_BINARY, DEFAULT_TEMPLATE_NAME, alt_text, darken, render_png, render_svg,
 };
 // X shares the `create_post` / `post_url` names with Bluesky, so those two stay
 // module-qualified (`x::create_post`); the rest are re-exported for symmetry.
