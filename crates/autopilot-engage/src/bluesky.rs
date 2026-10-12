@@ -15,8 +15,8 @@ use anyhow::{Context, Result, bail};
 use autopilot_publish::{Session, create_record, now_rfc3339_millis};
 
 use crate::candidates::{
-    Notification, OwnPost, Profile, Thread, parse_author_feed, parse_notifications, parse_profile,
-    parse_thread,
+    FeedPost, Notification, OwnPost, Profile, Thread, parse_author_feed, parse_feed_posts,
+    parse_notifications, parse_profile, parse_thread,
 };
 use crate::records::{
     FOLLOW_COLLECTION, LIKE_COLLECTION, POST_COLLECTION, StrongRef, build_follow_record,
@@ -105,6 +105,20 @@ pub async fn get_post_thread(
     parse_thread(&raw)
 }
 
+/// Fetch an actor's `getAuthorFeed` payload (public).
+async fn fetch_author_feed(
+    base_url: &str,
+    actor: &str,
+    limit: usize,
+    timeout: Duration,
+) -> Result<String> {
+    let query = vec![
+        ("actor".to_string(), actor.to_string()),
+        ("limit".to_string(), limit.to_string()),
+    ];
+    get_text(base_url, GET_AUTHOR_FEED, &query, None, timeout).await
+}
+
 /// Read our own recent posts (public), to look for comments on them.
 pub async fn get_author_feed(
     base_url: &str,
@@ -112,12 +126,19 @@ pub async fn get_author_feed(
     limit: usize,
     timeout: Duration,
 ) -> Result<Vec<OwnPost>> {
-    let query = vec![
-        ("actor".to_string(), actor.to_string()),
-        ("limit".to_string(), limit.to_string()),
-    ];
-    let raw = get_text(base_url, GET_AUTHOR_FEED, &query, None, timeout).await?;
+    let raw = fetch_author_feed(base_url, actor, limit, timeout).await?;
     parse_author_feed(&raw)
+}
+
+/// Read an account of interest's recent posts (public), to comment proactively.
+pub async fn get_interest_feed(
+    base_url: &str,
+    actor: &str,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Vec<FeedPost>> {
+    let raw = fetch_author_feed(base_url, actor, limit, timeout).await?;
+    parse_feed_posts(&raw)
 }
 
 /// Resolve an account of interest to a profile (public).

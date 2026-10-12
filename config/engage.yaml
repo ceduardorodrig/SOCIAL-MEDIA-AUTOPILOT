@@ -51,6 +51,34 @@ interests:
     - "simonwillison.net"
     - "swyx.io"
 
+# Proactive commenting — joining the conversation on the curated accounts above.
+# This is how the account earns followers: a substantive reply to a relevant,
+# famous account. It is also the easiest way to look like a bot, so every knob
+# below is deliberately conservative. A proactive reply is held to the quality
+# bar in `quality.rs`: it must add a fact, a correction, an experience or a real
+# question, and it must NEVER link out, name our account or pitch anything.
+proactive:
+  # Master switch. `false` disables the whole proactive source, keeping mentions,
+  # replies-to-us, contextual likes and sporadic follows untouched.
+  enabled: true
+  # How many curated accounts to probe per run, and how many of their recent
+  # posts to read each. Keep these small: this is a conversation, not a sweep.
+  accounts_per_run: 5
+  posts_per_account: 5
+  # Skip posts older than this — a cold thread is worse than no reply.
+  max_post_age_hours: 36
+  # Candidates kept per account in a single gather (never a wall of posts).
+  candidates_per_account_per_run: 1
+  # Proactive replies per day, on top of the global `caps.replies_per_day`.
+  replies_per_day: 2
+  # Hard weekly ceiling per account: never become that account's reply-guy.
+  replies_per_account_per_week: 1
+  # Minimum hours before replying to the same account again.
+  min_gap_hours: 72
+  # Quality bar for a proactive reply (deterministic, see `quality.rs`).
+  min_chars: 40
+  min_words: 8
+
 # Notification reasons treated as "someone talked to us".
 notification_reasons: ["mention", "reply"]
 notification_limit: 50

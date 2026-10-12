@@ -15,16 +15,18 @@ use serde::Deserialize;
 
 use crate::bluesky::{
     DEFAULT_BLUESKY_READ_URL, DEFAULT_ENGAGE_TIMEOUT, create_follow, create_like, create_reply,
-    get_author_feed, get_post_thread, get_profile, list_notifications,
+    get_author_feed, get_interest_feed, get_post_thread, get_profile, list_notifications,
 };
 use crate::candidates::{
-    Candidate, FollowTarget, Notification, Profile, Thread, combine, follow_candidates,
-    mention_candidates, own_post_reply_candidates, parse_thread_value,
+    Candidate, CandidateKind, FollowTarget, InterestFeed, Notification, Profile, Thread, combine,
+    follow_candidates, mention_candidates, own_post_reply_candidates, parse_feed_posts_value,
+    parse_thread_value, proactive_candidates,
 };
 use crate::config::EngageConfig;
 use crate::jitter::{Rng, jitter_secs};
 use crate::planner::{Action, Plan, PlanInput, plan};
 use crate::prompt::{build_reply_prompt, parse_reply, screen_reply};
+use crate::quality::screen_proactive_reply;
 use crate::records::StrongRef;
 use crate::state::{ActionKind, ActionLog, StateEntry, append_entry};
 
@@ -160,7 +162,8 @@ pub async fn run(options: EngageOptions) -> Result<EngageReport> {
         }
     };
 
-    let (candidates, follows) = gather_live(&config, &session, &mut report.notes).await?;
+    let (candidates, follows) =
+        gather_live(&config, &session, &state, now, &mut report.notes).await?;
 
     let mut rng = Rng::from_clock();
     let chosen = plan(
@@ -182,16 +185,38 @@ pub async fn run(options: EngageOptions) -> Result<EngageReport> {
     }
 
     let registry = load_config(&options.providers_path).await?;
+    let our_tokens = our_account_tokens(&persona, &session);
     let mut execution = Execution {
         persona: &persona,
         session: &session,
         registry: &registry,
         config: &config,
         state_path: &options.state_path,
+        our_tokens: &our_tokens,
         rng: &mut rng,
     };
     report.executed = execution.perform_all(&chosen).await;
     Ok(report)
+}
+
+/// The strings a proactive reply must never contain: our handles, DID, display
+/// name and persona slug. Used by the deterministic quality bar.
+fn our_account_tokens(persona: &PersonaPack, session: &Session) -> Vec<String> {
+    let mut tokens = vec![
+        session.did.clone(),
+        session.handle.clone(),
+        persona.display_name.clone(),
+        persona.persona.clone(),
+    ];
+    for channel in &persona.channels {
+        if !channel.handle.trim().is_empty() {
+            tokens.push(channel.handle.clone());
+        }
+    }
+    tokens.retain(|token| token.trim().chars().count() >= 4);
+    tokens.sort();
+    tokens.dedup();
+    tokens
 }
 
 /// Describe the plan without any network call or write.
@@ -219,12 +244,18 @@ async fn dry_run(
     }
 
     let (candidates, follows) = match &options.fixture {
-        Some(path) => gather_offline(path, "").await?,
+        Some(path) => gather_offline(path, config, state, now, "").await?,
         None => {
             report.notes.push(format!(
                 "would fetch up to {} notifications and scan {} of our own posts for comments",
                 config.notification_limit, config.own_posts_to_scan
             ));
+            if config.proactive.enabled {
+                report.notes.push(format!(
+                    "would read the recent posts of up to {} curated accounts (newer than {}h)",
+                    config.proactive.accounts_per_run, config.proactive.max_post_age_hours
+                ));
+            }
             (Vec::new(), Vec::new())
         }
     };
@@ -250,6 +281,14 @@ async fn dry_run(
         config.caps.follows_per_week,
         config.caps.max_actions_per_run,
     ));
+    if config.proactive.enabled {
+        report.notes.push(format!(
+            "proactive: ≤{} reply/day, ≤{} per account/week, ≥{}h gap before the same account again",
+            config.proactive.replies_per_day,
+            config.proactive.replies_per_account_per_week,
+            config.proactive.min_gap_hours,
+        ));
+    }
     Ok(())
 }
 
@@ -296,7 +335,13 @@ fn delay_for(config: &EngageConfig, action: &Action, rng: &mut Rng) -> u64 {
 }
 
 /// Read candidates from an offline fixture (no network).
-async fn gather_offline(path: &Path, our_did: &str) -> Result<(Vec<Candidate>, Vec<FollowTarget>)> {
+async fn gather_offline(
+    path: &Path,
+    config: &EngageConfig,
+    state: &ActionLog,
+    now_unix: u64,
+    our_did: &str,
+) -> Result<(Vec<Candidate>, Vec<FollowTarget>)> {
     let raw = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("reading engagement fixture {}", path.display()))?;
@@ -309,8 +354,29 @@ async fn gather_offline(path: &Path, our_did: &str) -> Result<(Vec<Candidate>, V
         .map(parse_thread_value)
         .collect::<Result<Vec<_>>>()?;
     let replies = own_post_reply_candidates(&threads, our_did);
-    let candidates = combine(mentions, replies);
-    let follows = follow_candidates(&candidates, &fixture.profiles, our_did);
+    // Follows are driven by people who talked to us, never by cold proactive
+    // replies — a stranger's post is not an interaction with us.
+    let interactions = combine(mentions, replies);
+    let follows = follow_candidates(&interactions, &fixture.profiles, our_did);
+
+    let mut proactive = Vec::new();
+    if config.proactive.enabled {
+        for feed in &fixture.feeds {
+            let posts = parse_feed_posts_value(&feed.response)?;
+            proactive.extend(proactive_candidates(
+                &InterestFeed {
+                    did: &feed.profile.did,
+                    handle: &feed.profile.handle,
+                    posts: &posts,
+                },
+                now_unix,
+                config.proactive.max_age_secs(),
+                state,
+                config.proactive.candidates_per_account_per_run,
+            ));
+        }
+    }
+    let candidates = combine(interactions, proactive);
     Ok((candidates, follows))
 }
 
@@ -318,6 +384,8 @@ async fn gather_offline(path: &Path, our_did: &str) -> Result<(Vec<Candidate>, V
 async fn gather_live(
     config: &EngageConfig,
     session: &Session,
+    state: &ActionLog,
+    now_unix: u64,
     notes: &mut Vec<String>,
 ) -> Result<(Vec<Candidate>, Vec<FollowTarget>)> {
     let notifications = list_notifications(
@@ -360,10 +428,16 @@ async fn gather_live(
         Err(err) => notes.push(format!("could not read our own feed: {err:#}")),
     }
     let replies = own_post_reply_candidates(&threads, &session.did);
-    let candidates = combine(mentions, replies);
+    let interactions = combine(mentions, replies);
 
-    // Resolve only the accounts of interest we might actually follow.
-    let probe = (config.caps.follows_per_day.max(1) as usize) * 2;
+    // Resolve the curated accounts once: the same profiles drive slow follows
+    // and the proactive feed reads.
+    let follow_probe = (config.caps.follows_per_day.max(1) as usize) * 2;
+    let probe = if config.proactive.enabled {
+        follow_probe.max(config.proactive.accounts_per_run)
+    } else {
+        follow_probe
+    };
     let mut interests = Vec::new();
     for handle in config.interests.accounts.iter().take(probe) {
         match get_profile(DEFAULT_BLUESKY_READ_URL, handle, DEFAULT_ENGAGE_TIMEOUT).await {
@@ -371,7 +445,39 @@ async fn gather_live(
             Err(err) => notes.push(format!("could not resolve interest `{handle}`: {err:#}")),
         }
     }
-    let follows = follow_candidates(&candidates, &interests, &session.did);
+    let follows = follow_candidates(&interactions, &interests, &session.did);
+
+    let mut proactive = Vec::new();
+    if config.proactive.enabled {
+        let max_age = config.proactive.max_age_secs();
+        for profile in &interests {
+            match get_interest_feed(
+                DEFAULT_BLUESKY_READ_URL,
+                &profile.handle,
+                config.proactive.posts_per_account,
+                DEFAULT_ENGAGE_TIMEOUT,
+            )
+            .await
+            {
+                Ok(posts) => proactive.extend(proactive_candidates(
+                    &InterestFeed {
+                        did: &profile.did,
+                        handle: &profile.handle,
+                        posts: &posts,
+                    },
+                    now_unix,
+                    max_age,
+                    state,
+                    config.proactive.candidates_per_account_per_run,
+                )),
+                Err(err) => notes.push(format!(
+                    "could not read the feed of `{}`: {err:#}",
+                    profile.handle
+                )),
+            }
+        }
+    }
+    let candidates = combine(interactions, proactive);
     Ok((candidates, follows))
 }
 
@@ -382,6 +488,8 @@ struct Execution<'a> {
     registry: &'a ProvidersConfig,
     config: &'a EngageConfig,
     state_path: &'a Path,
+    /// Our handles/DID/name: a proactive reply must never name any of them.
+    our_tokens: &'a [String],
     rng: &'a mut Rng,
 }
 
@@ -443,7 +551,21 @@ impl Execution<'_> {
         };
 
         // A reply is content: the deterministic guardrail is mandatory.
-        let verdict = screen_reply(self.persona, &text);
+        let mut verdict = screen_reply(self.persona, &text);
+        // A proactive reply carries the extra quality bar: it must contribute,
+        // never flatter, link or name our own account.
+        if candidate.kind == CandidateKind::Proactive {
+            let quality = screen_proactive_reply(
+                &text,
+                self.our_tokens,
+                self.config.proactive.min_chars,
+                self.config.proactive.min_words,
+            );
+            if !quality.approved {
+                verdict.approved = false;
+                verdict.issues.extend(quality.issues);
+            }
+        }
         if !verdict.approved {
             let issues = verdict
                 .issues
@@ -470,6 +592,8 @@ impl Execution<'_> {
         self.record(
             ActionKind::Reply,
             &candidate.parent.uri,
+            &candidate.author_did,
+            candidate.kind.as_str(),
             &format!("{uri} :: {text}"),
         )
         .await?;
@@ -491,7 +615,8 @@ impl Execution<'_> {
             DEFAULT_ENGAGE_TIMEOUT,
         )
         .await?;
-        self.record(ActionKind::Like, &subject.uri, &uri).await?;
+        self.record(ActionKind::Like, &subject.uri, "", "contextual-like", &uri)
+            .await?;
         Ok(ExecutedAction::ok(
             "like",
             &subject.uri,
@@ -510,6 +635,8 @@ impl Execution<'_> {
         self.record(
             ActionKind::Follow,
             &target.did,
+            &target.did,
+            "interest",
             &format!("{} :: {uri}", target.handle),
         )
         .await?;
@@ -521,13 +648,22 @@ impl Execution<'_> {
     }
 
     /// Append an action to the JSONL state so it is never repeated.
-    async fn record(&self, kind: ActionKind, target: &str, detail: &str) -> Result<()> {
+    async fn record(
+        &self,
+        kind: ActionKind,
+        target: &str,
+        author_did: &str,
+        source: &str,
+        detail: &str,
+    ) -> Result<()> {
         let entry = StateEntry {
             at_unix: now_unix(),
             action: kind,
             target: target.to_string(),
             persona: self.persona.persona.clone(),
             detail: detail.to_string(),
+            author_did: author_did.to_string(),
+            source: source.to_string(),
         };
         append_entry(self.state_path, &entry).await
     }
@@ -542,6 +678,18 @@ struct Fixture {
     threads: Vec<serde_json::Value>,
     #[serde(default)]
     profiles: Vec<Profile>,
+    /// Curated accounts with a canned `getAuthorFeed` response each.
+    #[serde(default)]
+    feeds: Vec<FixtureFeed>,
+}
+
+/// One curated account's recent feed in an offline fixture.
+#[derive(Debug, Deserialize)]
+struct FixtureFeed {
+    profile: Profile,
+    /// A full `app.bsky.feed.getAuthorFeed` response (`{"feed": [...]}`).
+    #[serde(default)]
+    response: serde_json::Value,
 }
 
 #[cfg(test)]
@@ -581,12 +729,140 @@ mod tests {
         .await
         .expect("write fixture");
 
-        let (candidates, follows) = gather_offline(&path, "").await.expect("fixture reads");
+        let config = EngageConfig::parse_yaml("{}").expect("defaults");
+        let (candidates, follows) =
+            gather_offline(&path, &config, &ActionLog::default(), 1_791_795_600, "")
+                .await
+                .expect("fixture reads");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].author_handle, "them.bsky.social");
         assert_eq!(follows.len(), 2);
         assert_eq!(follows[0].reason, "interacted with us");
         assert_eq!(follows[1].handle, "gnome.org");
+
+        tokio::fs::remove_dir_all(&dir).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn offline_feed_yields_a_proactive_candidate() {
+        let dir = fixture_dir();
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        let path = dir.join("fixture.json");
+        tokio::fs::write(
+            &path,
+            r#"{
+              "feeds": [{
+                "profile": {"did": "did:plc:famous", "handle": "famous.bsky.social"},
+                "response": {"feed": [{
+                  "post": {
+                    "uri": "at://did:plc:famous/app.bsky.feed.post/1",
+                    "cid": "c1",
+                    "author": {"did": "did:plc:famous", "handle": "famous.bsky.social"},
+                    "record": {"text": "the new scheduler is here", "createdAt": "2026-10-12T08:00:00.000Z"},
+                    "indexedAt": "2026-10-12T08:00:01.000Z"
+                  }
+                }]}
+              }]
+            }"#,
+        )
+        .await
+        .expect("write fixture");
+
+        let config = EngageConfig::parse_yaml("{}").expect("defaults");
+        let now = 1_791_795_600; // 2026-10-12T09:00:00Z
+        let (candidates, follows) =
+            gather_offline(&path, &config, &ActionLog::default(), now, "did:plc:our")
+                .await
+                .expect("fixture reads");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].kind, CandidateKind::Proactive);
+        assert_eq!(candidates[0].author_handle, "famous.bsky.social");
+        // A cold proactive reply must NOT turn the stranger into a follow target.
+        assert!(follows.is_empty());
+
+        tokio::fs::remove_dir_all(&dir).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_prints_the_proactive_plan_without_the_network() {
+        let dir = fixture_dir();
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        let path = dir.join("fixture.json");
+        tokio::fs::write(
+            &path,
+            r#"{
+              "feeds": [{
+                "profile": {"did": "did:plc:famous", "handle": "famous.bsky.social"},
+                "response": {"feed": [
+                  {"post": {"uri": "at://did:plc:famous/app.bsky.feed.post/1", "cid": "c1",
+                            "author": {"did": "did:plc:famous", "handle": "famous.bsky.social"},
+                            "record": {"text": "the new scheduler is here", "createdAt": "2026-10-12T08:30:00.000Z"},
+                            "indexedAt": "2026-10-12T08:30:01.000Z"}},
+                  {"post": {"uri": "at://did:plc:famous/app.bsky.feed.post/2", "cid": "c2",
+                            "author": {"did": "did:plc:famous", "handle": "famous.bsky.social"},
+                            "record": {"text": "another fresh claim", "createdAt": "2026-10-12T08:00:00.000Z"},
+                            "indexedAt": "2026-10-12T08:00:01.000Z"}}
+                ]}
+              }]
+            }"#,
+        )
+        .await
+        .expect("write fixture");
+
+        // A window that always matches, no sporadic skip: the plan is visible.
+        let config_path = dir.join("engage.yaml");
+        tokio::fs::write(
+            &config_path,
+            "windows: [\"00:00\"]\nwindow_minutes: 1440\npacing: {run_skip_probability: 0.0}\n",
+        )
+        .await
+        .expect("write config");
+
+        let options = EngageOptions {
+            persona_path: dir.join("persona.yaml"),
+            config_path,
+            state_path: dir.join("state.jsonl"),
+            providers_path: dir.join("providers.yaml"),
+            fixture: Some(path),
+            dry_run: true,
+        };
+        tokio::fs::write(
+            &options.persona_path,
+            r#"
+persona: tech-curiosities
+display_name: Tech Curiosities
+niche: computing-technology-ai-linux-foss
+language: en
+voice: {tone: curious, audience: developers}
+rubric: {min_score: 0.75}
+channels:
+  - platform: bluesky
+    handle: example.bsky.social
+"#,
+        )
+        .await
+        .expect("write persona");
+
+        let report = run(options).await.expect("dry run");
+        assert!(report.dry_run);
+        assert!(!report.failed);
+        // The newest post per account becomes a planned proactive reply.
+        assert!(
+            report
+                .planned
+                .iter()
+                .any(|line| line.contains("proactive") && line.contains("famous.bsky.social")),
+            "planned: {:?}",
+            report.planned
+        );
+        println!("--- dry run plan ---");
+        for note in &report.notes {
+            println!("note    : {note}");
+        }
+        for line in &report.planned {
+            println!("planned : {line}");
+        }
 
         tokio::fs::remove_dir_all(&dir).await.expect("cleanup");
     }

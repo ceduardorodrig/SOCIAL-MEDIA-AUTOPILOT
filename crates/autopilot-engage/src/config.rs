@@ -60,6 +60,9 @@ pub struct EngageConfig {
     pub pacing: Pacing,
     #[serde(default)]
     pub interests: Interests,
+    /// Proactive commenting on the curated accounts of interest.
+    #[serde(default)]
+    pub proactive: Proactive,
     /// Notification reasons treated as "someone talked to us".
     #[serde(default = "default_notification_reasons")]
     pub notification_reasons: Vec<String>,
@@ -179,6 +182,115 @@ pub struct Interests {
     pub accounts: Vec<String>,
 }
 
+/// Proactive commenting: joining the conversation on curated accounts.
+///
+/// This is the growth mechanism the owner asked for, and the most dangerous one
+/// for a bot's reputation. Every default here is deliberately tight: few
+/// replies, one per account per week, a long minimum gap and a strict quality
+/// bar. It never advertises: see `quality.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Proactive {
+    /// Master switch for the whole proactive source.
+    #[serde(default = "default_proactive_enabled")]
+    pub enabled: bool,
+    /// How many curated accounts to probe per run.
+    #[serde(default = "default_proactive_accounts")]
+    pub accounts_per_run: usize,
+    /// How many recent posts to read per account.
+    #[serde(default = "default_proactive_posts")]
+    pub posts_per_account: usize,
+    /// Skip posts older than this (the conversation is already cold).
+    #[serde(default = "default_proactive_max_age_hours")]
+    pub max_post_age_hours: u64,
+    /// Candidates kept per account in a single gather (never a wall of posts).
+    #[serde(default = "default_proactive_candidates")]
+    pub candidates_per_account_per_run: usize,
+    /// Global ceiling on proactive replies per day, on top of `caps.replies_per_day`.
+    #[serde(default = "default_proactive_replies_per_day")]
+    pub replies_per_day: u32,
+    /// Hard weekly ceiling per account: never become that account's reply-guy.
+    #[serde(default = "default_proactive_replies_per_account_week")]
+    pub replies_per_account_per_week: u32,
+    /// Minimum hours before replying to the same account again.
+    #[serde(default = "default_proactive_min_gap_hours")]
+    pub min_gap_hours: u64,
+    /// Quality bar: minimum characters of a proactive reply.
+    #[serde(default = "default_quality_min_chars")]
+    pub min_chars: usize,
+    /// Quality bar: minimum words of a proactive reply.
+    #[serde(default = "default_quality_min_words")]
+    pub min_words: usize,
+}
+
+fn default_proactive_enabled() -> bool {
+    true
+}
+
+fn default_proactive_accounts() -> usize {
+    5
+}
+
+fn default_proactive_posts() -> usize {
+    5
+}
+
+fn default_proactive_max_age_hours() -> u64 {
+    36
+}
+
+fn default_proactive_candidates() -> usize {
+    1
+}
+
+fn default_proactive_replies_per_day() -> u32 {
+    2
+}
+
+fn default_proactive_replies_per_account_week() -> u32 {
+    1
+}
+
+fn default_proactive_min_gap_hours() -> u64 {
+    72
+}
+
+fn default_quality_min_chars() -> usize {
+    40
+}
+
+fn default_quality_min_words() -> usize {
+    8
+}
+
+impl Default for Proactive {
+    fn default() -> Self {
+        Self {
+            enabled: default_proactive_enabled(),
+            accounts_per_run: default_proactive_accounts(),
+            posts_per_account: default_proactive_posts(),
+            max_post_age_hours: default_proactive_max_age_hours(),
+            candidates_per_account_per_run: default_proactive_candidates(),
+            replies_per_day: default_proactive_replies_per_day(),
+            replies_per_account_per_week: default_proactive_replies_per_account_week(),
+            min_gap_hours: default_proactive_min_gap_hours(),
+            min_chars: default_quality_min_chars(),
+            min_words: default_quality_min_words(),
+        }
+    }
+}
+
+impl Proactive {
+    /// The freshness cut-off in seconds.
+    pub fn max_age_secs(&self) -> u64 {
+        self.max_post_age_hours.saturating_mul(3_600)
+    }
+
+    /// The minimum gap before replying to the same account again, in seconds.
+    pub fn min_gap_secs(&self) -> u64 {
+        self.min_gap_hours.saturating_mul(3_600)
+    }
+}
+
 impl EngageConfig {
     /// Load the configuration from a YAML file.
     pub async fn load(path: &Path) -> Result<Self> {
@@ -238,6 +350,18 @@ impl EngageConfig {
         }
         if self.pacing.follow_delay_min_secs > self.pacing.follow_delay_max_secs {
             bail!("pacing.follow_delay_min_secs must not exceed follow_delay_max_secs");
+        }
+        if self.proactive.max_post_age_hours == 0 {
+            bail!("proactive.max_post_age_hours must be greater than zero");
+        }
+        if self.proactive.candidates_per_account_per_run == 0 {
+            bail!("proactive.candidates_per_account_per_run must be at least 1");
+        }
+        if self.proactive.min_chars == 0 || self.proactive.min_words == 0 {
+            bail!("proactive quality thresholds must be greater than zero");
+        }
+        if self.proactive.replies_per_account_per_week == 0 && self.proactive.enabled {
+            bail!("proactive is enabled but replies_per_account_per_week is 0");
         }
         Ok(())
     }
@@ -310,6 +434,28 @@ mod tests {
     fn inconsistent_pacing_is_rejected() {
         let config = EngageConfig::parse_yaml("pacing: {delay_min_secs: 300, delay_max_secs: 10}")
             .expect("parses");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn proactive_defaults_are_conservative() {
+        let config = EngageConfig::parse_yaml("{}").expect("defaults");
+        config.validate().expect("defaults are valid");
+        assert!(config.proactive.enabled);
+        assert_eq!(config.proactive.replies_per_day, 2);
+        assert_eq!(config.proactive.replies_per_account_per_week, 1);
+        assert_eq!(config.proactive.min_gap_secs(), 72 * 3_600);
+        assert_eq!(config.proactive.max_age_secs(), 36 * 3_600);
+    }
+
+    #[test]
+    fn proactive_quality_thresholds_are_validated() {
+        let config = EngageConfig::parse_yaml("proactive: {min_chars: 0}").expect("still parses");
+        assert!(config.validate().is_err());
+
+        let config =
+            EngageConfig::parse_yaml("proactive: {enabled: true, replies_per_account_per_week: 0}")
+                .expect("still parses");
         assert!(config.validate().is_err());
     }
 

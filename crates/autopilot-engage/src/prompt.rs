@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use autopilot_core::{PersonaPack, Platform};
 use autopilot_guardrail::{Verdict, evaluate, platform_limit};
 
-use crate::candidates::Candidate;
+use crate::candidates::{Candidate, CandidateKind};
 
 /// Build the prompt that asks the chain for one in-context reply.
 pub fn build_reply_prompt(persona: &PersonaPack, candidate: &Candidate) -> String {
@@ -31,6 +31,15 @@ pub fn build_reply_prompt(persona: &PersonaPack, candidate: &Candidate) -> Strin
     };
     let limit = platform_limit(Platform::Bluesky);
 
+    let proactive = match candidate.kind {
+        CandidateKind::Proactive => {
+            "\n\
+             You are joining a stranger's conversation to CONTRIBUTE, never to advertise.\n\
+             Reply only if you can add something specific about the post above.\n"
+        }
+        _ => "",
+    };
+
     format!(
         "You are the engagement stage of an autonomous social-media engine.\n\
          Write ONE short reply in {language} on Bluesky, as {display_name} ({niche}).\n\n\
@@ -41,10 +50,12 @@ pub fn build_reply_prompt(persona: &PersonaPack, candidate: &Candidate) -> Strin
          Never touch these topics: {blocklist}\n\n\
          {author} wrote ({kind}):\n\"{parent}\"\n\n\
          Reply to THAT specific post: engage with its actual point and add something\n\
-         (a fact, an opinion, a small correction or a real question), staying in context.\n\
-         Never send a generic acknowledgement (\"Thanks!\", \"Great post!\").\n\
-         Do not @-mention anyone and do not add hashtags. Reply with the plain text\n\
-         only — no quotes, no markdown — at most {limit} characters.",
+         (a fact, a correction, a concrete experience or a real question), staying in context.\n\
+         Quality bar: never send a generic acknowledgement (\"Thanks!\", \"Great post!\"),\n\
+         never agree without adding anything, and never turn the reply into a plug.\n\
+         Never include a link, never name or mention our own account ({display_name}),\n\
+         never add hashtags. Reply with the plain text only — no quotes, no markdown —\n\
+         at most {limit} characters.{proactive}",
         language = persona.language,
         display_name = persona.display_name,
         niche = persona.niche,
@@ -57,6 +68,7 @@ pub fn build_reply_prompt(persona: &PersonaPack, candidate: &Candidate) -> Strin
         kind = candidate.kind.as_str(),
         parent = candidate.text,
         limit = limit,
+        proactive = proactive,
     )
 }
 
@@ -126,39 +138,34 @@ fn strip_leading_mention(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autopilot_core::{Channel, Rubric, Voice};
 
     use crate::records::StrongRef;
 
+    /// Build the persona from YAML so this test does not break when the persona
+    /// pack grows a new (defaulted) field — the pack is data, not a struct literal.
     fn persona() -> PersonaPack {
-        PersonaPack {
-            persona: "tech-curiosities".into(),
-            display_name: "Tech Curiosities".into(),
-            niche: "computing-technology-ai-linux-foss".into(),
-            language: "en".into(),
-            active: false,
-            voice: Voice {
-                tone: "a curious engineer talking to peers".into(),
-                audience: "developers and sysadmins".into(),
-                guidelines: vec!["write like a person on a forum".into()],
-                banned_phrases: vec!["game-changer".into()],
-                max_hashtags: 2,
-                emojis_allowed: true,
-            },
-            few_shot: vec![],
-            blocklist: vec!["crypto/token shilling".into()],
-            rubric: Rubric {
-                min_score: 0.75,
-                criteria: vec![],
-            },
-            channels: vec![Channel {
-                platform: Platform::Bluesky,
-                handle: "example.bsky.social".into(),
-                enabled: true,
-                posts_per_day: 2,
-                windows: vec![],
-            }],
-        }
+        let yaml = r#"
+persona: tech-curiosities
+display_name: Tech Curiosities
+niche: computing-technology-ai-linux-foss
+language: en
+voice:
+  tone: a curious engineer talking to peers
+  audience: developers and sysadmins
+  guidelines: ["write like a person on a forum"]
+  banned_phrases: ["game-changer"]
+  max_hashtags: 2
+  emojis_allowed: true
+blocklist: ["crypto/token shilling"]
+rubric:
+  min_score: 0.75
+channels:
+  - platform: bluesky
+    handle: example.bsky.social
+    enabled: true
+    posts_per_day: 2
+"#;
+        serde_yaml_ng::from_str(yaml).expect("persona fixture parses")
     }
 
     fn candidate() -> Candidate {
@@ -182,6 +189,21 @@ mod tests {
         assert!(prompt.contains("game-changer"));
         assert!(prompt.contains("crypto/token shilling"));
         assert!(prompt.contains("mention"));
+    }
+
+    #[test]
+    fn the_proactive_prompt_states_the_no_plug_rule() {
+        let mut proactive = candidate();
+        proactive.kind = CandidateKind::Proactive;
+        let prompt = build_reply_prompt(&persona(), &proactive);
+        assert!(prompt.contains("proactive"));
+        assert!(prompt.contains("never to advertise"));
+        assert!(prompt.contains("never name or mention our own account"));
+
+        // A mention reply keeps the quality bar but not the stranger wording.
+        let mention = build_reply_prompt(&persona(), &candidate());
+        assert!(!mention.contains("never to advertise"));
+        assert!(mention.contains("Quality bar"));
     }
 
     #[test]

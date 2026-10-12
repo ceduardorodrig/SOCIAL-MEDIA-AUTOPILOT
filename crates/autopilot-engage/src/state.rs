@@ -40,6 +40,15 @@ pub struct StateEntry {
     pub persona: String,
     #[serde(default)]
     pub detail: String,
+    /// Author DID of the post this action touched (empty for follows/likes).
+    /// It is what makes the per-account caps possible.
+    #[serde(default)]
+    pub author_did: String,
+    /// Where the action came from: `mention`, `reply-to-us`, `comment`,
+    /// `proactive`, `contextual-like` or `interest`. Used to cap proactive
+    /// replies separately from the answers to people who talked to us.
+    #[serde(default)]
+    pub source: String,
 }
 
 /// The in-memory view of the log.
@@ -112,6 +121,36 @@ impl ActionLog {
     pub fn count_this_week(&self, kind: ActionKind, now_unix: u64) -> u32 {
         self.count_since(kind, week_start_unix(now_unix))
     }
+
+    /// Number of replies recorded to `author_did` at or after `since_unix`.
+    pub fn count_replies_to_author_since(&self, author_did: &str, since_unix: u64) -> u32 {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.action == ActionKind::Reply
+                    && entry.author_did == author_did
+                    && entry.at_unix >= since_unix
+            })
+            .count() as u32
+    }
+
+    /// When we last replied to `author_did`, if ever.
+    pub fn last_reply_to_author(&self, author_did: &str) -> Option<u64> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.action == ActionKind::Reply && entry.author_did == author_did)
+            .map(|entry| entry.at_unix)
+            .max()
+    }
+
+    /// Number of actions of any kind recorded today whose `source` matches.
+    pub fn count_source_today(&self, source: &str, now_unix: u64) -> u32 {
+        let since = day_start_unix(now_unix);
+        self.entries
+            .iter()
+            .filter(|entry| entry.source == source && entry.at_unix >= since)
+            .count() as u32
+    }
 }
 
 /// Start of the UTC day containing `now_unix`.
@@ -141,6 +180,20 @@ mod tests {
             target: target.to_string(),
             persona: "tech-curiosities".to_string(),
             detail: String::new(),
+            author_did: String::new(),
+            source: String::new(),
+        }
+    }
+
+    fn reply_to(at_unix: u64, author_did: &str, source: &str) -> StateEntry {
+        StateEntry {
+            at_unix,
+            action: ActionKind::Reply,
+            target: format!("at://{author_did}/post"),
+            persona: "tech-curiosities".to_string(),
+            detail: String::new(),
+            author_did: author_did.to_string(),
+            source: source.to_string(),
         }
     }
 
@@ -171,6 +224,36 @@ mod tests {
         assert_eq!(log.count_today(ActionKind::Reply, now), 1);
         assert_eq!(log.count_today(ActionKind::Like, now), 1);
         assert_eq!(log.count_today(ActionKind::Reply, now + 86_400), 0);
+    }
+
+    #[test]
+    fn per_author_caps_and_sources_are_tracked() {
+        let now = 1_700_000_000;
+        let log = ActionLog::from_entries(vec![
+            reply_to(now - 3_600, "did:plc:famous", "proactive"),
+            reply_to(now - 86_400 * 2, "did:plc:famous", "proactive"),
+            reply_to(now - 86_400 * 9, "did:plc:famous", "proactive"),
+            reply_to(now - 100, "did:plc:friend", "mention"),
+        ]);
+
+        // The two recent replies fall inside the 7-day bucket; the old one does not.
+        assert_eq!(
+            log.count_replies_to_author_since("did:plc:famous", week_start_unix(now)),
+            2
+        );
+        assert_eq!(
+            log.count_replies_to_author_since("did:plc:friend", week_start_unix(now)),
+            1
+        );
+        assert_eq!(
+            log.last_reply_to_author("did:plc:famous"),
+            Some(now - 3_600)
+        );
+        assert_eq!(log.last_reply_to_author("did:plc:nobody"), None);
+
+        // Only the proactive reply happened today.
+        assert_eq!(log.count_source_today("proactive", now), 1);
+        assert_eq!(log.count_source_today("mention", now), 1);
     }
 
     #[test]

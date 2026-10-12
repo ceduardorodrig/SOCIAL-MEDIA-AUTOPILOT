@@ -4,11 +4,11 @@
 //! per-run budget, the contextual-like rule and the sporadic skip are all
 //! unit-testable without touching the network or the clock.
 
-use crate::candidates::{Candidate, FollowTarget};
+use crate::candidates::{Candidate, CandidateKind, FollowTarget};
 use crate::config::EngageConfig;
 use crate::jitter::Rng;
 use crate::records::StrongRef;
-use crate::state::{ActionKind, ActionLog};
+use crate::state::{ActionKind, ActionLog, week_start_unix};
 
 /// One planned write.
 #[derive(Debug, Clone)]
@@ -106,6 +106,15 @@ pub fn plan(input: &PlanInput, rng: &mut Rng) -> Plan {
             .count_this_week(ActionKind::Follow, input.now_unix),
     );
 
+    // Proactive replies have their own tight budget and per-account caps on top
+    // of the global reply cap: never become one account's reply-guy.
+    let proactive = &input.config.proactive;
+    let proactive_day_room = remaining(
+        proactive.replies_per_day,
+        input.state.count_source_today("proactive", input.now_unix),
+    );
+    let mut proactive_replies = 0usize;
+
     // Highest relevance first, with a stable tie-break on the URI.
     let mut ordered: Vec<&Candidate> = input.candidates.iter().collect();
     ordered.sort_by(|a, b| {
@@ -122,6 +131,15 @@ pub fn plan(input: &PlanInput, rng: &mut Rng) -> Plan {
         }
         if input.state.has(ActionKind::Reply, &candidate.parent.uri) {
             continue;
+        }
+        if candidate.kind == CandidateKind::Proactive {
+            if !proactive.enabled || proactive_replies >= proactive_day_room {
+                continue;
+            }
+            if !proactive_account_has_room(input, candidate, &actions) {
+                continue;
+            }
+            proactive_replies += 1;
         }
         actions.push(Action::Reply(candidate.clone()));
         replies += 1;
@@ -177,6 +195,35 @@ fn remaining(cap: u32, used: u32) -> usize {
     cap.saturating_sub(used) as usize
 }
 
+/// Whether a proactive reply to `candidate`'s author is allowed right now.
+///
+/// Three independent guards: the weekly per-account cap, the minimum gap since
+/// the last reply to that account, and a single-reply-per-account rule inside
+/// the run being planned.
+fn proactive_account_has_room(
+    input: &PlanInput,
+    candidate: &Candidate,
+    planned: &[Action],
+) -> bool {
+    let proactive = &input.config.proactive;
+    let weekly = input
+        .state
+        .count_replies_to_author_since(&candidate.author_did, week_start_unix(input.now_unix));
+    if weekly >= proactive.replies_per_account_per_week {
+        return false;
+    }
+    if let Some(last) = input.state.last_reply_to_author(&candidate.author_did)
+        && input.now_unix < last.saturating_add(proactive.min_gap_secs())
+    {
+        return false;
+    }
+    !planned.iter().any(|action| {
+        matches!(action, Action::Reply(existing)
+            if existing.kind == CandidateKind::Proactive
+                && existing.author_did == candidate.author_did)
+    })
+}
+
 fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -224,6 +271,32 @@ mod tests {
             target: target.to_string(),
             persona: "tech-curiosities".to_string(),
             detail: String::new(),
+            author_did: String::new(),
+            source: String::new(),
+        }
+    }
+
+    fn reply_to_author(author_did: &str, at_unix: u64) -> StateEntry {
+        StateEntry {
+            at_unix,
+            action: ActionKind::Reply,
+            target: format!("at://{author_did}/post"),
+            persona: "tech-curiosities".to_string(),
+            detail: String::new(),
+            author_did: author_did.to_string(),
+            source: "proactive".to_string(),
+        }
+    }
+
+    fn proactive(uri: &str, author_did: &str) -> Candidate {
+        Candidate {
+            kind: CandidateKind::Proactive,
+            parent: StrongRef::new(uri, "cid"),
+            root: StrongRef::new(uri, "cid"),
+            author_did: author_did.to_string(),
+            author_handle: "famous.bsky.social".to_string(),
+            text: "a fresh claim about the kernel scheduler".to_string(),
+            score: CandidateKind::Proactive.base_score(),
         }
     }
 
@@ -379,6 +452,121 @@ mod tests {
         };
         let blocked = plan(&input, &mut Rng::from_seed(6));
         assert!(blocked.actions.is_empty());
+    }
+
+    #[test]
+    fn a_proactive_reply_respects_the_weekly_per_account_cap() {
+        let cfg = config(
+            "pacing: {run_skip_probability: 0.0}\n\
+             caps: {replies_per_day: 10, likes_per_day: 0, max_actions_per_run: 10}\n\
+             proactive: {replies_per_day: 5, replies_per_account_per_week: 1, min_gap_hours: 0}",
+        );
+        let candidates = [
+            proactive("at://p1", "did:plc:famous"),
+            proactive("at://p2", "did:plc:other"),
+        ];
+        // We already replied to `famous` this week.
+        let state = ActionLog::from_entries(vec![reply_to_author("did:plc:famous", NOW - 3_600)]);
+        let input = PlanInput {
+            candidates: &candidates,
+            follows: &[],
+            state: &state,
+            config: &cfg,
+            now_unix: NOW,
+        };
+        let plan = plan(&input, &mut Rng::from_seed(11));
+        let replies: Vec<_> = plan
+            .actions
+            .iter()
+            .filter(|a| a.kind() == ActionKind::Reply)
+            .collect();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].target(), "at://p2");
+    }
+
+    #[test]
+    fn a_proactive_reply_respects_the_minimum_gap() {
+        let cfg = config(
+            "pacing: {run_skip_probability: 0.0}\n\
+             caps: {replies_per_day: 10, likes_per_day: 0, max_actions_per_run: 10}\n\
+             proactive: {replies_per_day: 5, replies_per_account_per_week: 5, min_gap_hours: 72}",
+        );
+        let candidates = [
+            proactive("at://p1", "did:plc:famous"),
+            proactive("at://p2", "did:plc:other"),
+        ];
+        // A reply one hour ago is well inside the 72-hour gap.
+        let state = ActionLog::from_entries(vec![reply_to_author("did:plc:famous", NOW - 3_600)]);
+        let input = PlanInput {
+            candidates: &candidates,
+            follows: &[],
+            state: &state,
+            config: &cfg,
+            now_unix: NOW,
+        };
+        let plan = plan(&input, &mut Rng::from_seed(12));
+        let replies: Vec<_> = plan
+            .actions
+            .iter()
+            .filter(|a| a.kind() == ActionKind::Reply)
+            .collect();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].target(), "at://p2");
+    }
+
+    #[test]
+    fn proactive_replies_have_their_own_daily_budget() {
+        let cfg = config(
+            "pacing: {run_skip_probability: 0.0}\n\
+             caps: {replies_per_day: 10, likes_per_day: 0, max_actions_per_run: 10}\n\
+             proactive: {replies_per_day: 1, replies_per_account_per_week: 5, min_gap_hours: 0}",
+        );
+        let candidates = [
+            proactive("at://p1", "did:plc:a"),
+            proactive("at://p2", "did:plc:b"),
+        ];
+        let input = PlanInput {
+            candidates: &candidates,
+            follows: &[],
+            state: &ActionLog::default(),
+            config: &cfg,
+            now_unix: NOW,
+        };
+        let plan = plan(&input, &mut Rng::from_seed(13));
+        let replies = plan
+            .actions
+            .iter()
+            .filter(|a| a.kind() == ActionKind::Reply)
+            .count();
+        assert_eq!(replies, 1);
+    }
+
+    #[test]
+    fn proactive_is_disabled_by_the_master_switch() {
+        let cfg = config(
+            "pacing: {run_skip_probability: 0.0}\n\
+             caps: {replies_per_day: 10, likes_per_day: 0, max_actions_per_run: 10}\n\
+             proactive: {enabled: false}",
+        );
+        let candidates = [
+            candidate("at://mention", 30),
+            proactive("at://p1", "did:plc:famous"),
+        ];
+        let input = PlanInput {
+            candidates: &candidates,
+            follows: &[],
+            state: &ActionLog::default(),
+            config: &cfg,
+            now_unix: NOW,
+        };
+        let plan = plan(&input, &mut Rng::from_seed(14));
+        let replies: Vec<_> = plan
+            .actions
+            .iter()
+            .filter(|a| a.kind() == ActionKind::Reply)
+            .collect();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].target(), "at://mention");
     }
 
     #[test]

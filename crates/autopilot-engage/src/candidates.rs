@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::records::StrongRef;
+use crate::state::{ActionKind, ActionLog};
 
 /// Why a post is a candidate for a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,15 +21,23 @@ pub enum CandidateKind {
     ReplyToUs,
     /// Someone commented on one of our posts (read from the thread).
     OwnPostReply,
+    /// A recent post by a curated account of interest: we join the conversation
+    /// proactively to contribute, never to advertise (see `quality.rs`).
+    Proactive,
 }
 
 impl CandidateKind {
-    /// Deterministic relevance weight (mentions outrank passive comments).
+    /// Deterministic relevance weight.
+    ///
+    /// Mentions and replies addressed to us always outrank a passive comment,
+    /// and a proactive reply to a stranger outranks nothing: it is the lowest
+    /// priority, so the stage never drowns real conversations in cold replies.
     pub fn base_score(self) -> u32 {
         match self {
             CandidateKind::Mention => 30,
             CandidateKind::ReplyToUs => 25,
             CandidateKind::OwnPostReply => 20,
+            CandidateKind::Proactive => 15,
         }
     }
 
@@ -38,6 +47,7 @@ impl CandidateKind {
             CandidateKind::Mention => "mention",
             CandidateKind::ReplyToUs => "reply-to-us",
             CandidateKind::OwnPostReply => "comment",
+            CandidateKind::Proactive => "proactive",
         }
     }
 }
@@ -107,6 +117,22 @@ pub struct PostView {
     pub author: Author,
     #[serde(default)]
     pub record: serde_json::Value,
+    /// When the AppView indexed the post (`getAuthorFeed` always sends it).
+    #[serde(default)]
+    pub indexed_at: String,
+}
+
+/// One `getAuthorFeed` item, with the flags proactive selection needs.
+///
+/// `app.bsky.feed.getAuthorFeed` returns a `feedViewPost`: `post` is the
+/// hydrated post, `reason` is present only for a repost, and `reply` (or the
+/// record's own `reply` ref, `app.bsky.feed.post#replyRef`) marks a post that is
+/// itself an answer. Reposts and replies are never proactive candidates.
+#[derive(Debug, Clone)]
+pub struct FeedPost {
+    pub post: PostView,
+    pub is_repost: bool,
+    pub is_reply: bool,
 }
 
 /// A thread rooted at one of our posts, flattened to its replies.
@@ -150,16 +176,42 @@ pub fn parse_profile(raw: &str) -> Result<Profile> {
 
 /// Parse a `getAuthorFeed` payload into our own top-level posts.
 pub fn parse_author_feed(raw: &str) -> Result<Vec<OwnPost>> {
-    let response: FeedResponse = serde_json::from_str(raw).context("invalid getAuthorFeed JSON")?;
-    Ok(response
-        .feed
+    Ok(parse_feed_posts(raw)?
         .into_iter()
-        .filter(|item| item.post.record.get("reply").is_none())
+        .filter(|item| !item.is_repost && !item.is_reply)
         .map(|item| OwnPost {
             uri: item.post.uri,
             cid: item.post.cid,
         })
         .collect())
+}
+
+/// Parse a `getAuthorFeed` payload into feed items with their selection flags.
+pub fn parse_feed_posts(raw: &str) -> Result<Vec<FeedPost>> {
+    let response: FeedResponse = serde_json::from_str(raw).context("invalid getAuthorFeed JSON")?;
+    Ok(feed_posts_from_items(&response.feed))
+}
+
+/// Parse an already-decoded `getAuthorFeed` payload.
+pub fn parse_feed_posts_value(value: &serde_json::Value) -> Result<Vec<FeedPost>> {
+    let response: FeedResponse =
+        serde_json::from_value(value.clone()).context("invalid getAuthorFeed JSON")?;
+    Ok(feed_posts_from_items(&response.feed))
+}
+
+/// Decode raw `feedViewPost` items into [`FeedPost`]s.
+fn feed_posts_from_items(items: &[serde_json::Value]) -> Vec<FeedPost> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let view: FeedItem = serde_json::from_value(item.clone()).ok()?;
+            Some(FeedPost {
+                is_repost: view.reason.is_some(),
+                is_reply: view.reply.is_some() || view.post.record.get("reply").is_some(),
+                post: view.post,
+            })
+        })
+        .collect()
 }
 
 /// Parse a `getPostThread` payload.
@@ -255,6 +307,55 @@ pub fn own_post_reply_candidates(threads: &[Thread], our_did: &str) -> Vec<Candi
     dedupe(candidates)
 }
 
+/// One curated account and its recently read feed.
+pub struct InterestFeed<'a> {
+    pub did: &'a str,
+    pub handle: &'a str,
+    pub posts: &'a [FeedPost],
+}
+
+/// Turn the recent posts of a curated account into proactive reply candidates.
+///
+/// A post qualifies when it is **not** a repost, **not** a reply, is fresh
+/// enough (`max_age_secs`) and was **not** handled before (checked against the
+/// state log). The newest `per_account_cap` posts survive, so one account can
+/// never flood a single gather.
+pub fn proactive_candidates(
+    account: &InterestFeed<'_>,
+    now_unix: u64,
+    max_age_secs: u64,
+    handled: &ActionLog,
+    per_account_cap: usize,
+) -> Vec<Candidate> {
+    let mut fresh: Vec<&FeedPost> = account
+        .posts
+        .iter()
+        .filter(|item| !item.is_repost && !item.is_reply)
+        .filter(|item| !record_text(&item.post.record).trim().is_empty())
+        .filter(|item| {
+            post_created_unix(&item.post)
+                .is_some_and(|created| now_unix.saturating_sub(created) <= max_age_secs)
+        })
+        .filter(|item| !handled.has(ActionKind::Reply, &item.post.uri))
+        .collect();
+    fresh.sort_by_key(|item| std::cmp::Reverse(post_created_unix(&item.post)));
+    fresh.truncate(per_account_cap);
+
+    fresh
+        .into_iter()
+        .map(|item| Candidate {
+            kind: CandidateKind::Proactive,
+            // A top-level post is its own thread root: root == parent.
+            parent: StrongRef::new(item.post.uri.clone(), item.post.cid.clone()),
+            root: StrongRef::new(item.post.uri.clone(), item.post.cid.clone()),
+            author_did: account.did.to_string(),
+            author_handle: account.handle.to_string(),
+            text: record_text(&item.post.record),
+            score: CandidateKind::Proactive.base_score(),
+        })
+        .collect()
+}
+
 /// Combine the accounts that interacted with us and the curated accounts of
 /// interest into a single, deduplicated follow list (interactions first).
 pub fn follow_candidates(
@@ -314,6 +415,74 @@ fn dedupe(candidates: Vec<Candidate>) -> Vec<Candidate> {
     out
 }
 
+/// The creation time of a post, in Unix seconds.
+///
+/// Prefers the record's own `createdAt` (the client-declared time) and falls
+/// back to the AppView `indexedAt`. Returns `None` when neither parses, so an
+/// undated post is simply skipped instead of guessed.
+pub fn post_created_unix(post: &PostView) -> Option<u64> {
+    let created = post
+        .record
+        .get("createdAt")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_rfc3339_unix);
+    created.or_else(|| parse_rfc3339_unix(&post.indexed_at))
+}
+
+/// Parse an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) to Unix
+/// seconds. Offsets other than `Z` are rejected; AT Protocol timestamps are UTC.
+pub fn parse_rfc3339_unix(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let (date, rest) = value.split_once('T')?;
+    let rest = rest.strip_suffix('Z')?;
+    let time = rest.split_once('.').map_or(rest, |(head, _)| head);
+
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+
+    let mut time_parts = time.split(':');
+    let hour: u32 = time_parts.next()?.parse().ok()?;
+    let minute: u32 = time_parts.next()?.parse().ok()?;
+    let second: u32 = time_parts.next()?.parse().ok()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        return None;
+    }
+    Some(
+        days as u64 * 86_400 + u64::from(hour) * 3_600 + u64::from(minute) * 60 + u64::from(second),
+    )
+}
+
+/// Days since the Unix epoch for a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`, valid for all years).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 } as i64;
+    let day_of_year = (153 * shifted_month + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 /// The text of a post record, when present.
 fn record_text(record: &serde_json::Value) -> String {
     record
@@ -335,17 +504,24 @@ fn reply_root(record: &serde_json::Value) -> Option<StrongRef> {
 #[derive(Debug, Deserialize)]
 struct FeedResponse {
     #[serde(default)]
-    feed: Vec<FeedItem>,
+    feed: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct FeedItem {
     post: PostView,
+    /// Present only when the item is a repost (`feedViewPost.reason`).
+    #[serde(default)]
+    reason: Option<serde_json::Value>,
+    /// Present when the feed item is a reply (`feedViewPost.reply`).
+    #[serde(default)]
+    reply: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::StateEntry;
 
     const OUR_DID: &str = "did:plc:our";
 
@@ -520,6 +696,128 @@ mod tests {
         assert_eq!(targets[0].reason, "interacted with us");
         assert_eq!(targets[1].did, "did:plc:gnome");
         assert_eq!(targets[1].reason, "account of interest");
+    }
+
+    fn feed_item(uri: &str, text: &str, created_at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "post": {
+                "uri": uri,
+                "cid": "cid",
+                "author": {"did": "did:plc:interest", "handle": "interest.bsky.social"},
+                "record": {"text": text, "createdAt": created_at},
+                "indexedAt": created_at
+            }
+        })
+    }
+
+    const FRESH: &str = "2026-10-12T09:00:00.000Z";
+    const NOW: u64 = 1_791_795_600; // 2026-10-12T09:00:00Z
+
+    #[test]
+    fn rfc3339_parses_utc_and_rejects_other_shapes() {
+        assert_eq!(parse_rfc3339_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339_unix("2026-10-12T00:00:00.000Z"),
+            Some(1_791_763_200)
+        );
+        assert_eq!(parse_rfc3339_unix("2026-10-12T09:00:00Z"), Some(NOW));
+        assert!(parse_rfc3339_unix("2026-10-12T09:00:00+02:00").is_none());
+        assert!(parse_rfc3339_unix("not a date").is_none());
+    }
+
+    #[test]
+    fn feed_selection_filters_age_repost_reply_and_handled() {
+        let raw = serde_json::json!({
+            "feed": [
+                feed_item("at://a/fresh", "a fresh take on the scheduler", FRESH),
+                {
+                    "reason": {"$type": "app.bsky.feed.defs#reasonRepost"},
+                    "post": feed_item("at://a/repost", "someone else's post", FRESH)["post"]
+                },
+                {
+                    "post": {
+                        "uri": "at://a/reply",
+                        "cid": "cid",
+                        "author": {"did": "did:plc:interest", "handle": "interest.bsky.social"},
+                        "record": {
+                            "text": "answering someone",
+                            "createdAt": FRESH,
+                            "reply": {"root": {"uri": "at://x", "cid": "y"},
+                                      "parent": {"uri": "at://x", "cid": "y"}}
+                        }
+                    }
+                },
+                feed_item("at://a/old", "stale post", "2026-10-11T00:00:00.000Z")
+            ]
+        })
+        .to_string();
+        let posts = parse_feed_posts(&raw).expect("feed parses");
+        assert_eq!(posts.len(), 4);
+
+        let account = InterestFeed {
+            did: "did:plc:interest",
+            handle: "interest.bsky.social",
+            posts: &posts,
+        };
+
+        // Nothing handled yet: only the fresh top-level post survives.
+        let fresh = proactive_candidates(&account, NOW, 21_600, &ActionLog::default(), 5);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].parent.uri, "at://a/fresh");
+        assert_eq!(fresh[0].kind, CandidateKind::Proactive);
+        assert_eq!(fresh[0].root, fresh[0].parent);
+
+        // Already answered: the same post is dropped.
+        let handled = ActionLog::from_entries(vec![StateEntry {
+            at_unix: NOW,
+            action: ActionKind::Reply,
+            target: "at://a/fresh".to_string(),
+            persona: "tech-curiosities".to_string(),
+            detail: String::new(),
+            author_did: "did:plc:interest".to_string(),
+            source: "proactive".to_string(),
+        }]);
+        assert!(proactive_candidates(&account, NOW, 21_600, &handled, 5).is_empty());
+    }
+
+    #[test]
+    fn proactive_candidates_keep_the_newest_per_account() {
+        let raw = serde_json::json!({
+            "feed": [
+                feed_item("at://a/1", "one", "2026-10-12T08:00:00.000Z"),
+                feed_item("at://a/2", "two", "2026-10-12T08:30:00.000Z"),
+                feed_item("at://a/3", "three", "2026-10-12T09:00:00.000Z")
+            ]
+        })
+        .to_string();
+        let posts = parse_feed_posts(&raw).expect("feed parses");
+        let account = InterestFeed {
+            did: "did:plc:interest",
+            handle: "interest.bsky.social",
+            posts: &posts,
+        };
+
+        let chosen = proactive_candidates(&account, NOW, 86_400, &ActionLog::default(), 2);
+        assert_eq!(chosen.len(), 2);
+        assert_eq!(chosen[0].parent.uri, "at://a/3");
+        assert_eq!(chosen[1].parent.uri, "at://a/2");
+    }
+
+    #[test]
+    fn a_repost_is_never_parsed_as_our_own_post() {
+        let raw = serde_json::json!({
+            "feed": [
+                {
+                    "reason": {"$type": "app.bsky.feed.defs#reasonRepost"},
+                    "post": feed_item("at://us/repost", "repost", FRESH)["post"]
+                },
+                feed_item("at://us/own", "our own post", FRESH)
+            ]
+        })
+        .to_string();
+        let posts = parse_author_feed(&raw).expect("feed parses");
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].uri, "at://us/own");
     }
 
     #[test]
