@@ -24,16 +24,9 @@ pub struct BlueskyCredentials {
 impl BlueskyCredentials {
     /// Read `BLUESKY_HANDLE` / `BLUESKY_APP_PASSWORD` from the environment.
     pub fn from_env() -> Result<Self> {
-        let handle = std::env::var("BLUESKY_HANDLE")
-            .context("missing environment variable BLUESKY_HANDLE")?;
-        let app_password = std::env::var("BLUESKY_APP_PASSWORD")
-            .context("missing environment variable BLUESKY_APP_PASSWORD")?;
-        if handle.trim().is_empty() || app_password.trim().is_empty() {
-            bail!("BLUESKY_HANDLE and BLUESKY_APP_PASSWORD must not be empty");
-        }
         Ok(Self {
-            handle,
-            app_password,
+            handle: crate::env_var("BLUESKY_HANDLE")?,
+            app_password: crate::env_var("BLUESKY_APP_PASSWORD")?,
         })
     }
 }

@@ -25,9 +25,11 @@ use autopilot_providers::{
     write_baseline,
 };
 use autopilot_publish::{
-    BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, build_post_record, create_post, create_session,
-    now_rfc3339_millis, post_url,
+    BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, DEFAULT_X_API_BASE_URL, XCredentials, X_ENV_VARS,
+    build_post_record, build_tweet_body, create_post, create_session, missing_env_vars,
+    now_rfc3339_millis, post_endpoint, post_url,
 };
+use autopilot_publish::x::create_post as create_x_post;
 use autopilot_run::{RunOptions, RunReport, StageOutcome};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -263,10 +265,14 @@ enum CreateCommand {
 
 #[derive(Subcommand)]
 enum PublishCommand {
-    /// Verify the Bluesky credentials without creating any post.
+    /// Verify publishing credentials without creating any post.
     Auth {
-        #[arg(long, default_value = DEFAULT_BLUESKY_BASE_URL)]
-        base_url: String,
+        /// Platform whose credentials to check.
+        #[arg(long, value_parser = parse_platform, default_value = "bluesky")]
+        platform: Platform,
+        /// Base URL of the platform API (defaults to the platform's entry point).
+        #[arg(long)]
+        base_url: Option<String>,
     },
     /// Publish a guardrail-approved draft to Bluesky.
     Bluesky {
@@ -277,6 +283,18 @@ enum PublishCommand {
         #[arg(long, default_value = DEFAULT_BLUESKY_BASE_URL)]
         base_url: String,
         /// Print the record that would be posted without calling the API.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Publish a guardrail-approved draft to X (Twitter).
+    X {
+        #[arg(long)]
+        persona: PathBuf,
+        #[arg(long)]
+        text: String,
+        #[arg(long, default_value = DEFAULT_X_API_BASE_URL)]
+        base_url: String,
+        /// Print the request that would be sent without calling the API.
         #[arg(long)]
         dry_run: bool,
     },
