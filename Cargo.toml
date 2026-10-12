@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/autopilot-core",
+    "crates/autopilot-harvest",
     "crates/autopilot-providers",
     "crates/autopilot-cli",
 ]

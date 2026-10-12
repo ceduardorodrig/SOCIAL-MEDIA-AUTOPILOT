@@ -16,4 +16,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 autopilot-core = { path = "../autopilot-core" }
+autopilot-harvest = { path = "../autopilot-harvest" }
 autopilot-providers = { path = "../autopilot-providers" }

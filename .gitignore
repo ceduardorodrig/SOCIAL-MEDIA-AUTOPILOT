@@ -1,4 +1,5 @@
 /target
+/var
 **/*.rs.bk
 .env
 .env.*

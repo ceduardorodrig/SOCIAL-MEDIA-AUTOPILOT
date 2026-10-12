@@ -45,7 +45,8 @@ code change.
 ```
 crates/
   autopilot-core/       persona pack model + validation
-  autopilot-providers/  provider registry, availability probes, fallback chain
+  autopilot-harvest/    trend collection (SearXNG JSON API)
+  autopilot-providers/  provider registry, availability probes, fallback chain, quota
   autopilot-cli/        `autopilot` binary
 config/providers.yaml   LLM chain (data, no secrets — env var names only)
 personas/*.yaml         persona packs
@@ -65,6 +66,15 @@ autopilot providers check
 
 # Resolved fallback chain for the next run
 autopilot providers chain
+
+# Trend harvesting (SearXNG JSON API on kavure)
+autopilot harvest search --query "descobertas científicas curiosas" --limit 10
+
+# Free-tier quota instrumentation (snapshot + optional JSONL ledger)
+autopilot quota check \
+  --model opencode/mimo-v2.6-flash-free \
+  --budget-tokens 5000000 \
+  --ledger var/quota-ledger.jsonl
 ```
 
 Provider credentials are read from the environment, never from the repo:
@@ -76,8 +86,9 @@ export GEMINI_API_KEY=...   # from the SOPS store (never committed)
 ## Status
 
 **Phase 0 — harness foundation.** Implemented: persona pack model + validation, provider
-registry with live health probes, fallback-chain resolution, CLI. Next: the harvest → triage →
-create → guardrail pipeline and the quota instrumentation for the OpenCode free tier.
+registry with live health probes, fallback-chain resolution, trend harvesting (SearXNG),
+free-tier quota instrumentation, CLI. Next: the triage → create → guardrail stages and the
+publish/metrics/learning loop.
 
 | Phase | Scope |
 |---|---|
