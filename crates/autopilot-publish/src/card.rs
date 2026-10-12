@@ -1,16 +1,12 @@
-//! Deterministic, **per-persona** post-card generator (no GPU, no image crate).
+//! Deterministic post-card generator (no GPU, no heavy image crate).
 //!
 //! A "post card" is the classic tech-account visual: the post's topic as a title,
-//! the post text as body copy, painted with **the persona's own** template and
-//! palette. The look is data, never a constant: the template and the palette are
-//! resolved from the persona pack (`visual.template` + `visual.palette`, see
-//! [`CardTheme::from_visual`]) and the template lives under
-//! `personas/<slug>/visual/`. Two personas therefore never render the same card —
-//! a single global template was an architecture bug (HB-032).
+//! the post text as body copy, rendered over the persona's palette. It is built
+//! from a **versioned SVG template** ([`CARD_TEMPLATE_VERSION`], shipped in
+//! `assets/card-v1.svg`) whose placeholders are filled with escaped, wrapped text
+//! and then rasterised to PNG by `rsvg-convert`.
 //!
-//! The template is a **versioned SVG file** whose placeholders are filled with
-//! escaped, wrapped text and the palette colours; it is then rasterised to PNG by
-//! `rsvg-convert`. Why SVG + `rsvg-convert` instead of a Rust image crate?
+//! Why an SVG template + `rsvg-convert` instead of a Rust image crate?
 //!
 //! * the visual is data (a reviewable, diffable, versioned file), not code;
 //! * `rsvg-convert` is already installed on the host and does the rasterisation
@@ -20,9 +16,9 @@
 //! * the same filled SVG is written next to the PNG, so a re-render is diffable
 //!   even when the PNG bytes are not byte-identical across tool versions.
 //!
-//! Everything that decides the output (wrapping, truncation, escaping, placeholder
-//! filling, palette derivation, PNG header parsing) is a pure function and
-//! unit-tested; only [`render_png`] spawns a process.
+//! Everything that decides the output (wrapping, truncation, escaping, template
+//! filling, PNG header parsing) is a pure function and unit-tested; only
+//! [`render_png`] spawns a process.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -30,18 +26,12 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use autopilot_core::{Palette, Typography, Visual, resolve_visual_template};
 
-/// Version of the built-in fallback template. Bump it when `default-card.svg`
-/// changes; a persona template is versioned by its own filename.
+/// Version of the SVG template. Bump it when `assets/card-vN.svg` changes.
 pub const CARD_TEMPLATE_VERSION: &str = "card-v1";
 
-/// Name reported for the built-in fallback template.
-pub const DEFAULT_TEMPLATE_NAME: &str = "default-card";
-
-/// The built-in fallback template, embedded at compile time so the binary is
-/// self-contained. It is used **only** when a persona declares no template.
-const DEFAULT_CARD_TEMPLATE: &str = include_str!("../assets/default-card.svg");
+/// The template, embedded at compile time so the binary is self-contained.
+const CARD_TEMPLATE: &str = include_str!("../assets/card-v1.svg");
 
 /// Card width in pixels. Square 1:1: it is the aspect the Bluesky app renders
 /// without letterboxing and the one that keeps the same asset usable on the
@@ -61,9 +51,6 @@ pub const DEFAULT_RSVG_BINARY: &str = "rsvg-convert";
 
 /// Timeout for one `rsvg-convert` invocation.
 pub const DEFAULT_RSVG_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Percentage of each channel kept when deriving a deeper background tone.
-const DARKEN_PERCENT: u16 = 70;
 
 /// Characters per title line. Tuned for DejaVu Sans at 68px inside a 1008px
 /// content box (the card is 1200px wide with a 96px safe margin): ~0.55em per
@@ -107,145 +94,25 @@ impl CardSpec {
     }
 }
 
-/// The resolved look of one card: template source plus the persona's palette,
-/// typography and motif.
+/// Fill the versioned template with a spec's escaped, wrapped text.
 ///
-/// A theme is always resolved **from a persona** ([`CardTheme::from_visual`]);
-/// the only exception is [`CardTheme::default_fallback`], used when a pack
-/// declares no `visual` block. It is data — never a global constant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CardTheme {
-    /// Template name as declared by the pack (or the fallback name).
-    pub name: String,
-    /// SVG source with `{{...}}` placeholders.
-    pub template: String,
-    pub palette: Palette,
-    pub typography: Typography,
-    /// Structural motif name, rendered by the template.
-    pub motif: String,
-    /// Footer the persona declares for its cards (empty when it declares none).
-    /// The caller may prefer it over a per-post footer.
-    pub footer: String,
-}
-
-impl CardTheme {
-    /// The built-in fallback theme, used only when a persona declares no
-    /// `visual` block.
-    pub fn default_fallback() -> Self {
-        Self {
-            name: DEFAULT_TEMPLATE_NAME.to_string(),
-            template: DEFAULT_CARD_TEMPLATE.to_string(),
-            palette: Palette::default(),
-            typography: Typography::default(),
-            motif: "terminal".to_string(),
-            footer: String::new(),
-        }
-    }
-
-    /// Resolve a theme from a persona's `visual` block.
-    ///
-    /// `visual_dir` is the persona's `personas/<slug>/visual/` directory. A
-    /// declared template that cannot be read is a hard error — never a silent
-    /// fallback, so two personas can never accidentally share a look. With no
-    /// template declared, the persona's palette and typography still repaint the
-    /// built-in structure.
-    pub fn from_visual(visual: Option<&Visual>, visual_dir: &Path) -> Result<Self> {
-        let Some(visual) = visual else {
-            return Ok(Self::default_fallback());
-        };
-
-        let (name, template) = match visual.template.as_deref() {
-            Some(declared) if !declared.trim().is_empty() => {
-                let path = resolve_visual_template(visual_dir, declared);
-                let source = std::fs::read_to_string(&path).with_context(|| {
-                    format!(
-                        "reading card template `{declared}` for the persona visual \
-                         (expected at {})",
-                        path.display()
-                    )
-                })?;
-                (declared.trim().to_string(), source)
-            }
-            _ => (
-                DEFAULT_TEMPLATE_NAME.to_string(),
-                DEFAULT_CARD_TEMPLATE.to_string(),
-            ),
-        };
-
-        Ok(Self {
-            name,
-            template,
-            palette: visual.palette.clone(),
-            typography: visual.typography.clone(),
-            motif: visual.motif.clone(),
-            footer: visual.footer.clone(),
-        })
-    }
-}
-
-/// Fill a resolved theme's template with a spec's escaped, wrapped text and the
-/// theme's palette/typography.
-///
-/// Pure and deterministic: the same theme and spec always yield the same SVG.
-pub fn render_svg(theme: &CardTheme, spec: &CardSpec) -> String {
+/// Pure and deterministic: the same spec always yields the same SVG string.
+pub fn render_svg(spec: &CardSpec) -> String {
     let title_lines = wrap_text(&spec.title, TITLE_MAX_CHARS, TITLE_MAX_LINES);
     let body_lines = wrap_text(&spec.body, BODY_MAX_CHARS, BODY_MAX_LINES);
-    let case = theme.typography.case;
+    let aria = escape_xml(&alt_text(spec));
 
-    let replacements = [
-        ("{{ARIA}}", escape_xml(&alt_text(spec))),
-        (
+    CARD_TEMPLATE
+        .replace("{{ARIA}}", &aria)
+        .replace(
             "{{TITLE_LINES}}",
-            tspans(&title_lines, TEXT_X, TITLE_LINE_HEIGHT),
-        ),
-        (
+            &tspans(&title_lines, TEXT_X, TITLE_LINE_HEIGHT),
+        )
+        .replace(
             "{{BODY_LINES}}",
-            tspans(&body_lines, TEXT_X, BODY_LINE_HEIGHT),
-        ),
-        ("{{FOOTER}}", escape_xml(&case.apply(&spec.footer))),
-        ("{{BG}}", theme.palette.background.clone()),
-        ("{{BG_DEEP}}", darken(&theme.palette.background)),
-        ("{{ACCENT}}", theme.palette.accent.clone()),
-        ("{{SECONDARY}}", theme.palette.secondary.clone()),
-        ("{{TEXT}}", theme.palette.text.clone()),
-        ("{{FONT_FAMILY}}", escape_xml(&theme.typography.family)),
-        ("{{TITLE_WEIGHT}}", theme.typography.weight.to_string()),
-        ("{{MOTIF}}", escape_xml(&case.apply(&theme.motif))),
-    ];
-
-    let mut svg = theme.template.clone();
-    for (key, value) in replacements {
-        svg = svg.replace(key, &value);
-    }
-    svg
-}
-
-/// Darken a `#rgb`/`#rrggbb` colour to a deeper tone (used for gradients).
-///
-/// Pure; a value that is not a valid hex colour is returned unchanged.
-pub fn darken(hex: &str) -> String {
-    let trimmed = hex.trim();
-    let Some(digits) = trimmed.strip_prefix('#') else {
-        return hex.to_string();
-    };
-    if !digits.chars().all(|c| c.is_ascii_hexdigit()) {
-        return hex.to_string();
-    }
-    let expanded: Vec<char> = match digits.len() {
-        3 => digits.chars().flat_map(|c| [c, c]).collect(),
-        6 => digits.chars().collect(),
-        _ => return hex.to_string(),
-    };
-
-    let mut channels = [0u8; 3];
-    for (index, channel) in channels.iter_mut().enumerate() {
-        let pair: String = expanded[index * 2..index * 2 + 2].iter().collect();
-        let Ok(byte) = u8::from_str_radix(&pair, 16) else {
-            return hex.to_string();
-        };
-        *channel = (u16::from(byte) * DARKEN_PERCENT / 100) as u8;
-    }
-    format!("#{:02x}{:02x}{:02x}", channels[0], channels[1], channels[2])
+            &tspans(&body_lines, TEXT_X, BODY_LINE_HEIGHT),
+        )
+        .replace("{{FOOTER}}", &escape_xml(&spec.footer))
 }
 
 /// A text alternative for the card (Bluesky alt text is mandatory).
@@ -327,16 +194,11 @@ pub fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-/// Rasterise a themed spec to a PNG, writing the filled SVG next to it for auditing.
+/// Rasterise a spec to a PNG, writing the filled SVG next to it for auditing.
 ///
 /// The SVG path is the PNG path with an `.svg` extension, so a re-render can be
 /// diffed at the template level. `rsvg_binary` is injectable for tests.
-pub async fn render_png(
-    theme: &CardTheme,
-    spec: &CardSpec,
-    png_path: &Path,
-    rsvg_binary: &str,
-) -> Result<PathBuf> {
+pub async fn render_png(spec: &CardSpec, png_path: &Path, rsvg_binary: &str) -> Result<PathBuf> {
     if let Some(dir) = png_path.parent()
         && !dir.as_os_str().is_empty()
     {
@@ -346,7 +208,7 @@ pub async fn render_png(
     }
 
     let svg_path = png_path.with_extension("svg");
-    tokio::fs::write(&svg_path, render_svg(theme, spec).as_bytes())
+    tokio::fs::write(&svg_path, render_svg(spec).as_bytes())
         .await
         .with_context(|| format!("writing card SVG {}", svg_path.display()))?;
 
@@ -436,7 +298,6 @@ fn truncate_with_ellipsis(line: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autopilot_core::TextCase;
 
     fn spec() -> CardSpec {
         CardSpec::from_post(
@@ -444,33 +305,6 @@ mod tests {
             "We ship a versioned SVG template and let rsvg-convert do the pixels.",
             "example.bsky.social",
         )
-    }
-
-    /// A minimal template used to prove structural differences.
-    const MINIMAL_TEMPLATE: &str =
-        "<svg aria-label=\"{{ARIA}}\"><text fill=\"{{ACCENT}}\">{{TITLE_LINES}}</text></svg>";
-
-    fn theme() -> CardTheme {
-        CardTheme::default_fallback()
-    }
-
-    fn themed_visual() -> Visual {
-        Visual {
-            template: None,
-            palette: Palette {
-                background: "#05060a".into(),
-                accent: "#7c3aed".into(),
-                secondary: "#22d3ee".into(),
-                text: "#e2e8f0".into(),
-            },
-            typography: Typography {
-                family: "Inter".into(),
-                weight: 800,
-                case: TextCase::Upper,
-            },
-            motif: "orbit".into(),
-            footer: "space.example".into(),
-        }
     }
 
     #[test]
@@ -515,119 +349,20 @@ mod tests {
     #[test]
     fn svg_is_deterministic_and_carries_escaped_text() {
         let spec = CardSpec::from_post("a < b & c", "x > y", "me");
-        let first = render_svg(&theme(), &spec);
-        let second = render_svg(&theme(), &spec);
+        let first = render_svg(&spec);
+        let second = render_svg(&spec);
         assert_eq!(first, second);
         assert!(first.contains("a &lt; b &amp; c"));
         assert!(first.contains("x &gt; y"));
         assert!(!first.contains("{{TITLE_LINES}}"), "template fully filled");
-        assert!(first.contains("viewBox"));
+        assert!(first.contains("card-v1") || first.contains("viewBox"));
     }
 
     #[test]
     fn svg_never_leaves_unfilled_placeholders() {
-        let svg = render_svg(&theme(), &spec());
-        assert!(!svg.contains("{{"), "no placeholder may survive: {svg}");
+        let svg = render_svg(&spec());
+        assert!(!svg.contains("{{"));
         assert!(svg.contains("<tspan"));
-    }
-
-    #[test]
-    fn the_palette_is_substituted_into_the_template() {
-        let theme = CardTheme {
-            palette: themed_visual().palette,
-            ..CardTheme::default_fallback()
-        };
-        let svg = render_svg(&theme, &spec());
-        assert!(svg.contains("#7c3aed"), "accent must reach the SVG");
-        assert!(svg.contains("#22d3ee"), "secondary must reach the SVG");
-        assert!(svg.contains("#05060a"), "background must reach the SVG");
-        assert!(!svg.contains("{{ACCENT}}"));
-    }
-
-    #[test]
-    fn two_palettes_produce_different_svg() {
-        let spec = spec();
-        let one = CardTheme::default_fallback();
-        let mut other = one.clone();
-        other.palette.accent = "#ff0000".into();
-        assert_ne!(render_svg(&one, &spec), render_svg(&other, &spec));
-    }
-
-    #[test]
-    fn two_templates_produce_structurally_different_svg() {
-        let spec = spec();
-        let default = render_svg(&theme(), &spec);
-        let minimal = CardTheme {
-            template: MINIMAL_TEMPLATE.to_string(),
-            ..CardTheme::default_fallback()
-        };
-        let minimal_svg = render_svg(&minimal, &spec);
-        assert_ne!(default, minimal_svg);
-        assert!(!minimal_svg.contains("<rect"));
-    }
-
-    #[test]
-    fn typography_case_is_applied_to_labels() {
-        let theme = CardTheme {
-            typography: themed_visual().typography,
-            motif: "orbit".into(),
-            ..CardTheme::default_fallback()
-        };
-        let svg = render_svg(&theme, &spec());
-        assert!(svg.contains(">ORBIT<"), "motif must be uppercased: {svg}");
-        assert!(svg.contains("font-family=\"'Inter'"));
-        assert!(svg.contains("font-weight=\"800\""));
-    }
-
-    #[test]
-    fn darken_derives_a_deeper_tone() {
-        assert_eq!(darken("#ffffff"), "#b2b2b2");
-        assert_eq!(darken("#fff"), "#b2b2b2");
-        assert_eq!(darken("#0b1220"), "#070c16");
-        // Invalid input is returned unchanged (never a panic).
-        assert_eq!(darken("amber"), "amber");
-        assert_eq!(darken("#12345"), "#12345");
-        assert_eq!(darken("#zzzzzz"), "#zzzzzz");
-    }
-
-    #[test]
-    fn from_visual_without_a_block_returns_the_fallback() {
-        let dir = Path::new("/nonexistent");
-        let theme = CardTheme::from_visual(None, dir).expect("no visual is not an error");
-        assert_eq!(theme, CardTheme::default_fallback());
-    }
-
-    #[test]
-    fn from_visual_keeps_the_declared_palette_with_the_default_structure() {
-        let visual = themed_visual();
-        let theme = CardTheme::from_visual(Some(&visual), Path::new("/nonexistent"))
-            .expect("no template declared is not an error");
-        assert_eq!(theme.name, DEFAULT_TEMPLATE_NAME);
-        assert_eq!(theme.palette.accent, "#7c3aed");
-        assert_eq!(theme.motif, "orbit");
-        assert_eq!(theme.footer, "space.example");
-    }
-
-    #[test]
-    fn from_visual_reads_the_template_file_and_fails_when_missing() {
-        let base = std::env::temp_dir().join(format!("autopilot-card-{}", std::process::id()));
-        let visual_dir = base.join("demo").join("visual");
-        std::fs::create_dir_all(&visual_dir).expect("temp visual dir");
-
-        let mut visual = themed_visual();
-        visual.template = Some("card-orbit-v1".into());
-
-        // Missing file: a clear error, never a silent fallback.
-        let missing = CardTheme::from_visual(Some(&visual), &visual_dir);
-        assert!(missing.is_err());
-
-        std::fs::write(visual_dir.join("card-orbit-v1.svg"), MINIMAL_TEMPLATE)
-            .expect("write temp template");
-        let theme = CardTheme::from_visual(Some(&visual), &visual_dir).expect("template loads");
-        assert_eq!(theme.name, "card-orbit-v1");
-        assert_eq!(theme.template, MINIMAL_TEMPLATE);
-
-        std::fs::remove_dir_all(&base).expect("cleanup temp visual dir");
     }
 
     #[test]
