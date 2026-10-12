@@ -82,37 +82,9 @@ pub fn parse_shortlist(raw: &str) -> Result<Vec<TopicScore>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autopilot_core::{Channel, Platform, Rubric, Voice};
 
     fn persona() -> PersonaPack {
-        PersonaPack {
-            persona: "ciencia".into(),
-            display_name: "Ciência".into(),
-            niche: "science-curiosities".into(),
-            language: "pt-BR".into(),
-            active: false,
-            voice: Voice {
-                tone: "curioso".into(),
-                audience: "adultos curiosos".into(),
-                guidelines: vec![],
-                banned_phrases: vec![],
-                max_hashtags: 4,
-                emojis_allowed: true,
-            },
-            few_shot: vec![],
-            blocklist: vec!["terraplanismo".into()],
-            rubric: Rubric {
-                min_score: 0.75,
-                criteria: vec![],
-            },
-            channels: vec![Channel {
-                platform: Platform::Bluesky,
-                handle: "x".into(),
-                enabled: true,
-                posts_per_day: 1,
-                windows: vec![],
-            }],
-        }
+        crate::test_support::sample_persona()
     }
 
     fn topics() -> Vec<Topic> {

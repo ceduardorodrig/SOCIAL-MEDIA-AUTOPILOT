@@ -27,6 +27,10 @@ pub struct JournalEvent<'a> {
     pub platform: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variant: Option<&'a str>,
+    /// What the editorial review changed (additive: only the `editor` stage
+    /// carries it, so older readers see exactly the previous shape).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<&'a [String]>,
 }
 
 /// Append-only writer bound to one run.
@@ -67,6 +71,7 @@ impl Journal {
             detail: &outcome.detail,
             platform: outcome.platform.as_deref(),
             variant: outcome.variant.as_deref(),
+            changes: outcome.changes.as_deref(),
         };
         append_line(&self.path, &event, "journal").await
     }

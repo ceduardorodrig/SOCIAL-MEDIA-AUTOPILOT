@@ -1,10 +1,11 @@
 //! The orchestrator: chain the stage crates for exactly one persona pack.
 //!
-//! The data flow is a single pass: harvest → triage → creation → guardrail →
-//! publish. Each stage records a [`StageOutcome`] that is both printed by the
-//! caller and appended to the run's [`Journal`]. The pure decisions (channel
-//! resolution, topic selection, guardrail partition) are separated from the
-//! effectful calls so they can be unit-tested without any network.
+//! The data flow is a single pass: harvest → triage → creation → editorial
+//! review → guardrail → publish. Each stage records a [`StageOutcome`] that is
+//! both printed by the caller and appended to the run's [`Journal`]. The pure
+//! decisions (channel resolution, topic selection, editor fold, guardrail
+//! partition) are separated from the effectful calls so they can be unit-tested
+//! without any network.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,8 +15,9 @@ use autopilot_core::{PersonaPack, Platform, load_persona, now_unix};
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{SearxngClient, Topic};
 use autopilot_pipeline::{
-    TopicScore, Variant, build_creation_prompt, build_triage_prompt, parse_shortlist,
-    parse_variants,
+    EditorOutcome, TopicScore, Variant, build_creation_prompt, build_editor_prompt,
+    build_triage_prompt, kept_variants, parse_editor_response, parse_shortlist, parse_variants,
+    review_or_keep,
 };
 use autopilot_providers::{JobKind, complete_with_chain, load_config};
 use autopilot_publish::{
@@ -132,6 +134,9 @@ pub struct StageOutcome {
     pub detail: String,
     pub platform: Option<String>,
     pub variant: Option<String>,
+    /// What the editorial review changed, when the stage is `editor` (additive:
+    /// absent for every other stage, so the journal shape is unchanged).
+    pub changes: Option<Vec<String>>,
 }
 
 impl StageOutcome {
@@ -142,6 +147,7 @@ impl StageOutcome {
             detail: detail.into(),
             platform: None,
             variant: None,
+            changes: None,
         }
     }
 
@@ -152,6 +158,11 @@ impl StageOutcome {
 
     fn with_variant(mut self, variant: &str) -> Self {
         self.variant = Some(variant.to_string());
+        self
+    }
+
+    fn with_changes(mut self, changes: Vec<String>) -> Self {
+        self.changes = Some(changes);
         self
     }
 }
@@ -307,6 +318,18 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
     )
     .await?;
 
+    // Stage [3.2] — the editorial review runs before the guardrail so the
+    // deterministic gate always validates the polished text, never the draft.
+    let drafts = stage_editor(
+        &mut report,
+        &journal,
+        &persona,
+        &drafts,
+        &registry,
+        &topic_title,
+    )
+    .await?;
+
     let approved = stage_guardrail(&mut report, &journal, &persona, &drafts).await?;
     if approved.is_empty() {
         record(
@@ -423,6 +446,17 @@ async fn stage_dry_run_plan(
         )
         .await?;
     }
+
+    record(
+        report,
+        journal,
+        StageOutcome::new(
+            "editor",
+            StageStatus::DryRun,
+            "would rewrite each draft as a sceptical editor (AI tells, facts preserved) before the guardrail",
+        ),
+    )
+    .await?;
 
     record(
         report,
@@ -619,6 +653,109 @@ async fn stage_create(
         }
     }
     Ok(drafts)
+}
+
+/// Stage [3.2] — editorial review. Returns the drafts the guardrail must see.
+///
+/// The review is a **best-effort polish layer**, so it degrades gracefully: when
+/// the editor is unreachable or its answer cannot be parsed, the original drafts
+/// are kept and the journal records `editor: skipped (reason)`. A transient
+/// error therefore never stalls the pipeline, never costs a post, and is never
+/// hidden — the run still goes through the guardrail, on the original text.
+async fn stage_editor(
+    report: &mut RunReport,
+    journal: &Journal,
+    persona: &PersonaPack,
+    drafts: &[(Platform, Vec<Variant>)],
+    registry: &autopilot_providers::ProvidersConfig,
+    topic: &str,
+) -> Result<Vec<(Platform, Vec<Variant>)>> {
+    let mut polished = Vec::new();
+    for (platform, variants) in drafts {
+        let prompt = build_editor_prompt(persona, *platform, topic, variants);
+        let (edits, via) = match complete_with_chain(
+            registry,
+            &prompt,
+            JobKind::Other,
+            COMPLETION_TIMEOUT,
+        )
+        .await
+        {
+            Ok(completion) => match parse_editor_response(&completion.text) {
+                Ok(edits) => (
+                    Some(edits),
+                    format!(" via {} ({})", completion.provider_id, completion.model),
+                ),
+                Err(err) => {
+                    record(
+                        report,
+                        journal,
+                        StageOutcome::new(
+                            "editor",
+                            StageStatus::Skipped,
+                            format!("skipped (unparseable response: {err:#})"),
+                        )
+                        .with_platform(*platform),
+                    )
+                    .await?;
+                    (None, String::new())
+                }
+            },
+            Err(err) => {
+                record(
+                    report,
+                    journal,
+                    StageOutcome::new(
+                        "editor",
+                        StageStatus::Skipped,
+                        format!("skipped (provider chain failed: {err:#})"),
+                    )
+                    .with_platform(*platform),
+                )
+                .await?;
+                (None, String::new())
+            }
+        };
+
+        let outcomes = review_or_keep(variants, edits.as_deref());
+        for outcome in &outcomes {
+            let outcome = match outcome {
+                EditorOutcome::Polished { changes, .. } => StageOutcome::new(
+                    "editor",
+                    StageStatus::Ok,
+                    format!(
+                        "ok — polished variant {}{via}; changes: {}",
+                        outcome.label(),
+                        render_changes(changes)
+                    ),
+                )
+                .with_variant(outcome.label())
+                .with_changes(changes.clone()),
+                EditorOutcome::Rejected { reason, .. } => StageOutcome::new(
+                    "editor",
+                    StageStatus::Rejected,
+                    format!("rejected variant {}: {reason}", outcome.label()),
+                )
+                .with_variant(outcome.label()),
+                EditorOutcome::Unchanged { .. } => StageOutcome::new(
+                    "editor",
+                    StageStatus::Skipped,
+                    format!(
+                        "unchanged variant {}{via} (no usable rewrite returned)",
+                        outcome.label()
+                    ),
+                )
+                .with_variant(outcome.label()),
+            };
+            record(report, journal, outcome.with_platform(*platform)).await?;
+        }
+
+        let kept = kept_variants(outcomes);
+        if !kept.is_empty() {
+            polished.push((*platform, kept));
+        }
+    }
+    Ok(polished)
 }
 
 /// Stage [3.5] — guardrail. Returns the approved drafts (a hard gate).
@@ -883,6 +1020,14 @@ fn render_issues(verdict: &Verdict) -> String {
         .join("; ")
 }
 
+/// Render what the editor changed as one line (or `none`).
+fn render_changes(changes: &[String]) -> String {
+    if changes.is_empty() {
+        return "none".to_string();
+    }
+    changes.join("; ")
+}
+
 /// Reject an invalid persona before any stage runs.
 fn validate_or_bail(persona: &PersonaPack) -> Result<()> {
     let issues = persona.validate();
@@ -911,6 +1056,7 @@ fn platform_suffix(platform: Option<Platform>) -> String {
 mod tests {
     use super::*;
     use autopilot_core::{Channel, Rubric, Voice};
+    use autopilot_pipeline::EditedVariant;
 
     fn persona() -> PersonaPack {
         PersonaPack {
@@ -1036,5 +1182,103 @@ mod tests {
         assert!(CardAttachment::WhenPrompted.should_attach("a terminal card"));
         assert!(CardAttachment::Always.should_attach(""));
         assert_eq!(CardAttachment::WhenPrompted.as_str(), "prompted");
+    }
+
+    #[test]
+    fn guardrail_sees_the_polished_text_not_the_original() {
+        let persona = persona();
+        let originals = vec![variant("A", "Não acredite: o cérebro gasta energia.")];
+
+        // The first draft carries a banned phrase, so the guardrail refuses it.
+        let (_, rejected_before) = partition_variants(&persona, Platform::Bluesky, &originals);
+        assert_eq!(rejected_before.len(), 1);
+
+        // After the review, the guardrail partitions the polished text instead.
+        let edits = vec![EditedVariant {
+            label: "A".into(),
+            text: "O cérebro gasta ~20% da energia do corpo em repouso.".into(),
+            changes: vec!["removed the templated opener".into()],
+            rejected_reason: String::new(),
+        }];
+        let kept = kept_variants(review_or_keep(&originals, Some(&edits)));
+        let (approved, rejected) = partition_variants(&persona, Platform::Bluesky, &kept);
+
+        assert!(
+            rejected.is_empty(),
+            "the polished text clears the guardrail"
+        );
+        assert_eq!(approved.len(), 1);
+        assert_eq!(
+            approved[0].text,
+            "O cérebro gasta ~20% da energia do corpo em repouso."
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_failure_keeps_the_original_drafts_and_journals_it() {
+        let journal_path = std::env::temp_dir().join(format!(
+            "autopilot-editor-degrade-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&journal_path).await;
+
+        let journal = Journal::new("run-test", "demo", journal_path.clone());
+        let mut report = RunReport {
+            run_id: "run-test".into(),
+            persona: "demo".into(),
+            dry_run: false,
+            journal: journal_path.clone(),
+            stages: Vec::new(),
+            published: Vec::new(),
+            failed: false,
+        };
+        // An empty chain fails immediately, so the degradation path is exercised
+        // without a network call: the editor is simply unavailable.
+        let registry = autopilot_providers::ProvidersConfig {
+            providers: Vec::new(),
+        };
+        let drafts = vec![(
+            Platform::Bluesky,
+            vec![variant("A", "O cérebro gasta energia.")],
+        )];
+
+        let polished = stage_editor(
+            &mut report,
+            &journal,
+            &persona(),
+            &drafts,
+            &registry,
+            "o cérebro",
+        )
+        .await
+        .expect("an unavailable editor is not an error");
+
+        assert_eq!(polished.len(), 1);
+        assert_eq!(polished[0].1[0].text, "O cérebro gasta energia.");
+        assert!(
+            !report.failed,
+            "a transient editor failure must not fail the run"
+        );
+
+        let raw = tokio::fs::read_to_string(&journal_path)
+            .await
+            .expect("journal written");
+        let event: serde_json::Value =
+            serde_json::from_str(raw.lines().next().unwrap_or("{}")).expect("valid journal JSON");
+        assert_eq!(event["stage"], "editor");
+        assert_eq!(event["status"], "skipped");
+        assert!(
+            event["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("skipped ("),
+            "the journal must say why the review was skipped: {event}"
+        );
+        assert!(
+            event.get("changes").is_none(),
+            "a skipped review carries no change list: {event}"
+        );
+
+        tokio::fs::remove_file(&journal_path).await.ok();
     }
 }

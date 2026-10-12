@@ -1,8 +1,8 @@
 //! Orchestration for one full pipeline run (`autopilot run`).
 //!
-//! The stage order is **harvest → triage → creation → guardrail → publish**.
-//! Metrics ([5]) and learning ([6]) are scheduled separately, so this crate
-//! stops after publishing.
+//! The stage order is **harvest → triage → creation → editorial review →
+//! guardrail → publish**. Metrics ([5]) and learning ([6]) are scheduled
+//! separately, so this crate stops after publishing.
 //!
 //! The orchestrator only **chains** the stage crates' public APIs — it never
 //! reimplements a stage (the repository enforces DRY). Every prompt, parser and

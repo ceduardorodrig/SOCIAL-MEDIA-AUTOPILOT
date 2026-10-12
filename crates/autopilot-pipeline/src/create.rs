@@ -5,6 +5,7 @@ use autopilot_core::{PersonaPack, Platform};
 use serde::{Deserialize, Serialize};
 
 use crate::json::extract_json;
+use crate::prompt::{platform_limit, render_banned_phrases, render_guidelines};
 
 /// One content variant (A or B) for a platform.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -24,22 +25,8 @@ struct Wrapper {
 
 /// Build the creation prompt for one platform and topic.
 pub fn build_creation_prompt(persona: &PersonaPack, platform: Platform, topic: &str) -> String {
-    let guidelines = if persona.voice.guidelines.is_empty() {
-        "- none".to_string()
-    } else {
-        persona
-            .voice
-            .guidelines
-            .iter()
-            .map(|rule| format!("- {rule}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let banned = if persona.voice.banned_phrases.is_empty() {
-        "none".to_string()
-    } else {
-        persona.voice.banned_phrases.join("; ")
-    };
+    let guidelines = render_guidelines(persona);
+    let banned = render_banned_phrases(persona);
 
     format!(
         "You are the creation stage of an autonomous social-media engine.\n\
@@ -66,21 +53,9 @@ pub fn build_creation_prompt(persona: &PersonaPack, platform: Platform, topic: &
         banned = banned,
         blocklist = persona.blocklist.join("; "),
         topic = topic,
-        limit = autopilot_guardrail_limit(platform),
+        limit = platform_limit(platform),
         max_tags = persona.voice.max_hashtags,
     )
-}
-
-/// Character limit mirrored from the guardrail, kept local to avoid a dependency cycle.
-fn autopilot_guardrail_limit(platform: Platform) -> usize {
-    match platform {
-        Platform::Bluesky => 300,
-        Platform::X => 280,
-        Platform::Linkedin => 3_000,
-        Platform::Instagram => 2_200,
-        Platform::Tiktok => 2_200,
-        Platform::Kwai => 2_200,
-    }
 }
 
 /// Parse the model response into variants.
@@ -104,37 +79,9 @@ pub fn parse_variants(raw: &str) -> Result<Vec<Variant>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autopilot_core::{Channel, Rubric, Voice};
 
     fn persona() -> PersonaPack {
-        PersonaPack {
-            persona: "ciencia".into(),
-            display_name: "Ciência & Curiosidades".into(),
-            niche: "science-curiosities".into(),
-            language: "pt-BR".into(),
-            active: false,
-            voice: Voice {
-                tone: "curioso".into(),
-                audience: "adultos".into(),
-                guidelines: vec!["comece com um gancho".into()],
-                banned_phrases: vec!["você não vai acreditar".into()],
-                max_hashtags: 3,
-                emojis_allowed: true,
-            },
-            few_shot: vec![],
-            blocklist: vec!["terraplanismo".into()],
-            rubric: Rubric {
-                min_score: 0.75,
-                criteria: vec![],
-            },
-            channels: vec![Channel {
-                platform: Platform::Bluesky,
-                handle: "x".into(),
-                enabled: true,
-                posts_per_day: 1,
-                windows: vec![],
-            }],
-        }
+        crate::test_support::sample_persona_with_voice()
     }
 
     #[test]
