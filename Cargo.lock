@@ -207,6 +207,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "clap",
  "getrandom 0.2.17",
  "hmac",
  "reqwest",

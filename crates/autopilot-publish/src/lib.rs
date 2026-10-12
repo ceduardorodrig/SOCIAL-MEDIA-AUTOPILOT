@@ -7,11 +7,18 @@
 use anyhow::{Context, Result, bail};
 
 pub mod bluesky;
+pub mod card;
 pub mod x;
 
 pub use bluesky::{
-    BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, Session, build_post_record, create_post,
-    create_session, now_rfc3339_millis, post_url,
+    BlobLink, BlobRef, BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, MAX_IMAGE_BYTES,
+    MAX_IMAGES_PER_POST, PostImage, Session, build_image_embed, build_post_record,
+    build_post_record_with_images, create_post, create_session, now_rfc3339_millis, post_url,
+    upload_blob, validate_alt, validate_image,
+};
+pub use card::{
+    CARD_HEIGHT, CARD_MIME_TYPE, CARD_TEMPLATE_VERSION, CARD_WIDTH, CardSpec, DEFAULT_RSVG_BINARY,
+    alt_text, render_png, render_svg,
 };
 // X shares the `create_post` / `post_url` names with Bluesky, so those two stay
 // module-qualified (`x::create_post`); the rest are re-exported for symmetry.

@@ -19,8 +19,10 @@ use autopilot_pipeline::{
 };
 use autopilot_providers::{JobKind, complete_with_chain, load_config};
 use autopilot_publish::{
-    BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, Session, build_post_record, create_post,
-    create_session, now_rfc3339_millis, post_url,
+    BlueskyCredentials, CARD_HEIGHT, CARD_MIME_TYPE, CARD_TEMPLATE_VERSION, CARD_WIDTH, CardSpec,
+    DEFAULT_BLUESKY_BASE_URL, DEFAULT_RSVG_BINARY, PostImage, Session, alt_text,
+    build_post_record_with_images, create_post, create_session, now_rfc3339_millis, post_url,
+    render_png, upload_blob,
 };
 
 use crate::journal::Journal;
@@ -30,6 +32,43 @@ const COMPLETION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long to wait for one publishing API call.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Where generated cards are kept (gitignored, alongside the run journal).
+const DEFAULT_CARD_DIR: &str = "var/cards";
+
+/// Whether `autopilot run` attaches a generated card to a Bluesky post.
+///
+/// Text-only posting is the default; a card is opt-in per run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CardAttachment {
+    /// Never attach a card — the text-only path, unchanged.
+    #[default]
+    Off,
+    /// Attach a card only when the variant carries an `image_prompt`.
+    WhenPrompted,
+    /// Attach a card to every post.
+    Always,
+}
+
+impl CardAttachment {
+    /// Stable, lower-case label for the console and the journal.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CardAttachment::Off => "off",
+            CardAttachment::WhenPrompted => "prompted",
+            CardAttachment::Always => "always",
+        }
+    }
+
+    /// Whether a card should be generated for a variant with this image prompt.
+    pub fn should_attach(self, image_prompt: &str) -> bool {
+        match self {
+            CardAttachment::Off => false,
+            CardAttachment::WhenPrompted => !image_prompt.trim().is_empty(),
+            CardAttachment::Always => true,
+        }
+    }
+}
 
 /// Options controlling one `autopilot run`.
 #[derive(Debug, Clone)]
@@ -50,6 +89,8 @@ pub struct RunOptions {
     pub journal_path: Option<PathBuf>,
     /// When set, no LLM call, no GPU work, no network and no publish happen.
     pub dry_run: bool,
+    /// Whether a generated post card is attached to the published post.
+    pub card: CardAttachment,
 }
 
 /// How a stage ended.
@@ -245,7 +286,7 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
     // A dry run never calls an LLM, the GPU, the network or a publisher: it only
     // describes the decisions the live run would take.
     if options.dry_run {
-        stage_dry_run_plan(&mut report, &journal, &persona, &channels).await?;
+        stage_dry_run_plan(&mut report, &journal, &persona, &channels, options.card).await?;
         return Ok(report);
     }
 
@@ -281,7 +322,7 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         return Ok(report);
     }
 
-    stage_publish(&mut report, &journal, &approved).await?;
+    stage_publish(&mut report, &journal, &options, &topic_title, &approved).await?;
     Ok(report)
 }
 
@@ -353,6 +394,7 @@ async fn stage_dry_run_plan(
     journal: &Journal,
     persona: &PersonaPack,
     channels: &[Platform],
+    card: CardAttachment,
 ) -> Result<()> {
     record(
         report,
@@ -394,6 +436,11 @@ async fn stage_dry_run_plan(
     .await?;
 
     for platform in channels {
+        let card_note = if *platform == Platform::Bluesky && card != CardAttachment::Off {
+            format!(" with a generated card (mode: {})", card.as_str())
+        } else {
+            String::new()
+        };
         record(
             report,
             journal,
@@ -401,7 +448,7 @@ async fn stage_dry_run_plan(
                 "publish",
                 StageStatus::DryRun,
                 format!(
-                    "would publish the approved variants to {}",
+                    "would publish the approved variants to {}{card_note}",
                     platform.as_str()
                 ),
             )
@@ -625,10 +672,13 @@ async fn stage_guardrail<'a>(
 async fn stage_publish(
     report: &mut RunReport,
     journal: &Journal,
+    options: &RunOptions,
+    topic: &str,
     approved: &[(Platform, &Variant)],
 ) -> Result<()> {
     let mut session: Option<Session> = None;
     let mut handle = String::new();
+    let run_id = report.run_id.clone();
 
     for (platform, variant) in approved {
         if *platform != Platform::Bluesky {
@@ -675,7 +725,17 @@ async fn stage_publish(
         let Some(current) = session.as_ref() else {
             continue;
         };
-        let post = build_post_record(&variant.text, &now_rfc3339_millis());
+
+        // The guardrail already approved the text; the card is a rendering of it.
+        let images =
+            match stage_card_image(report, journal, options, &run_id, topic, variant, current)
+                .await?
+            {
+                Some(image) => vec![image],
+                None => Vec::new(),
+            };
+
+        let post = build_post_record_with_images(&variant.text, &now_rfc3339_millis(), &images)?;
         match create_post(DEFAULT_BLUESKY_BASE_URL, current, &post, PUBLISH_TIMEOUT).await {
             Ok(uri) => {
                 let url = post_url(&handle, &uri);
@@ -716,6 +776,88 @@ async fn stage_publish(
         }
     }
     Ok(())
+}
+
+/// Render and upload a post card for a variant, or `None` when not requested.
+///
+/// A card failure never costs the post: the run falls back to a text-only post,
+/// journals the failure and marks the run as failed so it is not mistaken for a
+/// clean run.
+async fn stage_card_image(
+    report: &mut RunReport,
+    journal: &Journal,
+    options: &RunOptions,
+    run_id: &str,
+    topic: &str,
+    variant: &Variant,
+    session: &Session,
+) -> Result<Option<PostImage>> {
+    if !options.card.should_attach(&variant.image_prompt) {
+        return Ok(None);
+    }
+
+    let spec = CardSpec::from_post(topic, &variant.text, &session.handle);
+    let png = PathBuf::from(DEFAULT_CARD_DIR).join(format!("{run_id}-{}.png", variant.label));
+    let result = async {
+        let svg = render_png(&spec, &png, DEFAULT_RSVG_BINARY).await?;
+        let bytes = tokio::fs::read(&png).await?;
+        let blob = upload_blob(
+            DEFAULT_BLUESKY_BASE_URL,
+            session,
+            &bytes,
+            CARD_MIME_TYPE,
+            PUBLISH_TIMEOUT,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>((svg, blob))
+    }
+    .await;
+
+    match result {
+        Ok((svg, blob)) => {
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "card",
+                    StageStatus::Ok,
+                    format!(
+                        "attached {CARD_TEMPLATE_VERSION} card {}x{} ({} bytes) from {} and {}",
+                        CARD_WIDTH,
+                        CARD_HEIGHT,
+                        blob.size,
+                        png.display(),
+                        svg.display()
+                    ),
+                )
+                .with_platform(Platform::Bluesky)
+                .with_variant(&variant.label),
+            )
+            .await?;
+            Ok(Some(PostImage {
+                alt: alt_text(&spec),
+                blob,
+                width: CARD_WIDTH,
+                height: CARD_HEIGHT,
+            }))
+        }
+        Err(err) => {
+            report.failed = true;
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "card",
+                    StageStatus::Error,
+                    format!("card generation failed — publishing text only: {err:#}"),
+                )
+                .with_platform(Platform::Bluesky)
+                .with_variant(&variant.label),
+            )
+            .await?;
+            Ok(None)
+        }
+    }
 }
 
 /// Authenticate against Bluesky using the credentials in the environment.
@@ -883,5 +1025,16 @@ mod tests {
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].0.label, "B");
         assert!(!rejected[0].1.approved);
+    }
+
+    #[test]
+    fn card_attachment_modes_decide_on_the_image_prompt() {
+        assert_eq!(CardAttachment::default(), CardAttachment::Off);
+        assert!(!CardAttachment::Off.should_attach("anything"));
+        assert!(!CardAttachment::WhenPrompted.should_attach(""));
+        assert!(!CardAttachment::WhenPrompted.should_attach("   "));
+        assert!(CardAttachment::WhenPrompted.should_attach("a terminal card"));
+        assert!(CardAttachment::Always.should_attach(""));
+        assert_eq!(CardAttachment::WhenPrompted.as_str(), "prompted");
     }
 }

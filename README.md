@@ -116,6 +116,19 @@ autopilot publish auth                                         # verify Bluesky 
 autopilot publish bluesky --persona personas/ciencia-curiosidades.yaml \
   --text "Draft" --dry-run                                    # print the record only
 
+# Stage [4] — attach a generated post card to Bluesky posts. `off` (default) keeps
+# text-only posting; `prompted` attaches a card only when the variant carries an
+# image prompt; `always` attaches one to every post. The card is an SVG template
+# rasterised by rsvg-convert — no GPU and no image-generation model.
+autopilot run --persona personas/tech-curiosities.yaml --attach-card prompted
+
+# Generate a card offline (no network, no model): prints the dimensions and the
+# alt text; `--dry-run` prints the filled SVG and writes nothing.
+cargo run -p autopilot-publish --bin card -- render \
+  --topic "Rust 1.95 ships let-chains" \
+  --text "No more nesting: `if let Some(x) = y && x > 0`." \
+  --footer example.bsky.social --out /tmp/card.png
+
 # Stage [4] — publish to X (Twitter). OAuth 1.0a signing is pure Rust and
 # unit-tested against the published reference vectors; `--dry-run` prints the
 # request with no API call and needs no credentials.
@@ -170,7 +183,11 @@ and the **X (Twitter) publisher** (stage 4, API v2 with pure-Rust OAuth 1.0a sig
 offline-tested against the RFC 5849 and classic Twitter reference vectors), both with a
 mandatory guardrail gate, and the **metrics** (stage 5, platform adapter trait +
 JSONL store) and **learning** (stage 6, pure A/B scoring + persona memory proposal) stages. The
-**`autopilot run` orchestrator** now chains harvest → triage → creation → guardrail →
+Bluesky publisher now also carries **images**: it uploads a blob with
+`com.atproto.repo.uploadBlob` and attaches an `app.bsky.embed.images` embed with mandatory
+alt text, and it can generate the image itself as a deterministic **post card** (a versioned
+SVG template rasterised by `rsvg-convert`, no GPU) through `autopilot run --attach-card`.
+The **`autopilot run` orchestrator** now chains harvest → triage → creation → guardrail →
 publish for one persona, with a safe `--dry-run` and a per-run JSONL journal under
 `var/runs/`; a non-admitted `hl-infer` lease aborts a stage instead of running the
 GPU unarbitrated. Next: the remaining channels (LinkedIn, Instagram, TikTok, Kwai) and the

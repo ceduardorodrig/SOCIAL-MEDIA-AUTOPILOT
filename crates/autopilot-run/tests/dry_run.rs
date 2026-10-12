@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use autopilot_run::{RunOptions, StageStatus, run};
+use autopilot_run::{CardAttachment, RunOptions, StageStatus, run};
 
 fn journal_path() -> PathBuf {
     std::env::temp_dir().join(format!("autopilot-run-dry-{}.jsonl", std::process::id()))
@@ -25,6 +25,7 @@ async fn dry_run_walks_every_stage_without_side_effects() {
         config_path: PathBuf::from("tests/fixtures/does-not-exist.yaml"),
         journal_path: Some(journal.clone()),
         dry_run: true,
+        card: CardAttachment::Off,
     };
 
     let report = run(options).await.expect("dry run succeeds");
@@ -80,6 +81,7 @@ async fn a_draft_persona_is_never_executed_for_real() {
         config_path: PathBuf::from("tests/fixtures/does-not-exist.yaml"),
         journal_path: Some(journal.clone()),
         dry_run: false,
+        card: CardAttachment::Off,
     };
 
     let report = run(options).await.expect("the command itself succeeds");

@@ -30,7 +30,7 @@ use autopilot_publish::{
     build_post_record, build_tweet_body, create_post, create_session, missing_env_vars,
     now_rfc3339_millis, post_endpoint, post_url,
 };
-use autopilot_run::{RunOptions, RunReport, StageOutcome};
+use autopilot_run::{CardAttachment, RunOptions, RunReport, StageOutcome};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -148,6 +148,10 @@ struct RunArgs {
     /// Journal file (defaults to `var/runs/<run-id>.jsonl`).
     #[arg(long)]
     journal: Option<PathBuf>,
+    /// Attach a generated post card to Bluesky posts: off, prompted (only when
+    /// the variant carries an image prompt) or always.
+    #[arg(long, value_parser = parse_card_attachment, default_value = "off")]
+    attach_card: CardAttachment,
     /// Describe every stage without any LLM call, GPU work, network or publish.
     #[arg(long)]
     dry_run: bool,
@@ -218,6 +222,17 @@ fn parse_platform(value: &str) -> Result<Platform, String> {
         "kwai" => Ok(Platform::Kwai),
         other => Err(format!(
             "unknown platform `{other}` (expected: bluesky, x, linkedin, instagram, tiktok, kwai)"
+        )),
+    }
+}
+
+fn parse_card_attachment(value: &str) -> Result<CardAttachment, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "off" | "never" => Ok(CardAttachment::Off),
+        "prompted" | "prompt" => Ok(CardAttachment::WhenPrompted),
+        "always" => Ok(CardAttachment::Always),
+        other => Err(format!(
+            "unknown card mode `{other}` (expected: off, prompted, always)"
         )),
     }
 }
@@ -508,6 +523,7 @@ async fn run_autopilot(args: RunArgs) -> Result<ExitCode> {
         config_path: args.config,
         journal_path: args.journal,
         dry_run: args.dry_run,
+        card: args.attach_card,
     };
 
     let report = autopilot_run::run(options).await?;
