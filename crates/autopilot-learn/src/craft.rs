@@ -24,9 +24,10 @@ pub const DEFAULT_RUBRIC_BASE: f64 = 1.0;
 
 /// A post must clear this craft score to be promoted to a few-shot example.
 ///
-/// A single moderate slop tick (≤ 0.15) is tolerated; a high-severity template
-/// penalty (0.25) or two moderate ones drop below the floor.
-pub const DEFAULT_CRAFT_FLOOR: f64 = 0.8;
+/// 0.75 matches the persona rubric floor (`rubric.min_score`). Combined with the
+/// strong-tell magnitudes below, `1.0 - 0.35 = 0.65 < 0.75`: a single strong tell
+/// can never reach the floor, by construction rather than by rounding luck.
+pub const DEFAULT_CRAFT_FLOOR: f64 = 0.75;
 
 /// How many recent posts the repetition heuristics look back at.
 pub const DEFAULT_RECENT_WINDOW: usize = 10;
@@ -50,25 +51,36 @@ pub const DEFAULT_STRUCTURE_SIMILARITY: f64 = 0.5;
 pub const DEFAULT_MAX_AVOID: usize = 8;
 
 // Penalty magnitudes, named per the scoring model (`scoring-model.md`, §2).
-// "high" penalties target the strongest bot signals (template reuse), "medium"
-// target stylistic habits and "low" target noise.
+//
+// Tuning rule: every **strong tell** costs more than `1.0 - DEFAULT_CRAFT_FLOOR`
+// (0.25), so one strong tell alone drops a text below the floor. This was the
+// review defect: em-dash (0.15) + hashtags (0.05) = 0.20 left a slop-laden text
+// exactly at the old 0.80 floor. The numbers below are chosen so that
+// `1.0 - 0.35 = 0.65 < 0.75`, with a comment each, and the promotion gate also
+// requires a clean score (no penalty at all) so stacked low penalties can never
+// slip through on the boundary.
 
-/// High: the post reuses a recent post's structure (prefix/n-gram similarity).
-pub const PENALTY_REPEATED_STRUCTURE: f64 = 0.25;
-/// High: the post opens with the same words as a recent post.
-pub const PENALTY_REPEATED_OPENING: f64 = 0.25;
-/// Medium: em-dash density above ~1 per 40 words.
-pub const PENALTY_EM_DASH_DENSITY: f64 = 0.15;
+/// Strong tell: the post reuses a recent post's structure (n-gram similarity).
+pub const PENALTY_REPEATED_STRUCTURE: f64 = 0.35;
+/// Strong tell: the post opens with the same words as a recent post.
+pub const PENALTY_REPEATED_OPENING: f64 = 0.35;
+/// Strong tell: a templated LLM opener ("Did you know…", "The trick is…").
+pub const PENALTY_TEMPLATED_OPENER: f64 = 0.35;
+/// Strong tell: em-dash density above ~1 per 40 words (an LLM tic).
+pub const PENALTY_EM_DASH_DENSITY: f64 = 0.35;
 /// Medium: sentence lengths are too uniform, which reads like a machine.
-pub const PENALTY_SENTENCE_VARIANCE: f64 = 0.12;
+pub const PENALTY_SENTENCE_VARIANCE: f64 = 0.20;
 /// Medium: every post in the window ends in a question (a formula).
-pub const PENALTY_ALWAYS_QUESTION: f64 = 0.15;
+pub const PENALTY_ALWAYS_QUESTION: f64 = 0.20;
 /// Medium: the listicle shape ("5 things about X") repeats.
-pub const PENALTY_REPEATED_LISTICLE: f64 = 0.12;
+pub const PENALTY_REPEATED_LISTICLE: f64 = 0.20;
 /// Low: more than the tolerated number of hashtags.
-pub const PENALTY_HASHTAG_OVERLOAD: f64 = 0.05;
+pub const PENALTY_HASHTAG_OVERLOAD: f64 = 0.10;
 /// Low: emoji overload.
-pub const PENALTY_EMOJI_OVERLOAD: f64 = 0.05;
+pub const PENALTY_EMOJI_OVERLOAD: f64 = 0.10;
+/// Guardrail rejection: the guardrail is the authority on safety, so this is
+/// stronger than any single tell (0.50) and always sinks a text below the floor.
+pub const PENALTY_GUARDRAIL_REJECTED: f64 = 0.5;
 
 /// Tunables for the craft heuristics. All values have safe defaults.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -170,6 +182,15 @@ impl CraftScore {
     pub fn meets(&self, floor: f64) -> bool {
         self.score >= floor
     }
+
+    /// Apply an extra penalty after scoring (e.g. a guardrail rejection) and
+    /// recompute the total and final score.
+    pub fn add_penalty(mut self, penalty: CraftPenalty) -> Self {
+        self.total_penalty += penalty.penalty;
+        self.score = (self.base - self.total_penalty).clamp(0.0, 1.0);
+        self.penalties.push(penalty);
+        self
+    }
 }
 
 /// A shape or opening pattern the creation stage should avoid reusing.
@@ -181,6 +202,25 @@ pub struct AvoidEntry {
     pub penalty: f64,
     /// Evidence describing the offending shape.
     pub evidence: String,
+}
+
+impl From<CraftPenalty> for AvoidEntry {
+    fn from(penalty: CraftPenalty) -> Self {
+        Self {
+            rule: penalty.rule,
+            penalty: penalty.penalty,
+            evidence: penalty.evidence,
+        }
+    }
+}
+
+/// A penalty representing a guardrail rejection (never a craft heuristic).
+pub fn guardrail_penalty(reason: &str) -> CraftPenalty {
+    CraftPenalty {
+        rule: "guardrail-rejected".to_string(),
+        penalty: PENALTY_GUARDRAIL_REJECTED,
+        evidence: reason.to_string(),
+    }
 }
 
 /// Score one post against the craft heuristics.
@@ -198,6 +238,7 @@ pub fn craft_score(text: &str, recent: &[&str], config: &CraftConfig) -> CraftSc
 
     let mut penalties: Vec<CraftPenalty> = Vec::new();
     for candidate in [
+        penalty_templated_opener(text),
         penalty_repeated_structure(text, &window, config),
         penalty_repeated_opening(text, &window),
         penalty_em_dash_density(text, config),
@@ -224,6 +265,24 @@ pub fn craft_score(text: &str, recent: &[&str], config: &CraftConfig) -> CraftSc
     }
 }
 
+/// Score one post, additionally honouring a guardrail rejection.
+///
+/// When the caller already has the guardrail verdict and passes the rejection
+/// `reason`, a `guardrail-rejected` penalty is added so the text can never be
+/// promoted (the guardrail is the authority on safety — `scoring-model.md`, §2).
+pub fn craft_score_guarded(
+    text: &str,
+    recent: &[&str],
+    config: &CraftConfig,
+    rejection: Option<&str>,
+) -> CraftScore {
+    let score = craft_score(text, recent, config);
+    match rejection {
+        Some(reason) => score.add_penalty(guardrail_penalty(reason)),
+        None => score,
+    }
+}
+
 /// Collect the distinct avoid entries across a corpus of posts.
 ///
 /// `texts` is the corpus, **most recent first**.
@@ -232,15 +291,8 @@ pub fn avoid_entries(texts: &[&str], config: &CraftConfig) -> Vec<AvoidEntry> {
     for (index, text) in texts.iter().enumerate() {
         let recent = others(texts, index, text);
         for penalty in craft_score(text, &recent, config).penalties {
-            let duplicate = entries
-                .iter()
-                .any(|seen| seen.rule == penalty.rule && seen.evidence == penalty.evidence);
-            if !duplicate {
-                entries.push(AvoidEntry {
-                    rule: penalty.rule,
-                    penalty: penalty.penalty,
-                    evidence: penalty.evidence,
-                });
+            if let Some(entry) = unique_entry(&entries, penalty.into()) {
+                entries.push(entry);
             }
             if entries.len() >= DEFAULT_MAX_AVOID {
                 return entries;
@@ -248,6 +300,36 @@ pub fn avoid_entries(texts: &[&str], config: &CraftConfig) -> Vec<AvoidEntry> {
         }
     }
     entries
+}
+
+/// Same as [`avoid_entries`] but also records guardrail rejections.
+///
+/// A rejected text is never promoted, and the rejection itself is avoid evidence
+/// the creation stage can read.
+pub fn avoid_entries_with_rejections(
+    texts: &[&str],
+    rejected: &[&str],
+    config: &CraftConfig,
+) -> Vec<AvoidEntry> {
+    let mut entries = avoid_entries(texts, config);
+    for text in rejected {
+        let penalty = guardrail_penalty(&format!("guardrail rejected: \"{}\"", snippet(text)));
+        if let Some(entry) = unique_entry(&entries, penalty.into()) {
+            entries.push(entry);
+        }
+        if entries.len() >= DEFAULT_MAX_AVOID {
+            break;
+        }
+    }
+    entries
+}
+
+/// Return the entry unless the same rule + evidence is already present.
+fn unique_entry(entries: &[AvoidEntry], entry: AvoidEntry) -> Option<AvoidEntry> {
+    let duplicate = entries
+        .iter()
+        .any(|seen| seen.rule == entry.rule && seen.evidence == entry.evidence);
+    (!duplicate).then_some(entry)
 }
 
 /// Every corpus text except the one at `index` and its exact copies.
@@ -261,6 +343,28 @@ fn others<'a>(texts: &[&'a str], index: usize, text: &str) -> Vec<&'a str> {
 }
 
 // --- Heuristics ------------------------------------------------------------
+
+/// A templated LLM opener ("Did you know…", "The trick is…") is a tell on its
+/// own — it fires even when there is no recent post to compare against.
+fn penalty_templated_opener(text: &str) -> Option<CraftPenalty> {
+    let head = tokenize(text)
+        .iter()
+        .take(OPENING_WORDS * 2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if head.is_empty() {
+        return None;
+    }
+    let opener = TEMPLATED_OPENERS
+        .iter()
+        .find(|phrase| head.starts_with(*phrase))?;
+    Some(CraftPenalty {
+        rule: "templated-opener".to_string(),
+        penalty: PENALTY_TEMPLATED_OPENER,
+        evidence: format!("templated opener \"{opener}\""),
+    })
+}
 
 /// Repeated structure vs. the recent window (prefix/n-gram similarity).
 fn penalty_repeated_structure(
@@ -466,6 +570,27 @@ const LISTICLE_NOUNS: [&str; 8] = [
     "things", "ways", "tips", "reasons", "facts", "lessons", "tricks", "steps",
 ];
 
+/// Templated openers that mark machine-written copy. These overlap with the
+/// persona packs' `banned_phrases` but are enforced here as a *score* penalty so
+/// the learning stage never promotes such a post as a few-shot model, even when
+/// the guardrail verdict is not available to the caller.
+const TEMPLATED_OPENERS: [&str; 14] = [
+    "did you know",
+    "the trick is",
+    "here's the kicker",
+    "let me tell you",
+    "guess what",
+    "picture this",
+    "imagine this",
+    "in today's",
+    "let's dive",
+    "buckle up",
+    "unpopular opinion",
+    "hot take",
+    "fun fact",
+    "believe it or not",
+];
+
 /// Lowercased alphanumeric word tokens (accents preserved).
 fn tokenize(text: &str) -> Vec<String> {
     text.split(|character: char| !character.is_alphanumeric() && character != '\'')
@@ -622,6 +747,50 @@ mod tests {
             .find(|p| p.rule == "repeated-opening")
             .expect("opening penalty");
         assert!(penalty.evidence.contains("the trick is"));
+    }
+
+    #[test]
+    fn templated_opener_is_penalised_without_a_corpus() {
+        // No recent posts: the tell must still fire on its own.
+        let score = craft_score(
+            "Did you know that the kernel scheduler is amazing?",
+            &[],
+            &config(),
+        );
+        assert!(
+            score.penalties.iter().any(|p| p.rule == "templated-opener"),
+            "penalties: {:?}",
+            score.penalties
+        );
+    }
+
+    #[test]
+    fn a_single_strong_tell_cannot_reach_the_floor() {
+        // A strong tell alone must drop below the floor by construction.
+        let score = craft_score("one — two — three — four — five", &[], &config());
+        assert!(!score.is_clean());
+        assert!(!score.meets(config().craft_floor));
+        assert!(score.score < config().craft_floor);
+    }
+
+    #[test]
+    fn a_guardrail_rejection_sinks_the_score() {
+        let clean = craft_score("A clean short note.", &[], &config());
+        assert!(clean.is_clean());
+        let rejected = craft_score_guarded(
+            "A clean short note.",
+            &[],
+            &config(),
+            Some("banned phrase present"),
+        );
+        assert!(!rejected.is_clean());
+        assert!(!rejected.meets(config().craft_floor));
+        assert!(
+            rejected
+                .penalties
+                .iter()
+                .any(|p| p.rule == "guardrail-rejected")
+        );
     }
 
     #[test]

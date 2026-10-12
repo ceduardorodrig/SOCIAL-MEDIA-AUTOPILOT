@@ -11,7 +11,7 @@ use autopilot_core::Platform;
 use autopilot_metrics::MetricsRecord;
 use serde::{Deserialize, Serialize};
 
-use crate::craft::{AvoidEntry, CraftConfig, avoid_entries, craft_score};
+use crate::craft::{AvoidEntry, CraftConfig, avoid_entries_with_rejections, craft_score_guarded};
 use crate::score::{AbOutcome, VariantStats, weighted_score};
 
 /// How many winning posts to carry forward as few-shot examples.
@@ -22,6 +22,27 @@ const SECONDS_PER_DAY: u64 = 86_400;
 
 /// Seconds in an hour.
 const SECONDS_PER_HOUR: u64 = 3_600;
+
+/// Context that shapes a memory proposal: the craft tunables plus the texts the
+/// guardrail already rejected, when the caller has that verdict.
+#[derive(Debug, Clone, Copy)]
+pub struct ProposalContext<'a> {
+    /// Craft tunables (penalty magnitudes are constants; floor/base are here).
+    pub config: CraftConfig,
+    /// Texts the guardrail rejected. They are never promoted and are recorded in
+    /// the avoid memory. Empty when the caller has no guardrail verdict.
+    pub guardrail_rejected: &'a [&'a str],
+}
+
+impl ProposalContext<'static> {
+    /// A context with default craft tunables and no guardrail verdict.
+    pub fn new(config: CraftConfig) -> Self {
+        Self {
+            config,
+            guardrail_rejected: &[],
+        }
+    }
+}
 
 /// A proposed update to a persona pack's memory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -56,8 +77,8 @@ pub struct ScheduleHint {
 
 /// Build a memory proposal from the metrics and the A/B outcome.
 ///
-/// Uses the default craft configuration. `generated_at_unix` is passed in so the
-/// function stays pure and testable.
+/// Uses the default craft configuration and no guardrail verdict.
+/// `generated_at_unix` is passed in so the function stays pure and testable.
 pub fn propose_memory(
     records: &[MetricsRecord],
     persona: &str,
@@ -66,23 +87,18 @@ pub fn propose_memory(
     max_few_shot: usize,
     generated_at_unix: u64,
 ) -> MemoryUpdate {
-    propose_memory_with_config(
+    propose_memory_with_context(
         records,
         persona,
         platform,
         outcome,
         max_few_shot,
         generated_at_unix,
-        &CraftConfig::default(),
+        &ProposalContext::new(CraftConfig::default()),
     )
 }
 
-/// Same as [`propose_memory`] with an explicit craft configuration.
-///
-/// A winning post only becomes a few-shot example when its **craft** score also
-/// clears `config.craft_floor`: a post that performed by luck with a sloppy
-/// template must not become the model (`scoring-model.md` §3). Penalised shapes
-/// are collected into the avoid memory the creation stage reads.
+/// Same as [`propose_memory`] with explicit craft tunables.
 pub fn propose_memory_with_config(
     records: &[MetricsRecord],
     persona: &str,
@@ -92,15 +108,43 @@ pub fn propose_memory_with_config(
     generated_at_unix: u64,
     config: &CraftConfig,
 ) -> MemoryUpdate {
+    propose_memory_with_context(
+        records,
+        persona,
+        platform,
+        outcome,
+        max_few_shot,
+        generated_at_unix,
+        &ProposalContext::new(*config),
+    )
+}
+
+/// The full form: craft tunables **and** the guardrail verdict.
+///
+/// A winning post only becomes a few-shot example when it is **clean** (no
+/// craft penalty at all — a text that contributes an avoid entry is evidence of
+/// slop and must never be the model) **and** clears `craft_floor`. A text the
+/// guardrail rejected is never promoted either. Penalised shapes and rejections
+/// are collected into the avoid memory the creation stage reads
+/// (`scoring-model.md` §3).
+pub fn propose_memory_with_context(
+    records: &[MetricsRecord],
+    persona: &str,
+    platform: Platform,
+    outcome: &AbOutcome,
+    max_few_shot: usize,
+    generated_at_unix: u64,
+    context: &ProposalContext<'_>,
+) -> MemoryUpdate {
     let corpus = recent_texts(records);
 
     let few_shot = outcome
         .winner
         .as_deref()
-        .map(|winner| winning_texts(records, winner, max_few_shot, &corpus, config))
+        .map(|winner| winning_texts(records, winner, max_few_shot, &corpus, context))
         .unwrap_or_default();
 
-    let avoid = avoid_entries(&corpus, config);
+    let avoid = avoid_entries_with_rejections(&corpus, context.guardrail_rejected, &context.config);
 
     let schedule_hints = outcome
         .winner
@@ -116,8 +160,8 @@ pub fn propose_memory_with_config(
 
     let reason = match &outcome.winner {
         Some(winner) if few_shot.is_empty() => format!(
-            "{}; winner {winner} was not promoted to few-shot: craft score below {:.2}",
-            outcome.reason, config.craft_floor
+            "{}; winner {winner} was not promoted to few-shot: craft score not clean or below {:.2}",
+            outcome.reason, context.config.craft_floor
         ),
         _ => outcome.reason.clone(),
     };
@@ -174,14 +218,17 @@ pub async fn write_memory(path: &Path, update: &MemoryUpdate) -> Result<()> {
     autopilot_core::store::write_text(path, &body, "memory").await
 }
 
-/// Non-empty, de-duplicated texts of the winning variant that also clear the
-/// craft floor (order preserved).
+/// Non-empty, de-duplicated texts of the winning variant that are clean **and**
+/// clear the craft floor (order preserved).
+///
+/// A text that fired any penalty contributes an avoid entry, so it is never
+/// promoted: the avoid list would otherwise contradict the few-shot model.
 fn winning_texts(
     records: &[MetricsRecord],
     winner: &str,
     max: usize,
     corpus: &[&str],
-    config: &CraftConfig,
+    context: &ProposalContext<'_>,
 ) -> Vec<String> {
     let mut texts: Vec<String> = Vec::new();
     for record in records.iter().filter(|record| record.variant == winner) {
@@ -190,7 +237,12 @@ fn winning_texts(
             continue;
         }
         let recent = others_like(corpus, text);
-        if !craft_score(text, &recent, config).meets(config.craft_floor) {
+        let rejection = context
+            .guardrail_rejected
+            .contains(&text)
+            .then_some("rejected by the guardrail");
+        let craft = craft_score_guarded(text, &recent, &context.config, rejection);
+        if !craft.is_clean() || !craft.meets(context.config.craft_floor) {
             continue;
         }
         texts.push(text.to_string());
@@ -387,7 +439,7 @@ mod tests {
             "few_shot: {:?}",
             update.few_shot
         );
-        assert!(update.reason.contains("craft score below"));
+        assert!(update.reason.contains("not promoted to few-shot"));
     }
 
     #[test]
@@ -445,5 +497,100 @@ mod tests {
         let yaml = render_memory(&update).expect("renders");
         let decoded: MemoryUpdate = serde_yaml_ng::from_str(&yaml).expect("round-trips");
         assert_eq!(decoded.avoid, update.avoid);
+    }
+
+    #[test]
+    fn sloppy_high_engagement_is_never_promoted() {
+        // Regression: variant A is slop with high engagement; variant B is clean
+        // but low engagement. The craft gate must keep the slop out of few-shot.
+        let records = vec![
+            record_text(
+                "A",
+                "Did you know that Linux — the kernel — is — frankly — amazing? #linux #foss #tech #oss",
+                100,
+                0,
+                0,
+                0,
+            ),
+            record_text(
+                "B",
+                "The scheduler rewrite cut wakeups on my laptop overnight.",
+                1,
+                0,
+                0,
+                0,
+            ),
+        ];
+        let outcome = outcome_for(&records);
+        let update = propose_memory(
+            &records,
+            "p",
+            Platform::Bluesky,
+            &outcome,
+            DEFAULT_MAX_FEW_SHOT,
+            0,
+        );
+
+        assert_eq!(update.winner.as_deref(), Some("A"));
+        assert!(
+            update.few_shot.is_empty(),
+            "few_shot must be empty, got: {:?}",
+            update.few_shot
+        );
+        assert!(
+            update
+                .avoid
+                .iter()
+                .any(|entry| entry.rule == "em-dash-density"),
+            "avoid: {:?}",
+            update.avoid
+        );
+        assert!(
+            update
+                .avoid
+                .iter()
+                .any(|entry| entry.rule == "hashtag-overload"),
+            "avoid: {:?}",
+            update.avoid
+        );
+    }
+
+    #[test]
+    fn a_guardrail_rejected_winner_is_never_promoted() {
+        // A clean text that the guardrail rejected must not become the model.
+        let text = "A perfectly clean line the guardrail still rejected.";
+        let records = vec![
+            record_text("A", text, 100, 0, 0, 0),
+            record_text("B", "Another clean but losing line.", 1, 0, 0, 0),
+        ];
+        let outcome = outcome_for(&records);
+        let context = ProposalContext {
+            config: CraftConfig::default(),
+            guardrail_rejected: &[text],
+        };
+        let update = propose_memory_with_context(
+            &records,
+            "p",
+            Platform::Bluesky,
+            &outcome,
+            DEFAULT_MAX_FEW_SHOT,
+            0,
+            &context,
+        );
+
+        assert_eq!(update.winner.as_deref(), Some("A"));
+        assert!(
+            update.few_shot.is_empty(),
+            "few_shot: {:?}",
+            update.few_shot
+        );
+        assert!(
+            update
+                .avoid
+                .iter()
+                .any(|entry| entry.rule == "guardrail-rejected"),
+            "avoid: {:?}",
+            update.avoid
+        );
     }
 }

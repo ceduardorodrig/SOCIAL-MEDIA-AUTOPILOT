@@ -18,11 +18,12 @@ pub(crate) mod test_support;
 
 pub use craft::{
     AvoidEntry, CraftConfig, CraftPenalty, CraftScore, DEFAULT_CRAFT_FLOOR, DEFAULT_MAX_AVOID,
-    avoid_entries, craft_score,
+    avoid_entries, avoid_entries_with_rejections, craft_score, craft_score_guarded,
+    guardrail_penalty,
 };
 pub use memory::{
-    DEFAULT_MAX_FEW_SHOT, MemoryUpdate, ScheduleHint, best_hour, propose_memory,
-    propose_memory_with_config, render_memory, write_memory,
+    DEFAULT_MAX_FEW_SHOT, MemoryUpdate, ProposalContext, ScheduleHint, best_hour, propose_memory,
+    propose_memory_with_config, propose_memory_with_context, render_memory, write_memory,
 };
 pub use score::{
     AbOutcome, DEFAULT_BASELINE_WINDOW, DEFAULT_MIN_SAMPLES, PerformanceScore, VariantStats,
