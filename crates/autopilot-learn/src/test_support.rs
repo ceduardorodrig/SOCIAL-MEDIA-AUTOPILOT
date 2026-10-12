@@ -39,3 +39,17 @@ pub fn record_at(
     record.published_at_unix = Some(1_704_067_200 + u64::from(hour_utc) * 3_600);
     record
 }
+
+/// Same as [`record`] but with an explicit post body (used by craft tests).
+pub fn record_text(
+    variant: &str,
+    text: &str,
+    likes: u64,
+    replies: u64,
+    reposts: u64,
+    quotes: u64,
+) -> MetricsRecord {
+    let mut record = record(variant, likes, replies, reposts, quotes);
+    record.text = text.to_string();
+    record
+}

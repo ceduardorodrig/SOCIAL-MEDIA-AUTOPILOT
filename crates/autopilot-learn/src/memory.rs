@@ -11,6 +11,7 @@ use autopilot_core::Platform;
 use autopilot_metrics::MetricsRecord;
 use serde::{Deserialize, Serialize};
 
+use crate::craft::{AvoidEntry, CraftConfig, avoid_entries, craft_score};
 use crate::score::{AbOutcome, VariantStats, weighted_score};
 
 /// How many winning posts to carry forward as few-shot examples.
@@ -33,8 +34,12 @@ pub struct MemoryUpdate {
     pub min_samples: usize,
     /// Per-variant statistics, best first.
     pub variants: Vec<VariantStats>,
-    /// Winning posts, to reuse as few-shot examples.
+    /// Winning posts, to reuse as few-shot examples. A winning post is only
+    /// promoted when its craft score also clears the floor.
     pub few_shot: Vec<String>,
+    /// Penalised shapes/openings the creation stage should avoid reusing.
+    #[serde(default)]
+    pub avoid: Vec<AvoidEntry>,
     /// Human-readable schedule hints derived from the winning samples.
     pub schedule_hints: Vec<String>,
     /// Why this update was proposed (or why it is inconclusive).
@@ -51,7 +56,8 @@ pub struct ScheduleHint {
 
 /// Build a memory proposal from the metrics and the A/B outcome.
 ///
-/// `generated_at_unix` is passed in so the function stays pure and testable.
+/// Uses the default craft configuration. `generated_at_unix` is passed in so the
+/// function stays pure and testable.
 pub fn propose_memory(
     records: &[MetricsRecord],
     persona: &str,
@@ -60,11 +66,41 @@ pub fn propose_memory(
     max_few_shot: usize,
     generated_at_unix: u64,
 ) -> MemoryUpdate {
+    propose_memory_with_config(
+        records,
+        persona,
+        platform,
+        outcome,
+        max_few_shot,
+        generated_at_unix,
+        &CraftConfig::default(),
+    )
+}
+
+/// Same as [`propose_memory`] with an explicit craft configuration.
+///
+/// A winning post only becomes a few-shot example when its **craft** score also
+/// clears `config.craft_floor`: a post that performed by luck with a sloppy
+/// template must not become the model (`scoring-model.md` §3). Penalised shapes
+/// are collected into the avoid memory the creation stage reads.
+pub fn propose_memory_with_config(
+    records: &[MetricsRecord],
+    persona: &str,
+    platform: Platform,
+    outcome: &AbOutcome,
+    max_few_shot: usize,
+    generated_at_unix: u64,
+    config: &CraftConfig,
+) -> MemoryUpdate {
+    let corpus = recent_texts(records);
+
     let few_shot = outcome
         .winner
         .as_deref()
-        .map(|winner| winning_texts(records, winner, max_few_shot))
+        .map(|winner| winning_texts(records, winner, max_few_shot, &corpus, config))
         .unwrap_or_default();
+
+    let avoid = avoid_entries(&corpus, config);
 
     let schedule_hints = outcome
         .winner
@@ -78,6 +114,14 @@ pub fn propose_memory(
         })
         .unwrap_or_default();
 
+    let reason = match &outcome.winner {
+        Some(winner) if few_shot.is_empty() => format!(
+            "{}; winner {winner} was not promoted to few-shot: craft score below {:.2}",
+            outcome.reason, config.craft_floor
+        ),
+        _ => outcome.reason.clone(),
+    };
+
     MemoryUpdate {
         persona: persona.to_string(),
         generated_at_unix,
@@ -86,8 +130,9 @@ pub fn propose_memory(
         min_samples: outcome.min_samples,
         variants: outcome.variants.clone(),
         few_shot,
+        avoid,
         schedule_hints,
-        reason: outcome.reason.clone(),
+        reason,
     }
 }
 
@@ -129,12 +174,23 @@ pub async fn write_memory(path: &Path, update: &MemoryUpdate) -> Result<()> {
     autopilot_core::store::write_text(path, &body, "memory").await
 }
 
-/// Non-empty, de-duplicated texts of the winning variant (order preserved).
-fn winning_texts(records: &[MetricsRecord], winner: &str, max: usize) -> Vec<String> {
+/// Non-empty, de-duplicated texts of the winning variant that also clear the
+/// craft floor (order preserved).
+fn winning_texts(
+    records: &[MetricsRecord],
+    winner: &str,
+    max: usize,
+    corpus: &[&str],
+    config: &CraftConfig,
+) -> Vec<String> {
     let mut texts: Vec<String> = Vec::new();
     for record in records.iter().filter(|record| record.variant == winner) {
         let text = record.text.trim();
         if text.is_empty() || texts.iter().any(|kept| kept == text) {
+            continue;
+        }
+        let recent = others_like(corpus, text);
+        if !craft_score(text, &recent, config).meets(config.craft_floor) {
             continue;
         }
         texts.push(text.to_string());
@@ -145,11 +201,33 @@ fn winning_texts(records: &[MetricsRecord], winner: &str, max: usize) -> Vec<Str
     texts
 }
 
+/// The persona's recent texts, most recent first and de-duplicated.
+fn recent_texts(records: &[MetricsRecord]) -> Vec<&str> {
+    let mut texts: Vec<&str> = Vec::new();
+    for record in records.iter().rev() {
+        let text = record.text.trim();
+        if text.is_empty() || texts.contains(&text) {
+            continue;
+        }
+        texts.push(text);
+    }
+    texts
+}
+
+/// Corpus texts excluding every exact copy of `text`.
+fn others_like<'a>(corpus: &[&'a str], text: &str) -> Vec<&'a str> {
+    corpus
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate != text)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::score::{DEFAULT_MIN_SAMPLES, compare_variants};
-    use crate::test_support::{record, record_at};
+    use crate::test_support::{record, record_at, record_text};
 
     fn outcome_for(records: &[MetricsRecord]) -> AbOutcome {
         compare_variants(records, DEFAULT_MIN_SAMPLES)
@@ -268,5 +346,104 @@ mod tests {
         let yaml = render_memory(&update).expect("renders");
         assert!(yaml.contains("winner: B"), "yaml was: {yaml}");
         assert!(yaml.contains("persona: p"));
+    }
+
+    #[test]
+    fn a_lucky_winner_with_a_sloppy_template_is_not_promoted() {
+        // B wins on performance, but both posts share the same template opening,
+        // so B's craft score falls below the floor and it must not become the
+        // few-shot model.
+        let records = vec![
+            record_text(
+                "A",
+                "The trick is to read the man page before the blog post",
+                1,
+                0,
+                0,
+                0,
+            ),
+            record_text(
+                "B",
+                "The trick is to always benchmark before trusting numbers",
+                50,
+                0,
+                0,
+                0,
+            ),
+        ];
+        let outcome = outcome_for(&records);
+        let update = propose_memory(
+            &records,
+            "p",
+            Platform::Bluesky,
+            &outcome,
+            DEFAULT_MAX_FEW_SHOT,
+            0,
+        );
+
+        assert_eq!(update.winner.as_deref(), Some("B"));
+        assert!(
+            update.few_shot.is_empty(),
+            "few_shot: {:?}",
+            update.few_shot
+        );
+        assert!(update.reason.contains("craft score below"));
+    }
+
+    #[test]
+    fn a_clean_winner_is_promoted() {
+        let records = vec![
+            record_text("A", "A flat note about the kernel.", 1, 0, 0, 0),
+            record_text(
+                "B",
+                "I tried the new scheduler on my laptop. Wakeups dropped a lot.",
+                50,
+                0,
+                0,
+                0,
+            ),
+        ];
+        let outcome = outcome_for(&records);
+        let update = propose_memory(
+            &records,
+            "p",
+            Platform::Bluesky,
+            &outcome,
+            DEFAULT_MAX_FEW_SHOT,
+            0,
+        );
+
+        assert_eq!(update.few_shot.len(), 1);
+        assert!(update.few_shot[0].starts_with("I tried the new scheduler"));
+    }
+
+    #[test]
+    fn avoid_memory_round_trips_through_yaml() {
+        let records = vec![
+            record_text("A", "5 things about the Linux scheduler", 1, 0, 0, 0),
+            record_text("B", "5 things about the Rust borrow checker", 9, 0, 0, 0),
+        ];
+        let outcome = outcome_for(&records);
+        let update = propose_memory(
+            &records,
+            "p",
+            Platform::Bluesky,
+            &outcome,
+            DEFAULT_MAX_FEW_SHOT,
+            0,
+        );
+
+        assert!(
+            update
+                .avoid
+                .iter()
+                .any(|entry| entry.rule == "repeated-listicle"),
+            "avoid: {:?}",
+            update.avoid
+        );
+
+        let yaml = render_memory(&update).expect("renders");
+        let decoded: MemoryUpdate = serde_yaml_ng::from_str(&yaml).expect("round-trips");
+        assert_eq!(decoded.avoid, update.avoid);
     }
 }
