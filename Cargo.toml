@@ -10,6 +10,7 @@ members = [
     "crates/autopilot-providers",
     "crates/autopilot-publish",
     "crates/autopilot-media",
+    "crates/autopilot-run",
     "crates/autopilot-cli",
 ]
 

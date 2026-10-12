@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use autopilot_core::{Platform, ValidationIssue, load_dir, load_persona};
+use autopilot_core::{Platform, ValidationIssue, load_dir, load_persona, now_unix};
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{DEFAULT_SEARXNG_ENDPOINT, SearxngClient};
 use autopilot_learn::{
@@ -28,7 +28,8 @@ use autopilot_publish::{
     BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, build_post_record, create_post, create_session,
     now_rfc3339_millis, post_url,
 };
-use clap::{Parser, Subcommand};
+use autopilot_run::{RunOptions, RunReport, StageOutcome};
+use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -50,6 +51,8 @@ enum Command {
         #[command(subcommand)]
         command: PersonasCommand,
     },
+    /// Execute the full pipeline for one persona pack.
+    Run(RunArgs),
     /// LLM quota instrumentation.
     Quota {
         #[command(subcommand)]
@@ -118,6 +121,34 @@ enum PersonasCommand {
         #[arg(long, default_value = "personas")]
         dir: PathBuf,
     },
+}
+
+#[derive(Args)]
+struct RunArgs {
+    /// Persona pack to execute.
+    #[arg(long)]
+    persona: PathBuf,
+    /// Harvest query (defaults to the persona niche).
+    #[arg(long)]
+    query: Option<String>,
+    /// Maximum number of harvested topics.
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+    /// SearXNG endpoint used by the harvest stage.
+    #[arg(long, default_value = DEFAULT_SEARXNG_ENDPOINT)]
+    endpoint: String,
+    /// Restrict the run to one platform channel (default: every enabled one).
+    #[arg(long, value_parser = parse_platform)]
+    platform: Option<Platform>,
+    /// Provider registry (read only in a live run).
+    #[arg(long, default_value = "config/providers.yaml")]
+    config: PathBuf,
+    /// Journal file (defaults to `var/runs/<run-id>.jsonl`).
+    #[arg(long)]
+    journal: Option<PathBuf>,
+    /// Describe every stage without any LLM call, GPU work, network or publish.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Subcommand)]
@@ -350,6 +381,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Providers { command } => run_providers(command).await,
         Command::Personas { command } => run_personas(command).await,
+        Command::Run(args) => run_autopilot(args).await,
         Command::Quota { command } => run_quota(command).await,
         Command::Harvest { command } => run_harvest(command).await,
         Command::Guardrail { command } => run_guardrail(command).await,
@@ -441,6 +473,75 @@ async fn run_personas(command: PersonasCommand) -> Result<ExitCode> {
                 Ok(ExitCode::FAILURE)
             }
         }
+    }
+}
+
+/// Execute the full pipeline for one persona pack (`autopilot run`).
+///
+/// The stage chaining lives in `autopilot-run`; this command only maps the CLI
+/// arguments and renders the resulting report.
+async fn run_autopilot(args: RunArgs) -> Result<ExitCode> {
+    let options = RunOptions {
+        persona_path: args.persona,
+        query: args.query,
+        limit: args.limit,
+        endpoint: args.endpoint,
+        platform: args.platform,
+        config_path: args.config,
+        journal_path: args.journal,
+        dry_run: args.dry_run,
+    };
+
+    let report = autopilot_run::run(options).await?;
+    print_run_report(&report);
+    if report.failed {
+        Ok(ExitCode::FAILURE)
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Render a run report as structured console output.
+fn print_run_report(report: &RunReport) {
+    println!("persona  : {}", report.persona);
+    println!("run-id   : {}", report.run_id);
+    println!(
+        "mode     : {}",
+        if report.dry_run {
+            "dry-run (no LLM, no GPU, no network, no publish)"
+        } else {
+            "live"
+        }
+    );
+    println!("journal  : {}", report.journal.display());
+    for stage in &report.stages {
+        println!(
+            "[{:<9}] {:<9} {:<14} {}",
+            stage.stage,
+            stage.status.as_str(),
+            stage_scope(stage),
+            stage.detail
+        );
+    }
+    for post in &report.published {
+        println!(
+            "published: {} variant {} -> {}",
+            post.platform, post.variant, post.url
+        );
+    }
+    println!(
+        "result   : {} published, {}",
+        report.published.len(),
+        if report.failed { "FAILED" } else { "ok" }
+    );
+}
+
+/// `platform/variant`, `platform` or `-` for a stage line.
+fn stage_scope(stage: &StageOutcome) -> String {
+    match (&stage.platform, &stage.variant) {
+        (Some(platform), Some(variant)) => format!("{platform}/{variant}"),
+        (Some(platform), None) => platform.clone(),
+        _ => "-".to_string(),
     }
 }
 
@@ -771,14 +872,6 @@ async fn run_publish(command: PublishCommand) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
-}
-
-/// Current time as Unix seconds (used to stamp collected samples).
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
 }
 
 /// Build the metrics adapter for a platform (Bluesky is the only one so far).

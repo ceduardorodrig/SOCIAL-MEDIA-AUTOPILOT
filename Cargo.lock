@@ -101,6 +101,7 @@ dependencies = [
  "autopilot-pipeline",
  "autopilot-providers",
  "autopilot-publish",
+ "autopilot-run",
  "clap",
  "serde_json",
  "tokio",
@@ -206,6 +207,22 @@ dependencies = [
  "anyhow",
  "chrono",
  "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "autopilot-run"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "autopilot-core",
+ "autopilot-guardrail",
+ "autopilot-harvest",
+ "autopilot-pipeline",
+ "autopilot-providers",
+ "autopilot-publish",
  "serde",
  "serde_json",
  "tokio",

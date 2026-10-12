@@ -1,0 +1,887 @@
+//! The orchestrator: chain the stage crates for exactly one persona pack.
+//!
+//! The data flow is a single pass: harvest → triage → creation → guardrail →
+//! publish. Each stage records a [`StageOutcome`] that is both printed by the
+//! caller and appended to the run's [`Journal`]. The pure decisions (channel
+//! resolution, topic selection, guardrail partition) are separated from the
+//! effectful calls so they can be unit-tested without any network.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Result, bail};
+use autopilot_core::{PersonaPack, Platform, load_persona, now_unix};
+use autopilot_guardrail::{Verdict, evaluate};
+use autopilot_harvest::{SearxngClient, Topic};
+use autopilot_pipeline::{
+    TopicScore, Variant, build_creation_prompt, build_triage_prompt, parse_shortlist,
+    parse_variants,
+};
+use autopilot_providers::{JobKind, complete_with_chain, load_config};
+use autopilot_publish::{
+    BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, Session, build_post_record, create_post,
+    create_session, now_rfc3339_millis, post_url,
+};
+
+use crate::journal::Journal;
+
+/// How long to wait for one LLM completion.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long to wait for one publishing API call.
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Options controlling one `autopilot run`.
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    /// Persona pack to execute.
+    pub persona_path: PathBuf,
+    /// Harvest query (defaults to the persona niche, humanised).
+    pub query: Option<String>,
+    /// Maximum number of harvested topics.
+    pub limit: usize,
+    /// SearXNG endpoint used by the harvest stage.
+    pub endpoint: String,
+    /// Restrict the run to a single platform channel (default: every enabled one).
+    pub platform: Option<Platform>,
+    /// Provider registry path (read only in a live run).
+    pub config_path: PathBuf,
+    /// Journal file (defaults to `var/runs/<run-id>.jsonl`).
+    pub journal_path: Option<PathBuf>,
+    /// When set, no LLM call, no GPU work, no network and no publish happen.
+    pub dry_run: bool,
+}
+
+/// How a stage ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageStatus {
+    /// The stage did its work.
+    Ok,
+    /// The stage was intentionally not run (dry run, draft persona, no input).
+    Skipped,
+    /// The guardrail refused a draft.
+    Rejected,
+    /// A post was published.
+    Published,
+    /// The stage was described but not executed (dry run).
+    DryRun,
+    /// The stage failed (provider, parse or adapter error).
+    Error,
+}
+
+impl StageStatus {
+    /// Stable, lower-case label used by the console and the journal.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StageStatus::Ok => "ok",
+            StageStatus::Skipped => "skipped",
+            StageStatus::Rejected => "rejected",
+            StageStatus::Published => "published",
+            StageStatus::DryRun => "dry-run",
+            StageStatus::Error => "error",
+        }
+    }
+}
+
+/// One stage decision.
+#[derive(Debug, Clone)]
+pub struct StageOutcome {
+    pub stage: String,
+    pub status: StageStatus,
+    pub detail: String,
+    pub platform: Option<String>,
+    pub variant: Option<String>,
+}
+
+impl StageOutcome {
+    fn new(stage: &str, status: StageStatus, detail: impl Into<String>) -> Self {
+        Self {
+            stage: stage.to_string(),
+            status,
+            detail: detail.into(),
+            platform: None,
+            variant: None,
+        }
+    }
+
+    fn with_platform(mut self, platform: Platform) -> Self {
+        self.platform = Some(platform.as_str().to_string());
+        self
+    }
+
+    fn with_variant(mut self, variant: &str) -> Self {
+        self.variant = Some(variant.to_string());
+        self
+    }
+}
+
+/// A post that was actually published.
+#[derive(Debug, Clone)]
+pub struct PublishedPost {
+    pub platform: String,
+    pub variant: String,
+    pub uri: String,
+    pub url: String,
+}
+
+/// The full result of a run: every decision plus what was published.
+#[derive(Debug, Clone)]
+pub struct RunReport {
+    pub run_id: String,
+    pub persona: String,
+    pub dry_run: bool,
+    pub journal: PathBuf,
+    pub stages: Vec<StageOutcome>,
+    pub published: Vec<PublishedPost>,
+    /// True when a stage failed (never set by a guardrail rejection alone).
+    pub failed: bool,
+}
+
+/// Human-readable harvest query derived from the persona niche.
+pub fn humanize_niche(niche: &str) -> String {
+    niche
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Enabled channels for the run, optionally narrowed to one platform.
+pub fn resolve_channels(persona: &PersonaPack, only: Option<Platform>) -> Vec<Platform> {
+    let mut platforms: Vec<Platform> = persona
+        .channels
+        .iter()
+        .filter(|channel| channel.enabled)
+        .map(|channel| channel.platform)
+        .filter(|platform| only.is_none_or(|wanted| wanted == *platform))
+        .collect();
+    platforms.dedup();
+    platforms
+}
+
+/// Pick the highest-scoring topic that clears the persona's rubric floor.
+///
+/// The shortlist is already sorted by score descending, so the first match wins.
+pub fn select_topic(shortlist: &[TopicScore], min_score: f32) -> Option<&TopicScore> {
+    shortlist.iter().find(|topic| topic.score >= min_score)
+}
+
+/// Split drafts into guardrail-approved and rejected (with the verdict).
+pub fn partition_variants<'a>(
+    persona: &PersonaPack,
+    platform: Platform,
+    variants: &'a [Variant],
+) -> (Vec<&'a Variant>, Vec<(&'a Variant, Verdict)>) {
+    let mut approved = Vec::new();
+    let mut rejected = Vec::new();
+    for variant in variants {
+        let verdict = evaluate(persona, platform, &variant.text);
+        if verdict.approved {
+            approved.push(variant);
+        } else {
+            rejected.push((variant, verdict));
+        }
+    }
+    (approved, rejected)
+}
+
+/// Execute the pipeline for one persona pack.
+pub async fn run(options: RunOptions) -> Result<RunReport> {
+    let persona = load_persona(&options.persona_path).await?;
+    validate_or_bail(&persona)?;
+
+    let run_id = format!("{}-{}", persona.persona, now_unix());
+    let journal_path = options
+        .journal_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("var/runs/{run_id}.jsonl")));
+    let journal = Journal::new(
+        run_id.clone(),
+        persona.persona.clone(),
+        journal_path.clone(),
+    );
+
+    let mut report = RunReport {
+        run_id,
+        persona: persona.persona.clone(),
+        dry_run: options.dry_run,
+        journal: journal_path,
+        stages: Vec::new(),
+        published: Vec::new(),
+        failed: false,
+    };
+
+    // A draft pack is validated but never executed for real (spec invariant).
+    if !persona.active && !options.dry_run {
+        record(
+            &mut report,
+            &journal,
+            StageOutcome::new(
+                "run",
+                StageStatus::Skipped,
+                "persona is a draft (active: false) — set active: true to execute the pipeline",
+            ),
+        )
+        .await?;
+        return Ok(report);
+    }
+
+    let channels = resolve_channels(&persona, options.platform);
+    if channels.is_empty() {
+        bail!(
+            "persona `{}` has no enabled channel to run{}",
+            persona.persona,
+            platform_suffix(options.platform)
+        );
+    }
+
+    let query = options
+        .query
+        .clone()
+        .unwrap_or_else(|| humanize_niche(&persona.niche));
+
+    let topics = stage_harvest(&mut report, &journal, &options, &query).await?;
+
+    // A dry run never calls an LLM, the GPU, the network or a publisher: it only
+    // describes the decisions the live run would take.
+    if options.dry_run {
+        stage_dry_run_plan(&mut report, &journal, &persona, &channels).await?;
+        return Ok(report);
+    }
+
+    let registry = load_config(&options.config_path).await?;
+    let Some(topic_title) =
+        stage_triage(&mut report, &journal, &persona, &topics, &registry).await?
+    else {
+        return Ok(report);
+    };
+
+    let drafts = stage_create(
+        &mut report,
+        &journal,
+        &persona,
+        &channels,
+        &registry,
+        &topic_title,
+    )
+    .await?;
+
+    let approved = stage_guardrail(&mut report, &journal, &persona, &drafts).await?;
+    if approved.is_empty() {
+        record(
+            &mut report,
+            &journal,
+            StageOutcome::new(
+                "publish",
+                StageStatus::Skipped,
+                "no draft cleared the guardrail — nothing was published",
+            ),
+        )
+        .await?;
+        return Ok(report);
+    }
+
+    stage_publish(&mut report, &journal, &approved).await?;
+    Ok(report)
+}
+
+/// Stage [1] — harvest. Returns the topics (empty in a dry run or on failure).
+async fn stage_harvest(
+    report: &mut RunReport,
+    journal: &Journal,
+    options: &RunOptions,
+    query: &str,
+) -> Result<Vec<Topic>> {
+    if options.dry_run {
+        record(
+            report,
+            journal,
+            StageOutcome::new(
+                "harvest",
+                StageStatus::DryRun,
+                format!(
+                    "would search \"{query}\" via {} (limit {})",
+                    options.endpoint, options.limit
+                ),
+            ),
+        )
+        .await?;
+        return Ok(Vec::new());
+    }
+
+    match SearxngClient::new(options.endpoint.clone())
+        .search(query, options.limit)
+        .await
+    {
+        Ok(topics) => {
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "harvest",
+                    StageStatus::Ok,
+                    format!(
+                        "{} topic(s) for \"{query}\" via {}",
+                        topics.len(),
+                        options.endpoint
+                    ),
+                ),
+            )
+            .await?;
+            Ok(topics)
+        }
+        Err(err) => {
+            report.failed = true;
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "harvest",
+                    StageStatus::Error,
+                    format!("harvest failed: {err:#}"),
+                ),
+            )
+            .await?;
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Describe the remaining stages without running them (dry run only).
+async fn stage_dry_run_plan(
+    report: &mut RunReport,
+    journal: &Journal,
+    persona: &PersonaPack,
+    channels: &[Platform],
+) -> Result<()> {
+    record(
+        report,
+        journal,
+        StageOutcome::new(
+            "triage",
+            StageStatus::DryRun,
+            format!(
+                "would score the candidates against \"{}\" and pick the first above the rubric floor ({})",
+                persona.niche, persona.rubric.min_score
+            ),
+        ),
+    )
+    .await?;
+
+    for platform in channels {
+        record(
+            report,
+            journal,
+            StageOutcome::new(
+                "create",
+                StageStatus::DryRun,
+                format!("would draft 2 A/B variants for {}", platform.as_str()),
+            )
+            .with_platform(*platform),
+        )
+        .await?;
+    }
+
+    record(
+        report,
+        journal,
+        StageOutcome::new(
+            "guardrail",
+            StageStatus::DryRun,
+            "would evaluate every draft deterministically (blocklist, banned phrases, hashtags, platform limit, emoji) before publishing",
+        ),
+    )
+    .await?;
+
+    for platform in channels {
+        record(
+            report,
+            journal,
+            StageOutcome::new(
+                "publish",
+                StageStatus::DryRun,
+                format!(
+                    "would publish the approved variants to {}",
+                    platform.as_str()
+                ),
+            )
+            .with_platform(*platform),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Stage [2] — triage. Returns the chosen topic title, or `None` to stop.
+async fn stage_triage(
+    report: &mut RunReport,
+    journal: &Journal,
+    persona: &PersonaPack,
+    topics: &[Topic],
+    registry: &autopilot_providers::ProvidersConfig,
+) -> Result<Option<String>> {
+    if topics.is_empty() {
+        record(
+            report,
+            journal,
+            StageOutcome::new(
+                "triage",
+                StageStatus::Skipped,
+                "no candidate topics harvested — the next stage does not run",
+            ),
+        )
+        .await?;
+        return Ok(None);
+    }
+
+    let prompt = build_triage_prompt(persona, topics);
+    let completion =
+        match complete_with_chain(registry, &prompt, JobKind::Triage, COMPLETION_TIMEOUT).await {
+            Ok(completion) => completion,
+            Err(err) => {
+                report.failed = true;
+                record(
+                    report,
+                    journal,
+                    StageOutcome::new(
+                        "triage",
+                        StageStatus::Error,
+                        format!("provider chain failed: {err:#}"),
+                    ),
+                )
+                .await?;
+                return Ok(None);
+            }
+        };
+
+    let shortlist = match parse_shortlist(&completion.text) {
+        Ok(shortlist) => shortlist,
+        Err(err) => {
+            report.failed = true;
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "triage",
+                    StageStatus::Error,
+                    format!("could not parse the shortlist: {err:#}"),
+                ),
+            )
+            .await?;
+            return Ok(None);
+        }
+    };
+
+    let Some(topic) = select_topic(&shortlist, persona.rubric.min_score) else {
+        let best = shortlist.first().map_or(0.0, |entry| entry.score);
+        record(
+            report,
+            journal,
+            StageOutcome::new(
+                "triage",
+                StageStatus::Skipped,
+                format!(
+                    "no candidate scored >= {} (best {:.2}); nothing to publish",
+                    persona.rubric.min_score, best
+                ),
+            ),
+        )
+        .await?;
+        return Ok(None);
+    };
+
+    let title = topic.title.clone();
+    record(
+        report,
+        journal,
+        StageOutcome::new(
+            "triage",
+            StageStatus::Ok,
+            format!(
+                "selected \"{title}\" (score {:.2}) via {} ({})",
+                topic.score, completion.provider_id, completion.model
+            ),
+        ),
+    )
+    .await?;
+    Ok(Some(title))
+}
+
+/// Stage [3] — creation. Returns the drafts grouped by platform.
+async fn stage_create(
+    report: &mut RunReport,
+    journal: &Journal,
+    persona: &PersonaPack,
+    channels: &[Platform],
+    registry: &autopilot_providers::ProvidersConfig,
+    topic: &str,
+) -> Result<Vec<(Platform, Vec<Variant>)>> {
+    let mut drafts = Vec::new();
+    for platform in channels {
+        let prompt = build_creation_prompt(persona, *platform, topic);
+        match complete_with_chain(registry, &prompt, JobKind::Create, COMPLETION_TIMEOUT).await {
+            Ok(completion) => match parse_variants(&completion.text) {
+                Ok(variants) => {
+                    record(
+                        report,
+                        journal,
+                        StageOutcome::new(
+                            "create",
+                            StageStatus::Ok,
+                            format!(
+                                "{} variant(s) via {} ({})",
+                                variants.len(),
+                                completion.provider_id,
+                                completion.model
+                            ),
+                        )
+                        .with_platform(*platform),
+                    )
+                    .await?;
+                    drafts.push((*platform, variants));
+                }
+                Err(err) => {
+                    report.failed = true;
+                    record(
+                        report,
+                        journal,
+                        StageOutcome::new(
+                            "create",
+                            StageStatus::Error,
+                            format!("could not parse the variants: {err:#}"),
+                        )
+                        .with_platform(*platform),
+                    )
+                    .await?;
+                }
+            },
+            Err(err) => {
+                report.failed = true;
+                record(
+                    report,
+                    journal,
+                    StageOutcome::new(
+                        "create",
+                        StageStatus::Error,
+                        format!("provider chain failed: {err:#}"),
+                    )
+                    .with_platform(*platform),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(drafts)
+}
+
+/// Stage [3.5] — guardrail. Returns the approved drafts (a hard gate).
+async fn stage_guardrail<'a>(
+    report: &mut RunReport,
+    journal: &Journal,
+    persona: &PersonaPack,
+    drafts: &'a [(Platform, Vec<Variant>)],
+) -> Result<Vec<(Platform, &'a Variant)>> {
+    let mut approved = Vec::new();
+    for (platform, variants) in drafts {
+        let (ok, rejected) = partition_variants(persona, *platform, variants);
+        for variant in &ok {
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "guardrail",
+                    StageStatus::Ok,
+                    format!("variant {} approved", variant.label),
+                )
+                .with_platform(*platform)
+                .with_variant(&variant.label),
+            )
+            .await?;
+        }
+        for (variant, verdict) in &rejected {
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "guardrail",
+                    StageStatus::Rejected,
+                    format!(
+                        "variant {} rejected — {}",
+                        variant.label,
+                        render_issues(verdict)
+                    ),
+                )
+                .with_platform(*platform)
+                .with_variant(&variant.label),
+            )
+            .await?;
+        }
+        approved.extend(ok.into_iter().map(|variant| (*platform, variant)));
+    }
+    Ok(approved)
+}
+
+/// Stage [4] — publish. Only the platforms with an adapter are served.
+async fn stage_publish(
+    report: &mut RunReport,
+    journal: &Journal,
+    approved: &[(Platform, &Variant)],
+) -> Result<()> {
+    let mut session: Option<Session> = None;
+    let mut handle = String::new();
+
+    for (platform, variant) in approved {
+        if *platform != Platform::Bluesky {
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "publish",
+                    StageStatus::Skipped,
+                    format!("no publish adapter for `{}` yet", platform.as_str()),
+                )
+                .with_platform(*platform)
+                .with_variant(&variant.label),
+            )
+            .await?;
+            continue;
+        }
+
+        if session.is_none() {
+            match open_bluesky_session().await {
+                Ok(created) => {
+                    handle = created.handle.clone();
+                    session = Some(created);
+                }
+                Err(err) => {
+                    report.failed = true;
+                    record(
+                        report,
+                        journal,
+                        StageOutcome::new(
+                            "publish",
+                            StageStatus::Error,
+                            format!("bluesky authentication failed: {err:#}"),
+                        )
+                        .with_platform(*platform)
+                        .with_variant(&variant.label),
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+        }
+
+        let Some(current) = session.as_ref() else {
+            continue;
+        };
+        let post = build_post_record(&variant.text, &now_rfc3339_millis());
+        match create_post(DEFAULT_BLUESKY_BASE_URL, current, &post, PUBLISH_TIMEOUT).await {
+            Ok(uri) => {
+                let url = post_url(&handle, &uri);
+                record(
+                    report,
+                    journal,
+                    StageOutcome::new(
+                        "publish",
+                        StageStatus::Published,
+                        format!("published to bluesky: {url}"),
+                    )
+                    .with_platform(*platform)
+                    .with_variant(&variant.label),
+                )
+                .await?;
+                report.published.push(PublishedPost {
+                    platform: platform.as_str().to_string(),
+                    variant: variant.label.clone(),
+                    uri,
+                    url,
+                });
+            }
+            Err(err) => {
+                report.failed = true;
+                record(
+                    report,
+                    journal,
+                    StageOutcome::new(
+                        "publish",
+                        StageStatus::Error,
+                        format!("bluesky rejected the post: {err:#}"),
+                    )
+                    .with_platform(*platform)
+                    .with_variant(&variant.label),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Authenticate against Bluesky using the credentials in the environment.
+async fn open_bluesky_session() -> Result<Session> {
+    let credentials = BlueskyCredentials::from_env()?;
+    create_session(DEFAULT_BLUESKY_BASE_URL, &credentials, PUBLISH_TIMEOUT).await
+}
+
+/// Append one decision to both the journal and the in-memory report.
+async fn record(report: &mut RunReport, journal: &Journal, outcome: StageOutcome) -> Result<()> {
+    journal.record(&outcome).await?;
+    report.stages.push(outcome);
+    Ok(())
+}
+
+/// Render the guardrail issues of a rejected draft as one line.
+fn render_issues(verdict: &Verdict) -> String {
+    verdict
+        .issues
+        .iter()
+        .map(|issue| format!("{}: {}", issue.rule, issue.detail))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Reject an invalid persona before any stage runs.
+fn validate_or_bail(persona: &PersonaPack) -> Result<()> {
+    let issues = persona.validate();
+    if issues.is_empty() {
+        return Ok(());
+    }
+    let rendered: Vec<String> = issues
+        .iter()
+        .map(|issue| format!("{}: {}", issue.field, issue.problem))
+        .collect();
+    bail!(
+        "persona `{}` is invalid: {}",
+        persona.persona,
+        rendered.join("; ")
+    )
+}
+
+/// Human-readable suffix for a platform filter in error messages.
+fn platform_suffix(platform: Option<Platform>) -> String {
+    platform.map_or_else(String::new, |value| {
+        format!(" for platform `{}`", value.as_str())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autopilot_core::{Channel, Rubric, Voice};
+
+    fn persona() -> PersonaPack {
+        PersonaPack {
+            persona: "demo".into(),
+            display_name: "Demo".into(),
+            niche: "science-curiosities".into(),
+            language: "pt-BR".into(),
+            active: false,
+            voice: Voice {
+                tone: "curious".into(),
+                audience: "adults".into(),
+                guidelines: vec![],
+                banned_phrases: vec!["não acredite".into()],
+                max_hashtags: 3,
+                emojis_allowed: true,
+            },
+            few_shot: vec![],
+            blocklist: vec!["terraplanismo".into()],
+            rubric: Rubric {
+                min_score: 0.75,
+                criteria: vec![],
+            },
+            channels: vec![
+                Channel {
+                    platform: Platform::Bluesky,
+                    handle: String::new(),
+                    enabled: true,
+                    posts_per_day: 1,
+                    windows: vec![],
+                },
+                Channel {
+                    platform: Platform::X,
+                    handle: String::new(),
+                    enabled: true,
+                    posts_per_day: 1,
+                    windows: vec![],
+                },
+                Channel {
+                    platform: Platform::Instagram,
+                    handle: String::new(),
+                    enabled: false,
+                    posts_per_day: 1,
+                    windows: vec![],
+                },
+            ],
+        }
+    }
+
+    fn variant(label: &str, text: &str) -> Variant {
+        Variant {
+            label: label.into(),
+            text: text.into(),
+            hashtags: vec![],
+            image_prompt: String::new(),
+        }
+    }
+
+    #[test]
+    fn humanizes_the_niche_into_a_query() {
+        assert_eq!(humanize_niche("science-curiosities"), "science curiosities");
+        assert_eq!(humanize_niche("astrology_horoscope"), "astrology horoscope");
+        assert_eq!(humanize_niche("  spaced  out "), "spaced out");
+    }
+
+    #[test]
+    fn resolve_channels_keeps_enabled_and_applies_the_filter() {
+        let persona = persona();
+        assert_eq!(
+            resolve_channels(&persona, None),
+            vec![Platform::Bluesky, Platform::X]
+        );
+        assert_eq!(
+            resolve_channels(&persona, Some(Platform::X)),
+            vec![Platform::X]
+        );
+        assert!(resolve_channels(&persona, Some(Platform::Instagram)).is_empty());
+    }
+
+    #[test]
+    fn select_topic_respects_the_rubric_floor() {
+        let shortlist = vec![
+            TopicScore {
+                title: "good".into(),
+                url: String::new(),
+                score: 0.9,
+                reason: String::new(),
+            },
+            TopicScore {
+                title: "borderline".into(),
+                url: String::new(),
+                score: 0.8,
+                reason: String::new(),
+            },
+        ];
+        assert_eq!(
+            select_topic(&shortlist, 0.75).map(|topic| topic.title.as_str()),
+            Some("good")
+        );
+        assert!(select_topic(&shortlist, 0.95).is_none());
+    }
+
+    #[test]
+    fn partition_variants_splits_on_the_guardrail() {
+        let persona = persona();
+        let variants = vec![
+            variant("A", "O cérebro gasta energia. #ciencia"),
+            variant("B", "Sobre o terraplanismo moderno..."),
+        ];
+        let (approved, rejected) = partition_variants(&persona, Platform::Bluesky, &variants);
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].label, "A");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].0.label, "B");
+        assert!(!rejected[0].1.approved);
+    }
+}

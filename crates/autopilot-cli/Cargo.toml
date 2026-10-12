@@ -24,3 +24,4 @@ autopilot-metrics = { path = "../autopilot-metrics" }
 autopilot-pipeline = { path = "../autopilot-pipeline" }
 autopilot-providers = { path = "../autopilot-providers" }
 autopilot-publish = { path = "../autopilot-publish" }
+autopilot-run = { path = "../autopilot-run" }

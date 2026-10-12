@@ -52,10 +52,11 @@ crates/
   autopilot-publish/    platform adapters (Bluesky / AT Protocol)
   autopilot-metrics/    stage [5] — engagement collection (adapter trait) + JSONL store
   autopilot-learn/      stage [6] — pure A/B scoring + persona memory proposal
+  autopilot-run/        `autopilot run` — chains the stages for one persona
   autopilot-cli/        `autopilot` binary
 config/providers.yaml   LLM chain (data, no secrets — env var names only)
 personas/*.yaml         persona packs
-var/                    local stores (gitignored): metrics JSONL, memory proposals
+var/                    local stores (gitignored): run journals, metrics JSONL, memory proposals
 ```
 
 ## Usage
@@ -66,6 +67,14 @@ cargo build --release
 # Persona packs
 autopilot personas list
 autopilot personas validate
+
+# One full run for a persona: harvest → triage → create → guardrail → publish.
+# --dry-run describes every stage with no LLM call, no GPU work, no network and
+# no publish. A live run needs the publishing credentials in the environment and
+# respects the hl-infer batch windows; metrics/learning are scheduled separately.
+autopilot run --persona personas/ciencia-curiosidades.yaml --dry-run
+autopilot run --persona personas/ciencia-curiosidades.yaml --platform bluesky
+# Every run appends an auditable JSONL journal under var/runs/ (gitignored).
 
 # Provider availability (all three layers must answer)
 autopilot providers check
@@ -146,8 +155,11 @@ trend harvesting (SearXNG), free-tier quota instrumentation (snapshot, budget, J
 delta and project-scoped attribution), the deterministic guardrail, the triage (stage 2)
 and creation (stage 3) prompts + parsers, the **Bluesky publisher** (stage 4, AT Protocol)
 with a mandatory guardrail gate, and the **metrics** (stage 5, platform adapter trait +
-JSONL store) and **learning** (stage 6, pure A/B scoring + persona memory proposal) stages.
-Next: X and the remaining channels.
+JSONL store) and **learning** (stage 6, pure A/B scoring + persona memory proposal) stages. The
+**`autopilot run` orchestrator** now chains harvest → triage → creation → guardrail →
+publish for one persona, with a safe `--dry-run` and a per-run JSONL journal under
+`var/runs/`; a non-admitted `hl-infer` lease aborts a stage instead of running the
+GPU unarbitrated. Next: X and the remaining channels.
 
 | Phase | Scope |
 |---|---|

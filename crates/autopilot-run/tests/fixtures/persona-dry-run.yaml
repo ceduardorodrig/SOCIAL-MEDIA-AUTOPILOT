@@ -1,0 +1,41 @@
+# Persona pack fixture for the `autopilot run --dry-run` integration test.
+# A draft pack (active: false) with one enabled channel: dry-run must describe
+# every stage without touching the network, the GPU or a publisher.
+
+persona: dry-run-demo
+display_name: "Dry Run Demo"
+niche: demo-niche
+language: pt-BR
+active: false
+
+voice:
+  tone: "curious"
+  audience: "tests"
+  guidelines: []
+  banned_phrases: []
+  max_hashtags: 3
+  emojis_allowed: true
+
+few_shot: []
+
+blocklist:
+  - "forbidden"
+
+rubric:
+  min_score: 0.75
+  criteria:
+    - name: hook
+      weight: 1.0
+      description: "does the hook land?"
+
+channels:
+  - platform: bluesky
+    handle: ""
+    enabled: true
+    posts_per_day: 1
+    windows: ["06:00"]
+  - platform: x
+    handle: ""
+    enabled: false
+    posts_per_day: 1
+    windows: ["07:00"]
