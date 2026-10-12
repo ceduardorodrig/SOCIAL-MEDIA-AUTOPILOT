@@ -12,7 +12,7 @@ use autopilot_pipeline::{
     build_creation_prompt, build_triage_prompt, parse_shortlist, parse_variants,
 };
 use autopilot_providers::{
-    ModelUsage, ProbeOutcome, append_ledger, check_budget, complete_with_chain, delta,
+    JobKind, ModelUsage, ProbeOutcome, append_ledger, check_budget, complete_with_chain, delta,
     ledger_entry, load_config, opencode_usage, probe, read_baseline, resolve_chain, usage_for,
     write_baseline,
 };
@@ -545,7 +545,9 @@ async fn run_triage(command: TriageCommand) -> Result<ExitCode> {
             }
 
             let registry = load_config(&config).await?;
-            let completion = complete_with_chain(&registry, &prompt, COMPLETION_TIMEOUT).await?;
+            let completion =
+                complete_with_chain(&registry, &prompt, JobKind::Triage, COMPLETION_TIMEOUT)
+                    .await?;
             println!(
                 "provider : {} ({})",
                 completion.provider_id, completion.model
@@ -586,7 +588,9 @@ async fn run_create(command: CreateCommand) -> Result<ExitCode> {
             }
 
             let registry = load_config(&config).await?;
-            let completion = complete_with_chain(&registry, &prompt, COMPLETION_TIMEOUT).await?;
+            let completion =
+                complete_with_chain(&registry, &prompt, JobKind::Create, COMPLETION_TIMEOUT)
+                    .await?;
             println!(
                 "provider : {} ({})",
                 completion.provider_id, completion.model

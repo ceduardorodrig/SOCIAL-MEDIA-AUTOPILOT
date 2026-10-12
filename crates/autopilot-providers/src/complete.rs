@@ -14,6 +14,7 @@ use tokio::process::Command;
 use crate::config::{
     DEFAULT_GEMINI_ENDPOINT, DEFAULT_OLLAMA_ENDPOINT, ProviderConfig, ProviderKind, ProvidersConfig,
 };
+use crate::gateway::{DEFAULT_GATEWAY_TIMEOUT, GatewayClient, JobKind, estimate_required_bytes};
 
 /// A successful completion, tagged with the provider that produced it.
 #[derive(Debug, Clone)]
@@ -24,17 +25,25 @@ pub struct Completion {
 }
 
 /// Call a single provider.
-pub async fn complete(cfg: &ProviderConfig, prompt: &str, timeout: Duration) -> Result<String> {
-    tokio::time::timeout(timeout, complete_inner(cfg, prompt))
+///
+/// `kind` is the autopilot stage, forwarded to the GPU gateway when the local
+/// provider requests a VRAM lease. It is ignored by the cloud providers.
+pub async fn complete(
+    cfg: &ProviderConfig,
+    prompt: &str,
+    kind: JobKind,
+    timeout: Duration,
+) -> Result<String> {
+    tokio::time::timeout(timeout, complete_inner(cfg, prompt, kind))
         .await
         .with_context(|| format!("provider `{}` timed out after {timeout:?}", cfg.id))?
 }
 
-async fn complete_inner(cfg: &ProviderConfig, prompt: &str) -> Result<String> {
+async fn complete_inner(cfg: &ProviderConfig, prompt: &str, kind: JobKind) -> Result<String> {
     match cfg.kind {
         ProviderKind::Opencode => complete_opencode(cfg, prompt).await,
         ProviderKind::Gemini => complete_gemini(cfg, prompt).await,
-        ProviderKind::Ollama => complete_ollama(cfg, prompt).await,
+        ProviderKind::Ollama => complete_ollama(cfg, prompt, kind).await,
     }
 }
 
@@ -45,6 +54,7 @@ async fn complete_inner(cfg: &ProviderConfig, prompt: &str) -> Result<String> {
 pub async fn complete_with_chain(
     registry: &ProvidersConfig,
     prompt: &str,
+    kind: JobKind,
     timeout: Duration,
 ) -> Result<Completion> {
     let mut providers = registry.providers.clone();
@@ -52,7 +62,7 @@ pub async fn complete_with_chain(
 
     let mut failures: Vec<String> = Vec::new();
     for provider in providers {
-        match complete(&provider, prompt, timeout).await {
+        match complete(&provider, prompt, kind, timeout).await {
             Ok(text) => {
                 return Ok(Completion {
                     provider_id: provider.id,
@@ -161,7 +171,48 @@ async fn complete_gemini(cfg: &ProviderConfig, prompt: &str) -> Result<String> {
     Ok(text)
 }
 
-async fn complete_ollama(cfg: &ProviderConfig, prompt: &str) -> Result<String> {
+/// Local GPU completion, gated by a VRAM lease from the `hl-infer` gateway.
+///
+/// Homelab policy: local GPU work is only allowed through the gateway, so an
+/// unreachable gateway is a hard failure — never a silent bypass. The lease is
+/// released on success and on error (the gateway TTL is only a backstop).
+async fn complete_ollama(cfg: &ProviderConfig, prompt: &str, kind: JobKind) -> Result<String> {
+    let gateway = GatewayClient::from_env(DEFAULT_GATEWAY_TIMEOUT);
+    let required_bytes = estimate_required_bytes(&cfg.model);
+    let label = format!("ollama:{}", cfg.model);
+
+    let lease = gateway
+        .submit(kind, required_bytes, &label)
+        .await
+        .with_context(|| {
+            format!(
+                "local GPU provider `{}` could not obtain a VRAM lease from the hl-infer gateway",
+                cfg.id
+            )
+        })?;
+
+    let outcome = generate_ollama(cfg, prompt).await;
+    release_lease(&gateway, &lease.id, outcome).await
+}
+
+/// Release the lease, preserving the generation result even if release fails.
+async fn release_lease(
+    gateway: &GatewayClient,
+    lease_id: &str,
+    outcome: Result<String>,
+) -> Result<String> {
+    match gateway.release(lease_id).await {
+        Ok(()) => outcome,
+        Err(release_err) => match outcome {
+            Ok(_) => Err(release_err.context("failed to release the VRAM lease after generation")),
+            Err(gen_err) => Err(gen_err.context(format!(
+                "and the VRAM lease {lease_id} also failed to release: {release_err:#}"
+            ))),
+        },
+    }
+}
+
+async fn generate_ollama(cfg: &ProviderConfig, prompt: &str) -> Result<String> {
     let endpoint = cfg.endpoint_or_default(DEFAULT_OLLAMA_ENDPOINT);
     let url = format!("{endpoint}/api/generate");
 
