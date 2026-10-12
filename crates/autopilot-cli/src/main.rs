@@ -8,9 +8,13 @@ use anyhow::{Context, Result};
 use autopilot_core::{Platform, ValidationIssue, load_dir, load_persona};
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{DEFAULT_SEARXNG_ENDPOINT, SearxngClient};
+use autopilot_pipeline::{
+    build_creation_prompt, build_triage_prompt, parse_shortlist, parse_variants,
+};
 use autopilot_providers::{
-    ModelUsage, ProbeOutcome, append_ledger, check_budget, delta, ledger_entry, load_config,
-    opencode_usage, probe, read_baseline, resolve_chain, usage_for, write_baseline,
+    ModelUsage, ProbeOutcome, append_ledger, check_budget, complete_with_chain, delta,
+    ledger_entry, load_config, opencode_usage, probe, read_baseline, resolve_chain, usage_for,
+    write_baseline,
 };
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -48,6 +52,16 @@ enum Command {
     Guardrail {
         #[command(subcommand)]
         command: GuardrailCommand,
+    },
+    /// Stage [2] — score harvested topics against a persona.
+    Triage {
+        #[command(subcommand)]
+        command: TriageCommand,
+    },
+    /// Stage [3] — draft A/B variants for a platform.
+    Create {
+        #[command(subcommand)]
+        command: CreateCommand,
     },
 }
 
@@ -148,6 +162,47 @@ fn parse_platform(value: &str) -> Result<Platform, String> {
     }
 }
 
+#[derive(Subcommand)]
+enum TriageCommand {
+    /// Harvest topics and score them against a persona.
+    Run {
+        #[arg(long)]
+        persona: PathBuf,
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, default_value = DEFAULT_SEARXNG_ENDPOINT)]
+        endpoint: String,
+        #[arg(long, default_value = "config/providers.yaml")]
+        config: PathBuf,
+        /// Print the prompt without calling any LLM (no quota spent).
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CreateCommand {
+    /// Draft A/B variants for a platform.
+    Run {
+        #[arg(long)]
+        persona: PathBuf,
+        #[arg(long, value_parser = parse_platform)]
+        platform: Platform,
+        #[arg(long)]
+        topic: String,
+        #[arg(long, default_value = "config/providers.yaml")]
+        config: PathBuf,
+        /// Print the prompt without calling any LLM (no quota spent).
+        #[arg(long)]
+        dry_run: bool,
+        /// Run every variant through the deterministic guardrail.
+        #[arg(long)]
+        guard: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
@@ -172,6 +227,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Quota { command } => run_quota(command).await,
         Command::Harvest { command } => run_harvest(command).await,
         Command::Guardrail { command } => run_guardrail(command).await,
+        Command::Triage { command } => run_triage(command).await,
+        Command::Create { command } => run_create(command).await,
     }
 }
 
@@ -260,6 +317,9 @@ async fn run_personas(command: PersonasCommand) -> Result<ExitCode> {
 
 /// How long to wait for the `opencode stats` subprocess.
 const STATS_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long to wait for one LLM completion.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(300);
 
 async fn run_quota(command: QuotaCommand) -> Result<ExitCode> {
     match command {
@@ -424,6 +484,110 @@ async fn run_guardrail(command: GuardrailCommand) -> Result<ExitCode> {
             } else {
                 println!("verdict  : REJECTED");
                 Ok(ExitCode::FAILURE)
+            }
+        }
+    }
+}
+
+async fn run_triage(command: TriageCommand) -> Result<ExitCode> {
+    match command {
+        TriageCommand::Run {
+            persona,
+            query,
+            limit,
+            endpoint,
+            config,
+            dry_run,
+        } => {
+            let pack = load_persona(&persona).await?;
+            let topics = SearxngClient::new(endpoint).search(&query, limit).await?;
+            println!("harvest  : {} topic(s) for \"{query}\"", topics.len());
+
+            let prompt = build_triage_prompt(&pack, &topics);
+            if dry_run {
+                println!("--- prompt (dry run, no LLM called) ---");
+                println!("{prompt}");
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            let registry = load_config(&config).await?;
+            let completion = complete_with_chain(&registry, &prompt, COMPLETION_TIMEOUT).await?;
+            println!(
+                "provider : {} ({})",
+                completion.provider_id, completion.model
+            );
+
+            let shortlist = parse_shortlist(&completion.text)?;
+            println!("shortlist: {} topic(s)", shortlist.len());
+            for (index, entry) in shortlist.iter().enumerate() {
+                println!("{:>2}. {:.2}  {}", index + 1, entry.score, entry.title);
+                if !entry.reason.is_empty() {
+                    println!("      {}", entry.reason);
+                }
+                if !entry.url.is_empty() {
+                    println!("      {}", entry.url);
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+async fn run_create(command: CreateCommand) -> Result<ExitCode> {
+    match command {
+        CreateCommand::Run {
+            persona,
+            platform,
+            topic,
+            config,
+            dry_run,
+            guard,
+        } => {
+            let pack = load_persona(&persona).await?;
+            let prompt = build_creation_prompt(&pack, platform, &topic);
+            if dry_run {
+                println!("--- prompt (dry run, no LLM called) ---");
+                println!("{prompt}");
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            let registry = load_config(&config).await?;
+            let completion = complete_with_chain(&registry, &prompt, COMPLETION_TIMEOUT).await?;
+            println!(
+                "provider : {} ({})",
+                completion.provider_id, completion.model
+            );
+
+            let variants = parse_variants(&completion.text)?;
+            let mut rejected = 0usize;
+            for variant in &variants {
+                println!("--- variant {} ---", variant.label);
+                println!("{}", variant.text);
+                if !variant.hashtags.is_empty() {
+                    println!("hashtags : {}", variant.hashtags.join(" "));
+                }
+                if !variant.image_prompt.is_empty() {
+                    println!("image    : {}", variant.image_prompt);
+                }
+                if guard {
+                    let verdict = evaluate(&pack, platform, &variant.text);
+                    if verdict.approved {
+                        println!("guardrail: APPROVED");
+                    } else {
+                        rejected += 1;
+                        println!("guardrail: REJECTED");
+                        for issue in &verdict.issues {
+                            println!("  x [{}] {}", issue.rule, issue.detail);
+                        }
+                    }
+                }
+            }
+
+            if guard && rejected > 0 {
+                eprintln!("{rejected} variant(s) rejected by the guardrail");
+                Ok(ExitCode::FAILURE)
+            } else {
+                Ok(ExitCode::SUCCESS)
             }
         }
     }

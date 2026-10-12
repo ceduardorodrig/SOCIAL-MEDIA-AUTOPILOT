@@ -47,7 +47,8 @@ crates/
   autopilot-core/       persona pack model + validation
   autopilot-guardrail/  deterministic pre-publish validation
   autopilot-harvest/    trend collection (SearXNG JSON API)
-  autopilot-providers/  provider registry, availability probes, fallback chain, quota
+  autopilot-pipeline/   triage (score topics) and creation (A/B variants) prompts + parsers
+  autopilot-providers/  provider registry, availability probes, fallback chain, quota, completion
   autopilot-cli/        `autopilot` binary
 config/providers.yaml   LLM chain (data, no secrets — env var names only)
 personas/*.yaml         persona packs
@@ -86,6 +87,16 @@ autopilot guardrail check \
   --persona personas/ciencia-curiosidades.yaml \
   --platform bluesky \
   --text "Draft to validate #tag"
+
+# Stage [2] — triage: harvest and score topics (--dry-run prints the prompt only)
+autopilot triage run --persona personas/ciencia-curiosidades.yaml --query "descobertas científicas 2026" --limit 5
+
+# Stage [3] — creation: A/B variants for a platform, validated by the guardrail
+autopilot create run \
+  --persona personas/ciencia-curiosidades.yaml \
+  --platform bluesky \
+  --topic "O cérebro gasta ~20% da energia do corpo em repouso" \
+  --guard
 ```
 
 Provider credentials are read from the environment, never from the repo:
@@ -97,12 +108,10 @@ export GEMINI_API_KEY=...   # from the SOPS store (never committed)
 ## Status
 
 **Phase 0 — harness foundation.** Implemented: persona pack model + validation, provider
-registry with live health probes, fallback-chain resolution, trend harvesting (SearXNG),
-free-tier quota instrumentation (snapshot, budget, JSONL ledger, delta attribution and
-**project-scoped attribution** — the pipeline's consumption is isolated from interactive
-sessions) and the
-deterministic guardrail (blocklist, banned phrases, hashtags, platform length, emoji policy).
-Next: the triage and creation stages (LLM), then publish → metrics → learning.
+registry with live health probes, fallback-chain resolution and completion across the chain,
+trend harvesting (SearXNG), free-tier quota instrumentation (snapshot, budget, JSONL ledger,
+delta and project-scoped attribution), the deterministic guardrail, and the triage (stage 2)
+and creation (stage 3) prompts + parsers. Next: publish → metrics → learning loop.
 
 | Phase | Scope |
 |---|---|

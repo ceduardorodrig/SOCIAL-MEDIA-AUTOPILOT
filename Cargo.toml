@@ -4,6 +4,7 @@ members = [
     "crates/autopilot-core",
     "crates/autopilot-guardrail",
     "crates/autopilot-harvest",
+    "crates/autopilot-pipeline",
     "crates/autopilot-providers",
     "crates/autopilot-cli",
 ]

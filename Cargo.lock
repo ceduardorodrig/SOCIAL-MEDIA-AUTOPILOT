@@ -81,6 +81,7 @@ dependencies = [
  "autopilot-core",
  "autopilot-guardrail",
  "autopilot-harvest",
+ "autopilot-pipeline",
  "autopilot-providers",
  "clap",
  "tokio",
@@ -115,6 +116,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "autopilot-pipeline"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "autopilot-core",
+ "autopilot-harvest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

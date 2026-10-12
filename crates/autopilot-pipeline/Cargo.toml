@@ -1,0 +1,13 @@
+[package]
+name = "autopilot-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json = "1"
+
+autopilot-core = { path = "../autopilot-core" }
+autopilot-harvest = { path = "../autopilot-harvest" }

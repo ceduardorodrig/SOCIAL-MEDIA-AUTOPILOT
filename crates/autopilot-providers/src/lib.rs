@@ -5,11 +5,13 @@
 //! code: swapping a model is a one-line config edit.
 
 pub mod chain;
+pub mod complete;
 pub mod config;
 pub mod probe;
 pub mod quota;
 
 pub use chain::resolve_chain;
+pub use complete::{Completion, complete, complete_with_chain, extract_opencode_text};
 pub use config::{ProviderConfig, ProviderKind, ProvidersConfig, load_config};
 pub use probe::{ProbeOutcome, probe};
 pub use quota::{
