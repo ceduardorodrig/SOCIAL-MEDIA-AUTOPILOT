@@ -1,0 +1,34 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# StenioSentinel — canonical governance configuration for this repository
+# ══════════════════════════════════════════════════════════════════════════════
+# Language Tier: A (English) — docs, logs and CLI strings in English, so any
+# contributor (or a future maintainer) can debug without translating.
+# The engine reads this file from the target directory; no engine change is ever
+# needed to adapt the rules here.
+
+[general]
+name = "SUMAENIMA-SOCIALMEDIA-AUTOPILOT"
+version = "0.1.0"
+min_laws_count = 5
+agents_md = "AGENTS.md"
+
+[security]
+prohibit_bare_sudo = true
+scan_hardcoded_secrets = true
+forbid_eval_exec = true
+
+[architecture]
+prefer_rust_tools = true
+
+# Tier A requires diagnostic output in English. Portuguese leaking into logs or
+# CLI usage text is what this rule catches (it is a warning: visible, not fatal).
+[[custom_rules]]
+id = "GOV-LOG-EN"
+tag = "gov"
+severity = "warning"
+name = "Logs and CLI Strings in English"
+description = "Log strings (log_msg, println!, eprintln!, error!, warn!, info!, debug!) and CLI usage text contain Portuguese. Diagnostic output must be readable by anyone who clones this repository."
+pattern = "(log_msg|println!|eprintln!|error!|warn!|info!|debug!|usage).*\\b(Falha|falha|Erro|Uso|Opç|Nenhum|Iniciando|iniciando|iniciado|Recebido|Recebeu|Encerrando|Encerrou|ajustado|restaurado|aguardando|aguardar|finalizado|Detectou|detectou|Reaplicando|Processo filho|ao iniciar|ao executar|ao aguardar|ao salvar|ao remover|Não |não foi|não encontrad|Usuário|usuário|Configuração|configuração|arquivo|Arquivo|salvar|Salvar|remover|Remover|criar|Criar|criado|Limpando|Diretório|diretório|Compilando|compilando|Gerando|Criando|Escrevendo|compilado|Desconhecido|desconhecido|requer|instruç|Exibe|padrão)\\b"
+extensions = ["rs", "sh", "py", "ts"]
+must_match = false
+suggestion = "Translate the log string to English. Tier A requires diagnostic output in English so any contributor can debug it."

@@ -4,6 +4,10 @@ tags: [meta, agents, governance]
 
 # AGENTS.md — Rules for AI Agents (SUMAENIMA-SOCIALMEDIA-AUTOPILOT)
 
+**Language tier:** A (English) — docs, logs and CLI strings in English; see
+`governance/language-policy.md` in the vault. The machine-readable half of this configuration lives in
+`steniocheck.toml` (tier, security, architecture and the `GOV-LOG-EN` custom rule).
+
 This repository is part of the **Mnemocine** homelab ecosystem and is governed by
 **StenioSentinel**. Every AI agent working here must follow the rules below.
 
