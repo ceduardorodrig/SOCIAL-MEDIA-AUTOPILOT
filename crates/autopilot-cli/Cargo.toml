@@ -1,0 +1,19 @@
+[package]
+name = "autopilot-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "autopilot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+autopilot-core = { path = "../autopilot-core" }
+autopilot-providers = { path = "../autopilot-providers" }

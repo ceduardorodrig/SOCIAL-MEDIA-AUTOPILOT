@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/autopilot-core",
+    "crates/autopilot-providers",
+    "crates/autopilot-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+repository = "https://github.com/ceduardorodrig/SUMAENIMA-SOCIALMEDIA-AUTOPILOT"
+authors = ["Carlos Eduardo Rodrigues <ceduardorodrig@gmail.com>"]
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
