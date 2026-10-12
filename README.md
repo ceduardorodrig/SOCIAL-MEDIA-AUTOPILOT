@@ -45,6 +45,7 @@ code change.
 ```
 crates/
   autopilot-core/       persona pack model + validation
+  autopilot-guardrail/  deterministic pre-publish validation
   autopilot-harvest/    trend collection (SearXNG JSON API)
   autopilot-providers/  provider registry, availability probes, fallback chain, quota
   autopilot-cli/        `autopilot` binary
@@ -74,7 +75,14 @@ autopilot harvest search --query "descobertas científicas curiosas" --limit 10
 autopilot quota check \
   --model opencode/mimo-v2.6-flash-free \
   --budget-tokens 5000000 \
-  --ledger var/quota-ledger.jsonl
+  --ledger var/quota-ledger.jsonl \
+  --baseline var/quota-baseline.json   # reports consumption since the last snapshot
+
+# Deterministic pre-publish validation (no LLM)
+autopilot guardrail check \
+  --persona personas/ciencia-curiosidades.yaml \
+  --platform bluesky \
+  --text "Draft to validate #tag"
 ```
 
 Provider credentials are read from the environment, never from the repo:
@@ -87,8 +95,9 @@ export GEMINI_API_KEY=...   # from the SOPS store (never committed)
 
 **Phase 0 — harness foundation.** Implemented: persona pack model + validation, provider
 registry with live health probes, fallback-chain resolution, trend harvesting (SearXNG),
-free-tier quota instrumentation, CLI. Next: the triage → create → guardrail stages and the
-publish/metrics/learning loop.
+free-tier quota instrumentation (snapshot, budget, JSONL ledger, delta attribution) and the
+deterministic guardrail (blocklist, banned phrases, hashtags, platform length, emoji policy).
+Next: the triage and creation stages (LLM), then publish → metrics → learning.
 
 | Phase | Scope |
 |---|---|

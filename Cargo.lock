@@ -79,6 +79,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "autopilot-core",
+ "autopilot-guardrail",
  "autopilot-harvest",
  "autopilot-providers",
  "clap",
@@ -95,6 +96,14 @@ dependencies = [
  "serde",
  "serde_yaml_ng",
  "tokio",
+]
+
+[[package]]
+name = "autopilot-guardrail"
+version = "0.1.0"
+dependencies = [
+ "autopilot-core",
+ "serde",
 ]
 
 [[package]]

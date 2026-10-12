@@ -186,6 +186,71 @@ pub fn ledger_entry(usage: &ModelUsage, window_days: u32) -> LedgerEntry {
     }
 }
 
+/// Consumption since a previously recorded baseline (same window).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageDelta {
+    pub model_id: String,
+    pub steps: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_usd: f64,
+}
+
+impl UsageDelta {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.reasoning_tokens + self.cache_read_tokens
+    }
+}
+
+/// Consumption between a baseline snapshot and the current usage.
+///
+/// Counters are cumulative inside the stats window, so a baseline is only
+/// meaningful within the same window (`window_days`). When the window rolls over
+/// the counters reset and the delta saturates to zero rather than going negative.
+pub fn delta(before: &LedgerEntry, after: &ModelUsage) -> UsageDelta {
+    UsageDelta {
+        model_id: after.id(),
+        steps: after.steps.saturating_sub(before.steps),
+        input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
+        output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
+        reasoning_tokens: after
+            .reasoning_tokens
+            .saturating_sub(before.reasoning_tokens),
+        cache_read_tokens: after
+            .cache_read_tokens
+            .saturating_sub(before.cache_read_tokens),
+        cost_usd: (after.cost_usd - before.cost_usd).max(0.0),
+    }
+}
+
+/// Read a baseline snapshot, returning `None` when the file does not exist.
+pub async fn read_baseline(path: &Path) -> Result<Option<LedgerEntry>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(raw) => {
+            let entry: LedgerEntry = serde_json::from_str(&raw)
+                .with_context(|| format!("invalid baseline JSON in {}", path.display()))?;
+            Ok(Some(entry))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("reading baseline {}", path.display())),
+    }
+}
+
+/// Persist the current usage as the new baseline.
+pub async fn write_baseline(path: &Path, entry: &LedgerEntry) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating baseline directory {}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(entry).context("serializing baseline")?;
+    tokio::fs::write(path, body)
+        .await
+        .with_context(|| format!("writing baseline {}", path.display()))
+}
+
 fn string_field(value: &serde_json::Value, key: &str) -> String {
     value
         .get(key)
@@ -257,5 +322,38 @@ mod tests {
         let entry = ledger_entry(mimo, 0);
         assert_eq!(entry.model_id, "opencode/mimo-v2.6-flash-free");
         assert_eq!(mimo.total_tokens(), 144_750 + 22_335 + 17_392 + 1_942_400);
+    }
+
+    #[test]
+    fn delta_measures_consumption_since_baseline() {
+        let usages = parse_opencode_usage(FIXTURE).expect("fixture parses");
+        let mimo = usages.first().expect("first entry");
+
+        let mut baseline = ledger_entry(mimo, 0);
+        baseline.input_tokens = mimo.input_tokens - 1_000;
+        baseline.output_tokens = mimo.output_tokens - 500;
+        baseline.reasoning_tokens = mimo.reasoning_tokens;
+        baseline.cache_read_tokens = mimo.cache_read_tokens;
+        baseline.steps = mimo.steps - 2;
+
+        let delta = delta(&baseline, mimo);
+        assert_eq!(delta.steps, 2);
+        assert_eq!(delta.input_tokens, 1_000);
+        assert_eq!(delta.output_tokens, 500);
+        assert_eq!(delta.reasoning_tokens, 0);
+        assert_eq!(delta.total_tokens(), 1_500);
+    }
+
+    #[test]
+    fn delta_saturates_when_window_rolls_over() {
+        let usages = parse_opencode_usage(FIXTURE).expect("fixture parses");
+        let mimo = usages.first().expect("first entry");
+
+        let mut baseline = ledger_entry(mimo, 0);
+        baseline.input_tokens = mimo.input_tokens + 10_000;
+
+        let delta = delta(&baseline, mimo);
+        assert_eq!(delta.input_tokens, 0);
+        assert_eq!(delta.steps, 0);
     }
 }

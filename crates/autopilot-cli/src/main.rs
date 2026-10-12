@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::Result;
-use autopilot_core::{ValidationIssue, load_dir};
+use anyhow::{Context, Result};
+use autopilot_core::{Platform, ValidationIssue, load_dir, load_persona};
+use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{DEFAULT_SEARXNG_ENDPOINT, SearxngClient};
 use autopilot_providers::{
-    ProbeOutcome, append_ledger, check_budget, ledger_entry, load_config, opencode_usage, probe,
-    resolve_chain, usage_for,
+    ProbeOutcome, append_ledger, check_budget, delta, ledger_entry, load_config, opencode_usage,
+    probe, read_baseline, resolve_chain, usage_for, write_baseline,
 };
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -42,6 +43,11 @@ enum Command {
     Harvest {
         #[command(subcommand)]
         command: HarvestCommand,
+    },
+    /// Deterministic pre-publish validation.
+    Guardrail {
+        #[command(subcommand)]
+        command: GuardrailCommand,
     },
 }
 
@@ -88,6 +94,9 @@ enum QuotaCommand {
         /// Append the snapshot to a JSONL ledger.
         #[arg(long)]
         ledger: Option<PathBuf>,
+        /// Baseline file: report consumption since it and refresh it.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
     },
 }
 
@@ -102,6 +111,37 @@ enum HarvestCommand {
         #[arg(long, default_value = DEFAULT_SEARXNG_ENDPOINT)]
         endpoint: String,
     },
+}
+
+#[derive(Subcommand)]
+enum GuardrailCommand {
+    /// Validate a draft against a persona pack (deterministic, no LLM).
+    Check {
+        #[arg(long)]
+        persona: PathBuf,
+        #[arg(long, value_parser = parse_platform)]
+        platform: Platform,
+        /// Draft text (mutually exclusive with `--file`).
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the draft from a file (mutually exclusive with `--text`).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+}
+
+fn parse_platform(value: &str) -> Result<Platform, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "bluesky" => Ok(Platform::Bluesky),
+        "x" => Ok(Platform::X),
+        "linkedin" => Ok(Platform::Linkedin),
+        "instagram" => Ok(Platform::Instagram),
+        "tiktok" => Ok(Platform::Tiktok),
+        "kwai" => Ok(Platform::Kwai),
+        other => Err(format!(
+            "unknown platform `{other}` (expected: bluesky, x, linkedin, instagram, tiktok, kwai)"
+        )),
+    }
 }
 
 #[tokio::main]
@@ -127,6 +167,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Personas { command } => run_personas(command).await,
         Command::Quota { command } => run_quota(command).await,
         Command::Harvest { command } => run_harvest(command).await,
+        Command::Guardrail { command } => run_guardrail(command).await,
     }
 }
 
@@ -223,6 +264,7 @@ async fn run_quota(command: QuotaCommand) -> Result<ExitCode> {
             budget_tokens,
             days,
             ledger,
+            baseline,
         } => {
             let usages = opencode_usage(days, STATS_TIMEOUT).await?;
             let Some(usage) = usage_for(&usages, &model) else {
@@ -254,6 +296,26 @@ async fn run_quota(command: QuotaCommand) -> Result<ExitCode> {
             if let Some(path) = ledger {
                 append_ledger(&path, &ledger_entry(usage, days)).await?;
                 println!("ledger       : appended to {}", path.display());
+            }
+
+            if let Some(path) = baseline {
+                let previous = read_baseline(&path).await?;
+                match previous {
+                    Some(previous) => {
+                        let consumed = delta(&previous, usage);
+                        println!("--- since baseline ---");
+                        println!("steps        : {}", consumed.steps);
+                        println!("input tokens : {}", consumed.input_tokens);
+                        println!("output tokens: {}", consumed.output_tokens);
+                        println!("reasoning    : {}", consumed.reasoning_tokens);
+                        println!("cache read   : {}", consumed.cache_read_tokens);
+                        println!("total tokens : {}", consumed.total_tokens());
+                        println!("cost (usd)   : {:.4}", consumed.cost_usd);
+                    }
+                    None => println!("--- baseline created (no previous snapshot) ---"),
+                }
+                write_baseline(&path, &ledger_entry(usage, days)).await?;
+                println!("baseline     : refreshed at {}", path.display());
             }
 
             if check.within_budget {
@@ -290,6 +352,49 @@ async fn run_harvest(command: HarvestCommand) -> Result<ExitCode> {
                 );
             }
             Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+async fn run_guardrail(command: GuardrailCommand) -> Result<ExitCode> {
+    match command {
+        GuardrailCommand::Check {
+            persona,
+            platform,
+            text,
+            file,
+        } => {
+            let pack = load_persona(&persona).await?;
+            let draft = match (text, file) {
+                (Some(text), _) => text,
+                (None, Some(path)) => tokio::fs::read_to_string(&path)
+                    .await
+                    .with_context(|| format!("reading draft {}", path.display()))?,
+                (None, None) => {
+                    eprintln!("provide either --text or --file");
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
+
+            let verdict: Verdict = evaluate(&pack, platform, &draft);
+            let name = persona
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("-");
+            println!("persona  : {name}");
+            println!("platform : {}", platform.as_str());
+            println!("checks   : {} issue(s)", verdict.issues.len());
+            for issue in &verdict.issues {
+                println!("  x [{}] {}", issue.rule, issue.detail);
+            }
+
+            if verdict.approved {
+                println!("verdict  : APPROVED");
+                Ok(ExitCode::SUCCESS)
+            } else {
+                println!("verdict  : REJECTED");
+                Ok(ExitCode::FAILURE)
+            }
         }
     }
 }

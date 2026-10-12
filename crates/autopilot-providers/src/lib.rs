@@ -13,6 +13,6 @@ pub use chain::resolve_chain;
 pub use config::{ProviderConfig, ProviderKind, ProvidersConfig, load_config};
 pub use probe::{ProbeOutcome, probe};
 pub use quota::{
-    BudgetCheck, LedgerEntry, ModelUsage, append_ledger, check_budget, ledger_entry,
-    opencode_usage, usage_for,
+    BudgetCheck, LedgerEntry, ModelUsage, UsageDelta, append_ledger, check_budget, delta,
+    ledger_entry, opencode_usage, read_baseline, usage_for, write_baseline,
 };

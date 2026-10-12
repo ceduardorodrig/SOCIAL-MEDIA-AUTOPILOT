@@ -1,0 +1,10 @@
+[package]
+name = "autopilot-guardrail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+autopilot-core = { path = "../autopilot-core" }
