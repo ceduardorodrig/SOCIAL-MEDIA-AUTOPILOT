@@ -6,6 +6,7 @@ members = [
     "crates/autopilot-harvest",
     "crates/autopilot-pipeline",
     "crates/autopilot-providers",
+    "crates/autopilot-publish",
     "crates/autopilot-cli",
 ]
 

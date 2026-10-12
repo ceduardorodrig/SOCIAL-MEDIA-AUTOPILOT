@@ -49,6 +49,7 @@ crates/
   autopilot-harvest/    trend collection (SearXNG JSON API)
   autopilot-pipeline/   triage (score topics) and creation (A/B variants) prompts + parsers
   autopilot-providers/  provider registry, availability probes, fallback chain, quota, completion
+  autopilot-publish/    platform adapters (Bluesky / AT Protocol)
   autopilot-cli/        `autopilot` binary
 config/providers.yaml   LLM chain (data, no secrets — env var names only)
 personas/*.yaml         persona packs
@@ -97,6 +98,18 @@ autopilot create run \
   --platform bluesky \
   --topic "O cérebro gasta ~20% da energia do corpo em repouso" \
   --guard
+
+# Stage [4] — publish to Bluesky (the guardrail runs first and may refuse)
+autopilot publish auth                                         # verify credentials
+autopilot publish bluesky --persona personas/ciencia-curiosidades.yaml \
+  --text "Draft" --dry-run                                    # print the record only
+```
+
+Publishing credentials come from the environment (SOPS store), never from the repository:
+
+```bash
+export BLUESKY_HANDLE=...        # handle
+export BLUESKY_APP_PASSWORD=...  # an app password, not the account password
 ```
 
 Provider credentials are read from the environment, never from the repo:
@@ -111,7 +124,8 @@ export GEMINI_API_KEY=...   # from the SOPS store (never committed)
 registry with live health probes, fallback-chain resolution and completion across the chain,
 trend harvesting (SearXNG), free-tier quota instrumentation (snapshot, budget, JSONL ledger,
 delta and project-scoped attribution), the deterministic guardrail, and the triage (stage 2)
-and creation (stage 3) prompts + parsers. Next: publish → metrics → learning loop.
+and creation (stage 3) prompts + parsers, and the **Bluesky publisher** (stage 4, AT Protocol)
+with a mandatory guardrail gate. Next: metrics + learning loop, then X and the remaining channels.
 
 | Phase | Scope |
 |---|---|

@@ -16,6 +16,10 @@ use autopilot_providers::{
     ledger_entry, load_config, opencode_usage, probe, read_baseline, resolve_chain, usage_for,
     write_baseline,
 };
+use autopilot_publish::{
+    BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, build_post_record, create_post, create_session,
+    now_rfc3339_millis, post_url,
+};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -62,6 +66,11 @@ enum Command {
     Create {
         #[command(subcommand)]
         command: CreateCommand,
+    },
+    /// Stage [4] — publish a validated draft.
+    Publish {
+        #[command(subcommand)]
+        command: PublishCommand,
     },
 }
 
@@ -203,6 +212,27 @@ enum CreateCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum PublishCommand {
+    /// Verify the Bluesky credentials without creating any post.
+    Auth {
+        #[arg(long, default_value = DEFAULT_BLUESKY_BASE_URL)]
+        base_url: String,
+    },
+    /// Publish a guardrail-approved draft to Bluesky.
+    Bluesky {
+        #[arg(long)]
+        persona: PathBuf,
+        #[arg(long)]
+        text: String,
+        #[arg(long, default_value = DEFAULT_BLUESKY_BASE_URL)]
+        base_url: String,
+        /// Print the record that would be posted without calling the API.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
@@ -229,6 +259,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Guardrail { command } => run_guardrail(command).await,
         Command::Triage { command } => run_triage(command).await,
         Command::Create { command } => run_create(command).await,
+        Command::Publish { command } => run_publish(command).await,
     }
 }
 
@@ -320,6 +351,9 @@ const STATS_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long to wait for one LLM completion.
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long to wait for a publishing API call.
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn run_quota(command: QuotaCommand) -> Result<ExitCode> {
     match command {
@@ -589,6 +623,50 @@ async fn run_create(command: CreateCommand) -> Result<ExitCode> {
             } else {
                 Ok(ExitCode::SUCCESS)
             }
+        }
+    }
+}
+
+async fn run_publish(command: PublishCommand) -> Result<ExitCode> {
+    match command {
+        PublishCommand::Auth { base_url } => {
+            let credentials = BlueskyCredentials::from_env()?;
+            let session = create_session(&base_url, &credentials, PUBLISH_TIMEOUT).await?;
+            println!("authenticated : {}", session.handle);
+            println!("did           : {}", session.did);
+            Ok(ExitCode::SUCCESS)
+        }
+        PublishCommand::Bluesky {
+            persona,
+            text,
+            base_url,
+            dry_run,
+        } => {
+            let pack = load_persona(&persona).await?;
+
+            // The guardrail is mandatory: an unvalidated draft is never published.
+            let verdict = evaluate(&pack, Platform::Bluesky, &text);
+            if !verdict.approved {
+                for issue in &verdict.issues {
+                    println!("  x [{}] {}", issue.rule, issue.detail);
+                }
+                eprintln!("refusing to publish: the guardrail rejected the draft");
+                return Ok(ExitCode::FAILURE);
+            }
+            println!("guardrail : APPROVED");
+
+            let record = build_post_record(&text, &now_rfc3339_millis());
+            if dry_run {
+                println!("--- would post (dry run, no API call) ---");
+                println!("{}", serde_json::to_string_pretty(&record)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            let credentials = BlueskyCredentials::from_env()?;
+            let session = create_session(&base_url, &credentials, PUBLISH_TIMEOUT).await?;
+            let uri = create_post(&base_url, &session, &record, PUBLISH_TIMEOUT).await?;
+            println!("published : {}", post_url(&session.handle, &uri));
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
