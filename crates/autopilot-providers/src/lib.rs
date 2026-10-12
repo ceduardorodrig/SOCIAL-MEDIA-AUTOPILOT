@@ -15,7 +15,8 @@ pub use chain::resolve_chain;
 pub use complete::{Completion, complete, complete_with_chain, extract_opencode_text};
 pub use config::{ProviderConfig, ProviderKind, ProvidersConfig, load_config};
 pub use gateway::{
-    DEFAULT_GATEWAY_URL, GATEWAY_URL_ENV, GatewayClient, Job, JobKind, estimate_required_bytes,
+    DEFAULT_GATEWAY_URL, GATEWAY_URL_ENV, GatewayClient, Job, JobKind, Lease,
+    estimate_required_bytes,
 };
 pub use probe::{ProbeOutcome, probe};
 pub use quota::{

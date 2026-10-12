@@ -134,6 +134,16 @@ impl GatewayClient {
         serde_json::from_str(&text).context("invalid job JSON from the GPU gateway")
     }
 
+    /// Request a VRAM lease and return a handle that releases it on drop.
+    pub async fn lease(&self, kind: JobKind, required_bytes: u64, label: &str) -> Result<Lease> {
+        let job = self.submit(kind, required_bytes, label).await?;
+        Ok(Lease {
+            client: self.clone(),
+            job,
+            released: false,
+        })
+    }
+
     /// Release a lease so its VRAM becomes available again.
     pub async fn release(&self, id: &str) -> Result<()> {
         let url = format!("{}/v1/jobs/{id}/release", self.base_url);
@@ -155,6 +165,53 @@ impl GatewayClient {
             bail!("GPU gateway failed to release lease {id} (HTTP {status})");
         }
         Ok(())
+    }
+}
+
+/// A held VRAM lease.
+///
+/// Prefer the explicit [`Lease::release`]. If the lease is dropped without an
+/// explicit release — for example when an outer timeout cancels the future —
+/// the `Drop` implementation still schedules a best-effort release so a lease
+/// cannot leak. The gateway TTL remains the final backstop for process crashes.
+#[derive(Debug)]
+pub struct Lease {
+    client: GatewayClient,
+    job: Job,
+    released: bool,
+}
+
+impl Lease {
+    /// The gateway job id backing this lease.
+    pub fn id(&self) -> &str {
+        &self.job.id
+    }
+
+    /// The full job record returned by the gateway.
+    pub fn job(&self) -> &Job {
+        &self.job
+    }
+
+    /// Release the lease and return the gateway outcome.
+    pub async fn release(mut self) -> Result<()> {
+        self.released = true;
+        self.client.release(&self.job.id).await
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let client = self.client.clone();
+        let id = self.job.id.clone();
+        handle.spawn(async move {
+            let _ = client.release(&id).await;
+        });
     }
 }
 
@@ -198,10 +255,12 @@ fn parse_billions(model: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use axum::Json;
     use axum::Router;
+    use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use axum::routing::post;
     use serde_json::json;
@@ -233,6 +292,14 @@ mod tests {
     }
 
     async fn ok_release() -> StatusCode {
+        StatusCode::OK
+    }
+
+    async fn record_release(
+        State(releases): State<Arc<Mutex<Vec<String>>>>,
+        Path(id): Path<String>,
+    ) -> StatusCode {
+        releases.lock().expect("lock releases").push(id);
         StatusCode::OK
     }
 
@@ -272,6 +339,36 @@ mod tests {
             .release("job-000042")
             .await
             .expect("release should succeed");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_lease_releases_it() {
+        let releases: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/jobs", post(echo_submit))
+            .route("/v1/jobs/{id}/release", post(record_release))
+            .with_state(releases.clone());
+        let base = spawn(app).await;
+        let client = GatewayClient::new(base, Duration::from_secs(2));
+
+        let lease = client
+            .lease(JobKind::Triage, 1_000_000_000, "ollama:llama3:8b")
+            .await
+            .expect("lease should be created");
+        assert_eq!(lease.id(), "job-000042");
+        drop(lease);
+
+        // Give the detached release task a moment to run.
+        for _ in 0..100 {
+            if !releases.lock().expect("lock releases").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            releases.lock().expect("lock releases").as_slice(),
+            ["job-000042"]
+        );
     }
 
     #[tokio::test]

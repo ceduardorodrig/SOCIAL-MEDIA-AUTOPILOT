@@ -182,7 +182,7 @@ async fn complete_ollama(cfg: &ProviderConfig, prompt: &str, kind: JobKind) -> R
     let label = format!("ollama:{}", cfg.model);
 
     let lease = gateway
-        .submit(kind, required_bytes, &label)
+        .lease(kind, required_bytes, &label)
         .await
         .with_context(|| {
             format!(
@@ -192,21 +192,12 @@ async fn complete_ollama(cfg: &ProviderConfig, prompt: &str, kind: JobKind) -> R
         })?;
 
     let outcome = generate_ollama(cfg, prompt).await;
-    release_lease(&gateway, &lease.id, outcome).await
-}
-
-/// Release the lease, preserving the generation result even if release fails.
-async fn release_lease(
-    gateway: &GatewayClient,
-    lease_id: &str,
-    outcome: Result<String>,
-) -> Result<String> {
-    match gateway.release(lease_id).await {
+    match lease.release().await {
         Ok(()) => outcome,
         Err(release_err) => match outcome {
             Ok(_) => Err(release_err.context("failed to release the VRAM lease after generation")),
             Err(gen_err) => Err(gen_err.context(format!(
-                "and the VRAM lease {lease_id} also failed to release: {release_err:#}"
+                "and the VRAM lease also failed to release: {release_err:#}"
             ))),
         },
     }
