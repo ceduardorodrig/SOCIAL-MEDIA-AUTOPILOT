@@ -317,6 +317,9 @@ enum LearnCommand {
         /// Minimum samples per variant before the comparison is conclusive.
         #[arg(long, default_value_t = DEFAULT_MIN_SAMPLES)]
         min_samples: usize,
+        /// How many winning posts to keep as few-shot examples.
+        #[arg(long, default_value_t = DEFAULT_MAX_FEW_SHOT)]
+        max_few_shot: usize,
         /// Persist the proposal here (omit to only print it).
         #[arg(long)]
         write: Option<PathBuf>,
@@ -875,6 +878,7 @@ async fn run_learn(command: LearnCommand) -> Result<ExitCode> {
             platform,
             metrics,
             min_samples,
+            max_few_shot,
             write,
             dry_run,
         } => {
@@ -898,7 +902,7 @@ async fn run_learn(command: LearnCommand) -> Result<ExitCode> {
                 &pack.persona,
                 platform,
                 &outcome,
-                DEFAULT_MAX_FEW_SHOT,
+                max_few_shot,
                 now_unix(),
             );
 
