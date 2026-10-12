@@ -71,10 +71,13 @@ autopilot providers chain
 # Trend harvesting (SearXNG JSON API on kavure)
 autopilot harvest search --query "descobertas científicas curiosas" --limit 10
 
-# Free-tier quota instrumentation (snapshot + optional JSONL ledger)
+# Free-tier quota instrumentation
+# --project scopes the statistics to this repository, isolating the pipeline's
+# own consumption from interactive sessions.
 autopilot quota check \
   --model opencode/mimo-v2.6-flash-free \
   --budget-tokens 5000000 \
+  --project . \
   --ledger var/quota-ledger.jsonl \
   --baseline var/quota-baseline.json   # reports consumption since the last snapshot
 
@@ -95,7 +98,9 @@ export GEMINI_API_KEY=...   # from the SOPS store (never committed)
 
 **Phase 0 — harness foundation.** Implemented: persona pack model + validation, provider
 registry with live health probes, fallback-chain resolution, trend harvesting (SearXNG),
-free-tier quota instrumentation (snapshot, budget, JSONL ledger, delta attribution) and the
+free-tier quota instrumentation (snapshot, budget, JSONL ledger, delta attribution and
+**project-scoped attribution** — the pipeline's consumption is isolated from interactive
+sessions) and the
 deterministic guardrail (blocklist, banned phrases, hashtags, platform length, emoji policy).
 Next: the triage and creation stages (LLM), then publish → metrics → learning.
 

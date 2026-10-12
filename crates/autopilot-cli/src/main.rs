@@ -9,8 +9,8 @@ use autopilot_core::{Platform, ValidationIssue, load_dir, load_persona};
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{DEFAULT_SEARXNG_ENDPOINT, SearxngClient};
 use autopilot_providers::{
-    ProbeOutcome, append_ledger, check_budget, delta, ledger_entry, load_config, opencode_usage,
-    probe, read_baseline, resolve_chain, usage_for, write_baseline,
+    ModelUsage, ProbeOutcome, append_ledger, check_budget, delta, ledger_entry, load_config,
+    opencode_usage, probe, read_baseline, resolve_chain, usage_for, write_baseline,
 };
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -97,6 +97,10 @@ enum QuotaCommand {
         /// Baseline file: report consumption since it and refresh it.
         #[arg(long)]
         baseline: Option<PathBuf>,
+        /// Scope the statistics to a project (`.` = current directory), so the
+        /// pipeline's consumption is isolated from interactive sessions.
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 
@@ -265,37 +269,52 @@ async fn run_quota(command: QuotaCommand) -> Result<ExitCode> {
             days,
             ledger,
             baseline,
+            project,
         } => {
-            let usages = opencode_usage(days, STATS_TIMEOUT).await?;
-            let Some(usage) = usage_for(&usages, &model) else {
-                let seen = usages.iter().map(|u| u.id()).collect::<Vec<_>>().join(", ");
+            let account = opencode_usage(days, None, STATS_TIMEOUT).await?;
+            let attributed = match project.as_deref() {
+                Some(project) => Some(opencode_usage(days, Some(project), STATS_TIMEOUT).await?),
+                None => None,
+            };
+
+            let primary = attributed.as_ref().unwrap_or(&account);
+            let Some(usage) = usage_for(primary, &model) else {
+                let seen = primary
+                    .iter()
+                    .map(ModelUsage::id)
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 println!("no usage recorded for {model} in the last {days} day(s)");
                 println!("models seen: {seen}");
                 return Ok(ExitCode::SUCCESS);
             };
 
-            let check = check_budget(usage, budget_tokens);
-            println!("model        : {}", check.model_id);
-            println!("window       : last {days} day(s)");
-            println!("steps        : {}", usage.steps);
-            println!("input tokens : {}", usage.input_tokens);
-            println!("output tokens: {}", usage.output_tokens);
-            println!("reasoning    : {}", usage.reasoning_tokens);
-            println!("cache read   : {}", usage.cache_read_tokens);
-            println!("total tokens : {}", check.used_tokens);
-            println!("cost (usd)   : {:.4}", usage.cost_usd);
+            println!("model  : {}", usage.id());
+            println!("window : last {days} day(s)");
+
+            if attributed.is_some() {
+                print_usage("attributed — pipeline project", usage);
+                if let Some(all) = usage_for(&account, &model) {
+                    print_usage("account — every session", all);
+                }
+            } else {
+                print_usage("usage", usage);
+            }
+
+            let billable = usage_for(&account, &model).unwrap_or(usage);
+            let check = check_budget(billable, budget_tokens);
             match check.budget_tokens {
-                Some(0) => println!("budget       : 0 (configured)"),
+                Some(0) => println!("budget : 0 (configured)"),
                 Some(budget) => println!(
-                    "budget       : {budget} ({:.1}% used)",
+                    "budget : {budget} ({:.1}% of the account window)",
                     check.used_tokens as f64 * 100.0 / budget as f64
                 ),
-                None => println!("budget       : not set"),
+                None => println!("budget : not set"),
             }
 
             if let Some(path) = ledger {
                 append_ledger(&path, &ledger_entry(usage, days)).await?;
-                println!("ledger       : appended to {}", path.display());
+                println!("ledger : appended to {}", path.display());
             }
 
             if let Some(path) = baseline {
@@ -315,7 +334,7 @@ async fn run_quota(command: QuotaCommand) -> Result<ExitCode> {
                     None => println!("--- baseline created (no previous snapshot) ---"),
                 }
                 write_baseline(&path, &ledger_entry(usage, days)).await?;
-                println!("baseline     : refreshed at {}", path.display());
+                println!("baseline : refreshed at {}", path.display());
             }
 
             if check.within_budget {
@@ -326,6 +345,17 @@ async fn run_quota(command: QuotaCommand) -> Result<ExitCode> {
             }
         }
     }
+}
+
+fn print_usage(label: &str, usage: &ModelUsage) {
+    println!("{label}");
+    println!("  steps        : {}", usage.steps);
+    println!("  input tokens : {}", usage.input_tokens);
+    println!("  output tokens: {}", usage.output_tokens);
+    println!("  reasoning    : {}", usage.reasoning_tokens);
+    println!("  cache read   : {}", usage.cache_read_tokens);
+    println!("  total tokens : {}", usage.total_tokens());
+    println!("  cost (usd)   : {:.4}", usage.cost_usd);
 }
 
 async fn run_harvest(command: HarvestCommand) -> Result<ExitCode> {

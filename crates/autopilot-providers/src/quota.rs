@@ -62,11 +62,20 @@ pub struct LedgerEntry {
 }
 
 /// Fetch per-model usage from `opencode stats`.
-pub async fn opencode_usage(days: u32, timeout: Duration) -> Result<Vec<ModelUsage>> {
+///
+/// `project` scopes the statistics to one project (`.` resolves against the
+/// current working directory). Scoping to the repository directory isolates the
+/// pipeline's own consumption from the operator's interactive sessions.
+pub async fn opencode_usage(
+    days: u32,
+    project: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<ModelUsage>> {
+    let args = stats_args(days, project);
     let output = tokio::time::timeout(
         timeout,
         Command::new("opencode")
-            .args(["stats", "--json", "--models", "--days", &days.to_string()])
+            .args(&args)
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .output(),
@@ -80,6 +89,20 @@ pub async fn opencode_usage(days: u32, timeout: Duration) -> Result<Vec<ModelUsa
     }
 
     parse_opencode_usage(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Build the `opencode stats` argument list.
+fn stats_args(days: u32, project: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["stats", "--json", "--models", "--days"]
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    args.push(days.to_string());
+    if let Some(project) = project {
+        args.push("--project".to_string());
+        args.push(project.to_string());
+    }
+    args
 }
 
 /// Parse the JSON emitted by `opencode stats --json --models`.
@@ -322,6 +345,29 @@ mod tests {
         let entry = ledger_entry(mimo, 0);
         assert_eq!(entry.model_id, "opencode/mimo-v2.6-flash-free");
         assert_eq!(mimo.total_tokens(), 144_750 + 22_335 + 17_392 + 1_942_400);
+    }
+
+    #[test]
+    fn stats_args_include_project_only_when_scoped() {
+        let expected_global: Vec<String> = ["stats", "--json", "--models", "--days", "0"]
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        assert_eq!(stats_args(0, None), expected_global);
+
+        let expected_scoped: Vec<String> = [
+            "stats",
+            "--json",
+            "--models",
+            "--days",
+            "7",
+            "--project",
+            ".",
+        ]
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+        assert_eq!(stats_args(7, Some(".")), expected_scoped);
     }
 
     #[test]
