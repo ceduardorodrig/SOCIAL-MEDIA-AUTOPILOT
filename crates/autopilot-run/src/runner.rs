@@ -237,6 +237,60 @@ pub fn partition_variants<'a>(
     (approved, rejected)
 }
 
+/// How many approved variants one platform publishes per slot.
+///
+/// **One.** Two near-identical variants posted in the same minute read as spam
+/// and split the audience; the A/B comparison is therefore **sequential**, not
+/// simultaneous (see [`select_variants`]).
+const VARIANTS_PER_PLATFORM_PER_SLOT: usize = 1;
+
+/// Choose which approved variants a slot publishes.
+///
+/// A slot releases at most `per_platform` variants per platform, starting at
+/// `rotation` and wrapping, so consecutive slots **alternate** between the
+/// approved variants: over time both styles are exercised and compared through
+/// their metrics, while no single moment shows two near-identical posts.
+pub fn select_variants<'a>(
+    approved: &'a [(Platform, &'a Variant)],
+    per_platform: usize,
+    rotation: usize,
+) -> Vec<(Platform, &'a Variant)> {
+    let take = per_platform.max(1);
+    let mut platforms: Vec<Platform> = Vec::new();
+    for (platform, _) in approved {
+        if !platforms.contains(platform) {
+            platforms.push(*platform);
+        }
+    }
+
+    let mut selected = Vec::new();
+    for platform in platforms {
+        let group: Vec<&Variant> = approved
+            .iter()
+            .filter(|(candidate, _)| *candidate == platform)
+            .map(|(_, variant)| *variant)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        let start = rotation % group.len();
+        for offset in 0..take.min(group.len()) {
+            selected.push((platform, group[(start + offset) % group.len()]));
+        }
+    }
+    selected
+}
+
+/// Deterministic per-slot rotation: the last digit of the run id (a Unix
+/// timestamp) makes consecutive slots alternate which variant they publish.
+fn rotation_offset(run_id: &str) -> usize {
+    run_id
+        .chars()
+        .rev()
+        .find_map(|c| c.to_digit(10))
+        .map_or(0, |digit| digit as usize)
+}
+
 /// Execute the pipeline for one persona pack.
 pub async fn run(options: RunOptions) -> Result<RunReport> {
     let persona = load_persona(&options.persona_path).await?;
@@ -817,7 +871,35 @@ async fn stage_publish(
     let mut handle = String::new();
     let run_id = report.run_id.clone();
 
+    // One slot, one variant per platform: publishing two near-identical variants
+    // at the same moment reads as spam, so the A/B comparison is sequential and
+    // the rotation alternates which variant each slot releases.
+    let selection = select_variants(
+        approved,
+        VARIANTS_PER_PLATFORM_PER_SLOT,
+        rotation_offset(&run_id),
+    );
+
     for (platform, variant) in approved {
+        if !selection
+            .iter()
+            .any(|(chosen, selected)| chosen == platform && selected.label == variant.label)
+        {
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "publish",
+                    StageStatus::Skipped,
+                    "held back — a slot publishes one variant per platform (sequential A/B)",
+                )
+                .with_platform(*platform)
+                .with_variant(&variant.label),
+            )
+            .await?;
+            continue;
+        }
+
         if *platform != Platform::Bluesky {
             record(
                 report,
@@ -1112,6 +1194,41 @@ mod tests {
             hashtags: vec![],
             image_prompt: String::new(),
         }
+    }
+
+    #[test]
+    fn a_slot_publishes_one_variant_per_platform_and_alternates() {
+        let a = variant("A", "texto a");
+        let b = variant("B", "texto b");
+        let approved = vec![(Platform::Bluesky, &a), (Platform::Bluesky, &b)];
+
+        // Rotation 0 → A, rotation 1 → B: consecutive slots alternate, so no
+        // moment ever shows two near-identical posts.
+        let first = select_variants(&approved, 1, 0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].1.label, "A");
+
+        let second = select_variants(&approved, 1, 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].1.label, "B");
+    }
+
+    #[test]
+    fn every_platform_still_gets_its_variant_in_the_same_slot() {
+        let a = variant("A", "texto a");
+        let b = variant("B", "texto b");
+        let approved = vec![(Platform::Bluesky, &a), (Platform::X, &b)];
+        let selected = select_variants(&approved, 1, 0);
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().any(|(p, _)| *p == Platform::Bluesky));
+        assert!(selected.iter().any(|(p, _)| *p == Platform::X));
+    }
+
+    #[test]
+    fn the_rotation_comes_from_the_run_id_digits() {
+        assert_eq!(rotation_offset("tech-curiosities-1791849666"), 6);
+        assert_eq!(rotation_offset("persona-1791849661"), 1);
+        assert_eq!(rotation_offset("no-digits"), 0);
     }
 
     #[test]
