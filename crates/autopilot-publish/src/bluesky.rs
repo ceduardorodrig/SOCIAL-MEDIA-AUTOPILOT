@@ -173,15 +173,36 @@ pub fn build_post_record_with_images(
     created_at: &str,
     images: &[PostImage],
 ) -> Result<serde_json::Value> {
+    let embed = if images.is_empty() {
+        None
+    } else {
+        Some(build_image_embed(images)?)
+    };
+    Ok(build_post_record_with_embed(text, created_at, embed))
+}
+
+/// Build a post record with an optional, pre-built embed.
+///
+/// The images embed and the video embed share this one record shape, so the
+/// publisher has a single place that attaches an embed (`None` keeps the
+/// text-only record identical to [`build_post_record`]).
+pub fn build_post_record_with_embed(
+    text: &str,
+    created_at: &str,
+    embed: Option<serde_json::Value>,
+) -> serde_json::Value {
     let mut record = build_post_record(text, created_at);
-    if !images.is_empty() {
-        record["embed"] = build_image_embed(images)?;
+    if let Some(embed) = embed {
+        record["embed"] = embed;
     }
-    Ok(record)
+    record
 }
 
 /// Extract the message from an AT Protocol error payload.
-fn api_error_message(payload: &serde_json::Value) -> &str {
+///
+/// Shared with the video service (`app.bsky.video`), which reports errors in the
+/// same `{"message": ...}` shape.
+pub(crate) fn api_error_message(payload: &serde_json::Value) -> &str {
     payload
         .get("message")
         .and_then(serde_json::Value::as_str)

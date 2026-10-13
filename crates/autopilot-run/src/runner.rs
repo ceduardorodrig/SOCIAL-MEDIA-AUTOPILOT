@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use autopilot_core::{
     Format, FormatBudgets, PersonaPack, Platform, PublishingPolicy, SelectionRule, load_persona,
     now_unix, utc_day,
@@ -18,6 +18,10 @@ use autopilot_core::{
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{
     ARTICLE_TIMEOUT, MAX_SOURCE_CHARS, SearxngClient, Topic, fetch_article_text,
+};
+use autopilot_media::{
+    ImageSource, MediaConfig, PlaceholderImageSource, RenderOptions, SceneImageDir,
+    VERTICAL_HEIGHT, VERTICAL_WIDTH, VideoPlan, render as render_media,
 };
 use autopilot_pipeline::{
     EditorOutcome, Source, TopicScore, Variant, build_creation_prompt_with_avoid,
@@ -28,9 +32,11 @@ use autopilot_pipeline::{
 use autopilot_providers::{JobKind, complete_with_chain, load_config};
 use autopilot_publish::{
     BlueskyCredentials, CARD_HEIGHT, CARD_MIME_TYPE, CARD_WIDTH, CardIdentity, CardSpec,
-    DEFAULT_BLUESKY_BASE_URL, DEFAULT_RSVG_BINARY, PostImage, Session, alt_text,
-    build_post_record_with_images, create_post, create_session, now_rfc3339_millis, post_url,
-    render_png_for, template_for, upload_blob,
+    DEFAULT_BLUESKY_BASE_URL, DEFAULT_RSVG_BINARY, DEFAULT_VIDEO_BASE_URL,
+    DEFAULT_VIDEO_POLL_INTERVAL, PostImage, PostVideo, Session, VIDEO_MIME_TYPE, alt_text,
+    await_video_job, build_image_embed, build_post_record_with_embed, build_video_embed,
+    create_post, create_session, now_rfc3339_millis, post_url, render_png_for, template_for,
+    upload_blob, upload_video, validate_video,
 };
 use chrono::{Local, Timelike};
 
@@ -48,6 +54,15 @@ const PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where generated cards are kept (gitignored, alongside the run journal).
 const DEFAULT_CARD_DIR: &str = "var/cards";
+
+/// Where rendered short videos are kept (gitignored, under `var/`).
+const DEFAULT_VIDEO_DIR: &str = "var/media";
+
+/// How long to wait for one video-service request (the upload or a job poll).
+const VIDEO_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long to wait for a whole video processing job to complete.
+const VIDEO_JOB_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Whether `autopilot run` attaches a generated card to a Bluesky post.
 ///
@@ -109,6 +124,10 @@ pub struct RunOptions {
     pub dry_run: bool,
     /// Whether a generated post card is attached to the published post.
     pub card: CardAttachment,
+    /// Media configuration (Piper binary/voice, motion, scene images), read only
+    /// in a live run that the policy lets publish a short video. A missing file
+    /// falls back to the safe defaults, so text and cards never need it.
+    pub media_path: PathBuf,
 }
 
 /// How a stage ended.
@@ -319,11 +338,18 @@ pub fn matching_window(windows: &[String], now: i64, tolerance: i64) -> Option<S
 
 /// The format a slot intends to publish, before the frequency policy runs.
 ///
-/// The creation stage fills `image_prompt` when the topic's angle suits a card
-/// (`content-formats.md` §2), so the card mode plus that prompt is the intent;
-/// an empty prompt is a text post.
-pub fn intended_format(image_prompt: &str, card: CardAttachment) -> Format {
-    if card.should_attach(image_prompt) {
+/// The creation stage fills `video_plan` when the topic's angle suits a short
+/// video (`content-formats.md` §2, HB-035), and `image_prompt` when it suits a
+/// card; an empty prompt is a text post. The video plan wins: a topic the model
+/// shaped as a video is a video.
+pub fn intended_format(
+    image_prompt: &str,
+    video_plan: Option<&VideoPlan>,
+    card: CardAttachment,
+) -> Format {
+    if video_plan.is_some() {
+        Format::Video
+    } else if card.should_attach(image_prompt) {
         Format::Card
     } else {
         Format::Text
@@ -849,6 +875,8 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         return Ok(report);
     }
 
+    let media = MediaConfig::load_or_default(&options.media_path).await?;
+
     stage_publish(
         &mut report,
         &journal,
@@ -859,6 +887,7 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         &SlotState {
             published: &published,
             age_days,
+            media: &media,
         },
     )
     .await?;
@@ -1006,6 +1035,21 @@ async fn stage_dry_run_plan(
         )
         .await?;
     }
+
+    // HB-035: the video enlace is described too — it is gated by the policy
+    // (weekly budget + warming ramp), so it only fires when a pack releases it.
+    record(
+        report,
+        journal,
+        StageOutcome::new(
+            "media",
+            StageStatus::DryRun,
+            "would render and upload a short video when the policy releases the format \
+             (weekly budget + warming ramp); otherwise the slot stays text or card",
+        ),
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -1540,12 +1584,15 @@ async fn stage_grounding<'a>(
 ///
 /// The journal read and the account age are shared by the day gate and by every
 /// platform's publish step, so they travel together instead of as loose
-/// arguments.
+/// arguments. The media configuration travels with them: it is resolved once for
+/// the run and consumed only when the policy releases the video format.
 struct SlotState<'a> {
     /// The posts already published (the journal, read once before the gates).
     published: &'a [PublishedEntry],
     /// The account's age in days, or `None` for a mature account (ramp inert).
     age_days: Option<i64>,
+    /// Media configuration (Piper binary/voice, motion, scene images).
+    media: &'a MediaConfig,
 }
 
 /// Stage [4] — publish. Only the platforms with an adapter are served.
@@ -1613,7 +1660,11 @@ async fn stage_publish(
         // the warming ramp and the week's per-format budget. A card that would
         // overshoot the budget ships as text (the baseline); only a slot whose
         // text budget is *also* spent waits for the next slot.
-        let intended = intended_format(&variant.image_prompt, options.card);
+        let intended = intended_format(
+            &variant.image_prompt,
+            variant.video_plan.as_ref(),
+            options.card,
+        );
         let counts = week_counts(
             slot.published,
             &report.persona,
@@ -1684,17 +1735,32 @@ async fn stage_publish(
             continue;
         };
 
-        // The guardrail already approved the text; the card is a rendering of it.
-        // The format the frequency policy resolved decides whether it is a card.
-        let images =
-            match stage_card_image(report, journal, format, &run_id, topic, variant, current)
+        // One format per slot (`content-formats.md` §2): the format the frequency
+        // policy resolved decides whether the post carries a card or a short
+        // video. The guardrail already approved the text; the media is a
+        // rendering of it, never a second claim.
+        let embed = match format {
+            Format::Video => {
+                match stage_media(
+                    report, journal, format, slot.media, &run_id, variant, current,
+                )
                 .await?
-            {
-                Some(image) => vec![image],
-                None => Vec::new(),
-            };
+                {
+                    Some(video) => Some(build_video_embed(&video)?),
+                    None => None,
+                }
+            }
+            _ => {
+                match stage_card_image(report, journal, format, &run_id, topic, variant, current)
+                    .await?
+                {
+                    Some(image) => Some(build_image_embed(&[image])?),
+                    None => None,
+                }
+            }
+        };
 
-        let post = build_post_record_with_images(&variant.text, &now_rfc3339_millis(), &images)?;
+        let post = build_post_record_with_embed(&variant.text, &now_rfc3339_millis(), embed);
         match create_post(DEFAULT_BLUESKY_BASE_URL, current, &post, PUBLISH_TIMEOUT).await {
             Ok(uri) => {
                 let url = post_url(&handle, &uri);
@@ -1833,6 +1899,169 @@ async fn stage_card_image(
     }
 }
 
+/// Render and upload a short video for a slot, or `None` when not requested.
+///
+/// The counterpart of [`stage_card_image`] for the video format (HB-035): render
+/// the variant's plan through `autopilot-media` (Piper + ffmpeg), upload the MP4
+/// to the Bluesky video service and return the ready [`PostVideo`]. Unlike an
+/// image (an `uploadBlob` on the PDS), the video goes through the `app.bsky.video`
+/// side-car and a polling job. Every failure — no plan, a render that cannot run
+/// (no `piper-tts`, no stills), a refused upload — degrades the slot to a text
+/// post, journaling why and marking the run failed, so a degraded slot is never
+/// mistaken for a clean one.
+async fn stage_media(
+    report: &mut RunReport,
+    journal: &Journal,
+    format: Format,
+    media: &MediaConfig,
+    run_id: &str,
+    variant: &Variant,
+    session: &Session,
+) -> Result<Option<PostVideo>> {
+    if format != Format::Video {
+        return Ok(None);
+    }
+
+    let Some(plan) = variant.video_plan.as_ref() else {
+        record(
+            report,
+            journal,
+            StageOutcome::new(
+                "media",
+                StageStatus::Skipped,
+                "the video format has no plan for this variant — publishing text",
+            )
+            .with_platform(Platform::Bluesky)
+            .with_variant(&variant.label),
+        )
+        .await?;
+        return Ok(None);
+    };
+
+    let path = match render_video(plan, media, run_id, variant).await {
+        Ok(path) => path,
+        Err(err) => {
+            report.failed = true;
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "media",
+                    StageStatus::Error,
+                    format!("video render failed — publishing text only: {err:#}"),
+                )
+                .with_platform(Platform::Bluesky)
+                .with_variant(&variant.label),
+            )
+            .await?;
+            return Ok(None);
+        }
+    };
+
+    let result = async {
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("reading the rendered video {}", path.display()))?;
+        validate_video(bytes.len(), VIDEO_MIME_TYPE)?;
+        let job = upload_video(
+            DEFAULT_VIDEO_BASE_URL,
+            session,
+            &bytes,
+            VIDEO_REQUEST_TIMEOUT,
+        )
+        .await?;
+        let job = await_video_job(
+            DEFAULT_VIDEO_BASE_URL,
+            session,
+            job,
+            VIDEO_REQUEST_TIMEOUT,
+            DEFAULT_VIDEO_POLL_INTERVAL,
+            VIDEO_JOB_TIMEOUT,
+        )
+        .await?;
+        let blob = job
+            .blob
+            .clone()
+            .context("the completed video job carried no blob")?;
+        Ok::<_, anyhow::Error>((bytes.len(), job, blob))
+    }
+    .await;
+
+    match result {
+        Ok((len, job, blob)) => {
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "media",
+                    StageStatus::Ok,
+                    format!(
+                        "attached {VIDEO_MIME_TYPE} ({len} bytes) {VERTICAL_WIDTH}x{VERTICAL_HEIGHT} — job {} {}",
+                        job.job_id, job.state
+                    ),
+                )
+                .with_platform(Platform::Bluesky)
+                .with_variant(&variant.label),
+            )
+            .await?;
+            Ok(Some(PostVideo {
+                alt: video_alt(variant),
+                blob,
+                width: VERTICAL_WIDTH,
+                height: VERTICAL_HEIGHT,
+                presentation: None,
+            }))
+        }
+        Err(err) => {
+            report.failed = true;
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "media",
+                    StageStatus::Error,
+                    format!("video upload failed — publishing text only: {err:#}"),
+                )
+                .with_platform(Platform::Bluesky)
+                .with_variant(&variant.label),
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Render a plan to a vertical MP4 through `autopilot-media` (Piper + ffmpeg).
+///
+/// This is the one effectful, external-binary-dependent step of the video enlace:
+/// it spawns `piper-tts` and `ffmpeg` and consumes real still images (resolved
+/// behind the [`ImageSource`] seam). It is deliberately outside the pure
+/// decision helpers, and every failure is handled by the caller.
+async fn render_video(
+    plan: &VideoPlan,
+    media: &MediaConfig,
+    run_id: &str,
+    variant: &Variant,
+) -> Result<PathBuf> {
+    let work_dir = PathBuf::from(DEFAULT_VIDEO_DIR).join(format!("{run_id}-{}", variant.label));
+    let images: Box<dyn ImageSource> = match &media.scene_images {
+        Some(dir) => Box::new(SceneImageDir::new(dir.clone())),
+        None => Box::new(PlaceholderImageSource),
+    };
+    let options = RenderOptions::new(work_dir, media.piper.clone(), media.motion, false);
+    let output = render_media(plan, images.as_ref(), &options).await?;
+    Ok(output.video)
+}
+
+/// Alt text for a video, derived from the caption.
+///
+/// `app.bsky.embed.video` marks `alt` optional (unlike an image embed), but a
+/// described video is still better than an undescribed one.
+fn video_alt(variant: &Variant) -> Option<String> {
+    let text = variant.text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// Authenticate against Bluesky using the credentials in the environment.
 async fn open_bluesky_session() -> Result<Session> {
     let credentials = BlueskyCredentials::from_env()?;
@@ -1950,6 +2179,7 @@ mod tests {
             hashtags: vec![],
             image_prompt: String::new(),
             card: None,
+            video_plan: None,
         }
     }
 
@@ -2565,17 +2795,205 @@ mod tests {
     #[test]
     fn the_intended_format_follows_the_card_mode_and_the_prompt() {
         assert_eq!(
-            intended_format("a terminal", CardAttachment::Off),
+            intended_format("a terminal", None, CardAttachment::Off),
             Format::Text
         );
         assert_eq!(
-            intended_format("a terminal", CardAttachment::WhenPrompted),
+            intended_format("a terminal", None, CardAttachment::WhenPrompted),
             Format::Card
         );
         assert_eq!(
-            intended_format("   ", CardAttachment::WhenPrompted),
+            intended_format("   ", None, CardAttachment::WhenPrompted),
             Format::Text
         );
-        assert_eq!(intended_format("", CardAttachment::Always), Format::Card);
+        assert_eq!(
+            intended_format("", None, CardAttachment::Always),
+            Format::Card
+        );
+    }
+
+    fn video_plan() -> VideoPlan {
+        VideoPlan {
+            hook: "um gancho falado".into(),
+            scenes: vec![autopilot_media::Scene {
+                narration: "uma cena".into(),
+                image_prompt: "um cérebro".into(),
+            }],
+            call_to_action: "siga".into(),
+        }
+    }
+
+    #[test]
+    fn a_video_plan_wins_over_the_card_prompt() {
+        // HB-035: a topic the model shaped as a short video is a video, whatever
+        // the image prompt says — the plan is the stronger signal.
+        let plan = video_plan();
+        assert_eq!(
+            intended_format("a terminal", Some(&plan), CardAttachment::WhenPrompted),
+            Format::Video
+        );
+        assert_eq!(
+            intended_format("", Some(&plan), CardAttachment::Off),
+            Format::Video
+        );
+    }
+
+    #[test]
+    fn the_video_format_respects_the_budget_and_the_warming_ramp() {
+        // content-formats.md §3: the default video budget is 0, so a video the
+        // model wanted ships as text — the format is gated by the policy.
+        let budgets = FormatBudgets::default();
+        let counts = FormatCounts::default();
+        assert_eq!(budgets.budget(Format::Video), 0);
+        assert_eq!(
+            effective_format(Format::Video, None, &budgets, &counts),
+            Some(Format::Text)
+        );
+
+        // A pack that budgets one video a week and is past its ramp releases it.
+        let budgets = FormatBudgets {
+            video: 1,
+            ..FormatBudgets::default()
+        };
+        assert_eq!(
+            effective_format(Format::Video, Some(14), &budgets, &counts),
+            Some(Format::Video)
+        );
+        // Week 1 and week 2 do not release the video: the ramp tightens it back
+        // to text even though the budget is available.
+        assert_eq!(
+            effective_format(Format::Video, Some(0), &budgets, &counts),
+            Some(Format::Text)
+        );
+        assert_eq!(
+            effective_format(Format::Video, Some(7), &budgets, &counts),
+            Some(Format::Text)
+        );
+        // The budget spent → text; text spent too → the slot waits.
+        let spent_video = FormatCounts {
+            video: 1,
+            ..FormatCounts::default()
+        };
+        assert_eq!(
+            effective_format(Format::Video, Some(14), &budgets, &spent_video),
+            Some(Format::Text)
+        );
+        let spent_all = FormatCounts {
+            video: 1,
+            text: budgets.text,
+            ..FormatCounts::default()
+        };
+        assert_eq!(
+            effective_format(Format::Video, Some(14), &budgets, &spent_all),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_media_stage_is_a_no_op_for_a_non_video_slot() {
+        // The enlace decides inside `stage_media`: a text or card slot never
+        // renders, never uploads and never touches the network.
+        let journal_path =
+            std::env::temp_dir().join(format!("autopilot-media-skip-{}.jsonl", std::process::id()));
+        let _ = tokio::fs::remove_file(&journal_path).await;
+
+        let journal = Journal::new("run-test", "demo", journal_path.clone());
+        let mut report = RunReport {
+            run_id: "run-test".into(),
+            persona: "demo".into(),
+            dry_run: false,
+            journal: journal_path.clone(),
+            stages: Vec::new(),
+            published: Vec::new(),
+            failed: false,
+        };
+        // A session that would be refused if a request were attempted: the point
+        // is that none is.
+        let session = Session {
+            did: "did:plc:abc".into(),
+            handle: "demo.bsky.social".into(),
+            access_jwt: "irrelevant".into(),
+        };
+
+        let media = MediaConfig::default();
+        for format in [Format::Text, Format::Card] {
+            let video = stage_media(
+                &mut report,
+                &journal,
+                format,
+                &media,
+                "run-test",
+                &variant("A", "texto"),
+                &session,
+            )
+            .await
+            .expect("a non-video slot is a clean no-op");
+            assert!(video.is_none());
+        }
+        assert!(report.stages.is_empty(), "nothing is even journalled");
+        assert!(!report.failed);
+
+        tokio::fs::remove_file(&journal_path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn a_video_render_failure_degrades_to_text_and_fails_loudly() {
+        // The render needs `piper-tts` and real stills; with the default config
+        // and no scene images it cannot run, so the slot must degrade to a text
+        // post, journal the reason and mark the run failed (never a silent drop).
+        let journal_path = std::env::temp_dir().join(format!(
+            "autopilot-media-degrade-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&journal_path).await;
+
+        let journal = Journal::new("run-test", "demo", journal_path.clone());
+        let mut report = RunReport {
+            run_id: "run-test".into(),
+            persona: "demo".into(),
+            dry_run: false,
+            journal: journal_path.clone(),
+            stages: Vec::new(),
+            published: Vec::new(),
+            failed: false,
+        };
+        let session = Session {
+            did: "did:plc:abc".into(),
+            handle: "demo.bsky.social".into(),
+            access_jwt: "irrelevant".into(),
+        };
+        let mut with_video = variant("A", "um vídeo sobre o cérebro");
+        with_video.video_plan = Some(video_plan());
+
+        let video = stage_media(
+            &mut report,
+            &journal,
+            Format::Video,
+            &MediaConfig::default(),
+            "run-test",
+            &with_video,
+            &session,
+        )
+        .await
+        .expect("the failure is handled, not returned");
+        assert!(video.is_none(), "the post falls back to text");
+        assert!(report.failed, "a degraded slot is never a clean run");
+
+        let raw = tokio::fs::read_to_string(&journal_path)
+            .await
+            .expect("journal written");
+        let event: serde_json::Value =
+            serde_json::from_str(raw.lines().next().unwrap_or("{}")).expect("valid journal JSON");
+        assert_eq!(event["stage"], "media");
+        assert_eq!(event["status"], "error");
+        assert!(
+            event["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("publishing text only"),
+            "the journal must explain the fallback: {event}"
+        );
+
+        tokio::fs::remove_file(&journal_path).await.ok();
     }
 }

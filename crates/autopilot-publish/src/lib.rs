@@ -8,13 +8,14 @@ use anyhow::{Context, Result, bail};
 
 pub mod bluesky;
 pub mod card;
+pub mod video;
 pub mod x;
 
 pub use bluesky::{
     BlobLink, BlobRef, BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, MAX_IMAGE_BYTES,
     MAX_IMAGES_PER_POST, PostImage, Session, build_image_embed, build_post_record,
-    build_post_record_with_images, create_post, create_record, create_session, now_rfc3339_millis,
-    post_url, upload_blob, validate_alt, validate_image,
+    build_post_record_with_embed, build_post_record_with_images, create_post, create_record,
+    create_session, now_rfc3339_millis, post_url, upload_blob, validate_alt, validate_image,
 };
 pub use card::{
     CARD_HEIGHT, CARD_MIME_TYPE, CARD_TEMPLATE_VERSION, CARD_TEMPLATES, CARD_WIDTH, CardIdentity,
@@ -24,6 +25,11 @@ pub use card::{
 };
 // X shares the `create_post` / `post_url` names with Bluesky, so those two stay
 // module-qualified (`x::create_post`); the rest are re-exported for symmetry.
+pub use video::{
+    DEFAULT_VIDEO_BASE_URL, DEFAULT_VIDEO_POLL_INTERVAL, GET_JOB_STATUS_PATH, MAX_VIDEO_BYTES,
+    PostVideo, UPLOAD_VIDEO_PATH, VIDEO_MIME_TYPE, VideoJobStatus, await_video_job,
+    build_video_embed, get_job_status, upload_video, validate_video,
+};
 pub use x::{
     DEFAULT_X_API_BASE_URL, PublishedPost, X_ENV_VARS, XCredentials, authorization_header,
     build_tweet_body, missing_env_vars, post_endpoint,

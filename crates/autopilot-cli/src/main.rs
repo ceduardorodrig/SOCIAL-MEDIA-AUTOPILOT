@@ -165,6 +165,10 @@ struct RunArgs {
     /// the variant carries an image prompt) or always.
     #[arg(long, value_parser = parse_card_attachment, default_value = "off")]
     attach_card: CardAttachment,
+    /// Media configuration used only when the policy releases a short video
+    /// (Piper binary/voice, motion, scene images). A missing file uses defaults.
+    #[arg(long, default_value = "config/media.yaml")]
+    media_config: PathBuf,
     /// Describe every stage without any LLM call, GPU work, network or publish.
     #[arg(long)]
     dry_run: bool,
@@ -647,6 +651,7 @@ async fn run_autopilot(args: RunArgs) -> Result<ExitCode> {
         memory_path: args.memory,
         dry_run: args.dry_run,
         card: args.attach_card,
+        media_path: args.media_config,
     };
 
     let report = autopilot_run::run(options).await?;

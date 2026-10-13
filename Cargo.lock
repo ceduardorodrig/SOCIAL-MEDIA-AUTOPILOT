@@ -177,6 +177,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "tokio",
 ]
 
@@ -200,6 +201,7 @@ dependencies = [
  "anyhow",
  "autopilot-core",
  "autopilot-harvest",
+ "autopilot-media",
  "serde",
  "serde_json",
 ]
@@ -223,6 +225,7 @@ name = "autopilot-publish"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -244,6 +247,7 @@ dependencies = [
  "autopilot-guardrail",
  "autopilot-harvest",
  "autopilot-learn",
+ "autopilot-media",
  "autopilot-pipeline",
  "autopilot-providers",
  "autopilot-publish",

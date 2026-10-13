@@ -151,6 +151,7 @@ mod tests {
             hashtags: Vec::new(),
             image_prompt: String::new(),
             card: None,
+            video_plan: None,
         }
     }
 

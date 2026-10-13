@@ -11,3 +11,4 @@ serde_json = "1"
 
 autopilot-core = { path = "../autopilot-core" }
 autopilot-harvest = { path = "../autopilot-harvest" }
+autopilot-media = { path = "../autopilot-media" }

@@ -12,6 +12,7 @@ pub mod grounding;
 pub mod json;
 pub mod prompt;
 pub mod triage;
+pub mod video;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -28,3 +29,4 @@ pub use grounding::{
 };
 pub use json::extract_json;
 pub use triage::{TopicScore, build_triage_prompt, parse_shortlist};
+pub use video::{VIDEO_PLAN_INSTRUCTION, drop_invalid_video_plans, parse_video_plan};

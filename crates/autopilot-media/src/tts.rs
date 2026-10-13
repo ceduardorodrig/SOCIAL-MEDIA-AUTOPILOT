@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 /// Default Piper binary name, resolved through `PATH`.
@@ -39,25 +40,43 @@ impl BuiltCommand {
 }
 
 /// Configuration for a Piper synthesis run.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PiperConfig {
+    /// Piper binary; resolved through `PATH` when it has no separator.
+    #[serde(default = "default_piper_binary")]
     pub binary: String,
     /// Voice model (`.onnx`); Piper finds the matching `.json` next to it.
+    #[serde(default)]
     pub model: PathBuf,
     /// Speech speed: higher is slower. `None` keeps the voice default.
+    #[serde(default)]
     pub length_scale: Option<f32>,
     /// Silence inserted between sentences, in seconds.
+    #[serde(default)]
     pub sentence_silence: Option<f32>,
+}
+
+fn default_piper_binary() -> String {
+    DEFAULT_PIPER_BINARY.to_string()
+}
+
+impl Default for PiperConfig {
+    fn default() -> Self {
+        Self {
+            binary: default_piper_binary(),
+            model: PathBuf::new(),
+            length_scale: None,
+            sentence_silence: None,
+        }
+    }
 }
 
 impl PiperConfig {
     /// Build a config for a voice model with the default binary and tuning.
     pub fn new(model: impl Into<PathBuf>) -> Self {
         Self {
-            binary: DEFAULT_PIPER_BINARY.to_string(),
             model: model.into(),
-            length_scale: None,
-            sentence_silence: None,
+            ..Self::default()
         }
     }
 }

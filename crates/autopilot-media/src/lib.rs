@@ -12,6 +12,7 @@
 //! [`render::ImageSource`] seam.
 
 pub mod assembly;
+pub mod config;
 pub mod json;
 pub mod plan;
 pub mod render;
@@ -21,6 +22,7 @@ pub use assembly::{
     AssemblySegment, AssemblySpec, DEFAULT_FFMPEG_BINARY, DEFAULT_FFPROBE_BINARY, DEFAULT_FPS,
     Motion, SUBTITLE_FILE, VERTICAL_HEIGHT, VERTICAL_WIDTH, build_assembly_command,
 };
+pub use config::MediaConfig;
 pub use json::extract_json;
 pub use plan::{Beat, BeatRole, Scene, VideoPlan};
 pub use render::{

@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::tts::BuiltCommand;
 
@@ -32,11 +33,14 @@ const SUBTITLE_STYLE: &str = "FontName=DejaVu Sans,FontSize=48,Bold=1,PrimaryCol
      OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=140";
 
 /// Still-image motion for each scene.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Motion {
     /// Scale to fit and pad with black (safe on every ffmpeg build).
+    #[serde(rename = "static")]
     Static,
     /// Slow Ken Burns zoom/pan via the `zoompan` filter.
+    #[serde(rename = "kenburns")]
     KenBurns,
 }
 
@@ -361,6 +365,16 @@ mod tests {
     fn rejects_an_empty_segment_list() {
         let spec = AssemblySpec::vertical(Vec::new(), PathBuf::from("out.mp4"));
         assert!(build_assembly_command(&spec).is_err());
+    }
+
+    #[test]
+    fn building_the_same_spec_twice_is_deterministic() {
+        // The assembly (the wiring's effectful step) is a pure function of the
+        // spec: same plan, byte-identical argv. Nothing ambient leaks in.
+        let first = build_assembly_command(&spec()).expect("builds");
+        let second = build_assembly_command(&spec()).expect("builds");
+        assert_eq!(first, second);
+        assert_eq!(first.display_line(), second.display_line());
     }
 
     #[test]

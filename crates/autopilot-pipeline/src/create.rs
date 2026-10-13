@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use autopilot_core::{PersonaPack, Platform};
+use autopilot_media::VideoPlan;
 use serde::{Deserialize, Serialize};
 
 use crate::grounding::Source;
@@ -42,6 +43,11 @@ pub struct Variant {
     /// post, and absent in older responses — hence the default.
     #[serde(default)]
     pub card: Option<CardContent>,
+    /// A short-video plan, present only when the topic's angle suits a video and
+    /// the persona's policy releases the format (HB-035). Absent in older
+    /// responses and in every text/card response.
+    #[serde(default)]
+    pub video_plan: Option<VideoPlan>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +117,15 @@ pub fn build_creation_prompt_with_avoid(
         )
     };
 
+    // HB-035: a short-video plan is asked for only when the policy budgets one,
+    // so a text/card-only pack keeps a byte-identical prompt (video defaults to
+    // a zero budget).
+    let video_block = if persona.publishing.formats.video > 0 {
+        crate::video::VIDEO_PLAN_INSTRUCTION.to_string()
+    } else {
+        String::new()
+    };
+
     format!(
         "You are the creation stage of an autonomous social-media engine.\n\
          Write in {language} for the platform `{platform}`.\n\n\
@@ -130,7 +145,7 @@ pub fn build_creation_prompt_with_avoid(
          headline plus one concrete fact from the source (a number, a name, a detail). The\n\
          caption is an INTRODUCTION to that card — your angle, why it matters — and never a\n\
          restatement of it: the reader sees both, so they must not say the same thing.\n\n\
-         Reply with ONLY a JSON array (no prose, no markdown) of objects with the keys\n\
+         {video_block}Reply with ONLY a JSON array (no prose, no markdown) of objects with the keys\n\
          \"label\" (\"A\" or \"B\"), \"text\", \"hashtags\" (array of strings), \"image_prompt\",\n\
          and \"card\" (an object with \"title\" and \"body\").\n",
         language = persona.language,
@@ -145,6 +160,7 @@ pub fn build_creation_prompt_with_avoid(
         topic = topic,
         grounding = grounding,
         avoid_block = avoid_block,
+        video_block = video_block,
         limit = platform_limit(platform),
         max_tags = persona.voice.max_hashtags,
     )
@@ -153,7 +169,7 @@ pub fn build_creation_prompt_with_avoid(
 /// Parse the model response into variants.
 pub fn parse_variants(raw: &str) -> Result<Vec<Variant>> {
     let json = extract_json(raw)?;
-    let variants: Vec<Variant> = match serde_json::from_str(json) {
+    let mut variants: Vec<Variant> = match serde_json::from_str(json) {
         Ok(variants) => variants,
         Err(_) => {
             let wrapper: Wrapper = serde_json::from_str(json)
@@ -165,6 +181,9 @@ pub fn parse_variants(raw: &str) -> Result<Vec<Variant>> {
     if variants.is_empty() {
         anyhow::bail!("the model returned no variants");
     }
+    // HB-035: a `video_plan` that cannot be rendered is dropped here (the caption
+    // and its card survive), so a malformed plan never costs the slot.
+    crate::video::drop_invalid_video_plans(&mut variants);
     Ok(variants)
 }
 
@@ -228,6 +247,36 @@ mod tests {
     #[test]
     fn empty_variant_list_is_an_error() {
         assert!(parse_variants("[]").is_err());
+    }
+
+    #[test]
+    fn a_video_plan_is_parsed_and_a_broken_one_is_dropped() {
+        // HB-035: the creation may carry a `video_plan`; one that cannot render
+        // is dropped here so its caption still ships (as a card or text).
+        let raw = r#"[{"label":"A","text":"t","video_plan":{"hook":"oi","scenes":[{"narration":"n","image_prompt":"p"}]}},
+                       {"label":"B","text":"u","video_plan":{"hook":"x","scenes":[]}}]"#;
+        let variants = parse_variants(raw).expect("parses");
+        assert!(variants[0].video_plan.is_some());
+        assert!(
+            variants[1].video_plan.is_none(),
+            "the scene-less plan is dropped, the caption kept"
+        );
+        assert_eq!(variants[1].text, "u");
+    }
+
+    #[test]
+    fn the_video_instruction_appears_only_when_the_policy_budgets_video() {
+        let mut pack = persona();
+        let plain = build_creation_prompt(&pack, Platform::Bluesky, "a topic", None);
+        assert!(
+            !plain.contains("video_plan"),
+            "a zero video budget asks for no plan"
+        );
+
+        pack.publishing.formats.video = 1;
+        let with_video = build_creation_prompt(&pack, Platform::Bluesky, "a topic", None);
+        assert!(with_video.contains("video_plan"));
+        assert!(with_video.contains("\"scenes\""));
     }
 
     #[test]

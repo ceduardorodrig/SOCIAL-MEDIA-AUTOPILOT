@@ -15,6 +15,7 @@ autopilot-core = { path = "../autopilot-core" }
 autopilot-guardrail = { path = "../autopilot-guardrail" }
 autopilot-harvest = { path = "../autopilot-harvest" }
 autopilot-learn = { path = "../autopilot-learn" }
+autopilot-media = { path = "../autopilot-media" }
 autopilot-pipeline = { path = "../autopilot-pipeline" }
 autopilot-providers = { path = "../autopilot-providers" }
 autopilot-publish = { path = "../autopilot-publish" }

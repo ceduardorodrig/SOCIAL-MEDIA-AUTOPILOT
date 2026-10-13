@@ -27,6 +27,7 @@ async fn dry_run_walks_every_stage_without_side_effects() {
         memory_path: None,
         dry_run: true,
         card: CardAttachment::Off,
+        media_path: PathBuf::from("config/media.yaml"),
     };
 
     let report = run(options).await.expect("dry run succeeds");
@@ -97,6 +98,7 @@ async fn a_draft_persona_is_never_executed_for_real() {
         memory_path: None,
         dry_run: false,
         card: CardAttachment::Off,
+        media_path: PathBuf::from("config/media.yaml"),
     };
 
     let report = run(options).await.expect("the command itself succeeds");
@@ -127,6 +129,7 @@ async fn the_harvest_query_comes_from_the_persona_pack() {
         memory_path: None,
         dry_run: true,
         card: CardAttachment::Off,
+        media_path: PathBuf::from("config/media.yaml"),
     };
 
     let report = run(options).await.expect("dry run succeeds");

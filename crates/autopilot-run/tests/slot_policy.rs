@@ -58,6 +58,7 @@ async fn a_full_slot_is_skipped_before_any_network_call() {
         memory_path: None,
         dry_run: false,
         card: CardAttachment::Off,
+        media_path: PathBuf::from("config/media.yaml"),
     };
 
     let report = run(options).await.expect("the command itself succeeds");

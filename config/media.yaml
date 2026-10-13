@@ -1,0 +1,29 @@
+# Social Media Autopilot — short-video media configuration (HB-035)
+#
+# TTS is local and CPU-only (never the GPU). Use `piper-tts`, whose upstream is
+# `OHF-Voice/piper1-gpl` (`rhasspy/piper` was archived 2025-10-06). Do NOT point
+# `binary` at `/usr/bin/piper`: on the validated host that path is
+# `piper 0.8-5` = **libratbag** (a mouse configuration tool), not the TTS engine.
+# Point it at the `piper-tts` console script (e.g. a venv's `bin/piper`).
+#
+# Every value has a safe default, so text and card posts need no media config at
+# all; the video format is likewise gated by the persona policy
+# (`publishing.formats.video`, default 0) and the warming ramp.
+
+piper:
+  # The `piper-tts` binary. A bare name is resolved through PATH; use an absolute
+  # path to avoid the libratbag collision.
+  binary: piper
+  # Voice model (`.onnx`); Piper finds the matching `.json` next to it.
+  model: ""
+  # Optional pacing. `length_scale` higher than 1.0 is slower.
+  # length_scale: 1.0
+  # sentence_silence: 0.1
+
+# Still-image motion per scene: static | kenburns.
+motion: static
+
+# Directory holding one PNG per scene, named `<scene_index>.png`. Without real
+# stills a live render aborts and the slot degrades to text; the GPU image source
+# (ComfyUI behind the `hl-infer` lease, HB-036) is not implemented yet.
+# scene_images: var/media/scenes
