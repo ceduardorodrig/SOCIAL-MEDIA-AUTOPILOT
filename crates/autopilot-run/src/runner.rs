@@ -13,7 +13,9 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use autopilot_core::{PersonaPack, Platform, load_persona, now_unix};
 use autopilot_guardrail::{Verdict, evaluate};
-use autopilot_harvest::{SearxngClient, Topic};
+use autopilot_harvest::{
+    ARTICLE_TIMEOUT, MAX_SOURCE_CHARS, SearxngClient, Topic, fetch_article_text,
+};
 use autopilot_pipeline::{
     EditorOutcome, Source, TopicScore, Variant, build_creation_prompt, build_editor_prompt,
     build_grounding_prompt, build_triage_prompt, kept_variants, parse_editor_response,
@@ -448,16 +450,56 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         return Ok(report);
     };
 
-    // The source travels with the topic. Until 12/10 the create stage wrote from
-    // the title alone, so the body came from the model's memory; the harvest had
-    // already read the page, and that text is what a post may cite.
-    let source = topics
+    // The source travels with the topic. The harvest snippet is one or two
+    // sentences — too thin to write against, which made the [3.7] review refuse
+    // every draft (verified 2026-10-13: nothing was published) — so fetch the
+    // **article body** once, for the selected topic only, and fall back to the
+    // snippet when the fetch fails.
+    let candidate = topics
         .iter()
-        .find(|candidate| candidate.title == topic_title)
-        .map(|candidate| Source {
-            url: &candidate.url,
-            content: &candidate.content,
-        });
+        .find(|candidate| candidate.title == topic_title);
+    let source_text = match candidate {
+        Some(candidate) => {
+            match fetch_article_text(&candidate.url, ARTICLE_TIMEOUT, MAX_SOURCE_CHARS).await {
+                Ok(article) => {
+                    record(
+                        &mut report,
+                        &journal,
+                        StageOutcome::new(
+                            "source",
+                            StageStatus::Ok,
+                            format!(
+                                "fetched {} chars from {} (the snippet was {})",
+                                article.chars().count(),
+                                candidate.url,
+                                candidate.content.chars().count()
+                            ),
+                        ),
+                    )
+                    .await?;
+                    article
+                }
+                Err(err) => {
+                    record(
+                        &mut report,
+                        &journal,
+                        StageOutcome::new(
+                            "source",
+                            StageStatus::Skipped,
+                            format!("article fetch failed — using the snippet: {err:#}"),
+                        ),
+                    )
+                    .await?;
+                    candidate.content.clone()
+                }
+            }
+        }
+        None => String::new(),
+    };
+    let source = candidate.map(|candidate| Source {
+        url: &candidate.url,
+        content: &source_text,
+    });
 
     let drafts = stage_create(
         &mut report,

@@ -7,6 +7,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Default SearXNG endpoint (kavure, tailnet).
+pub mod article;
+
+pub use article::{ARTICLE_TIMEOUT, MAX_SOURCE_CHARS, fetch_article_text, html_to_text};
+
 pub const DEFAULT_SEARXNG_ENDPOINT: &str = "http://100.124.146.77:8080";
 
 fn default_engine() -> String {
