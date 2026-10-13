@@ -1163,18 +1163,23 @@ async fn stage_grounding<'a>(
     source: Option<Source<'_>>,
     registry: &autopilot_providers::ProvidersConfig,
 ) -> Result<Vec<(Platform, &'a Variant)>> {
+    // Fail-closed, exactly like a review that cannot run: without a source there
+    // is nothing to verify the drafts against, so releasing them would be the
+    // very fabrication this gate exists to stop. Silence costs one slot; a
+    // fabrication costs credibility — the promise is "no source, no publish".
     let Some(source) = source else {
+        report.failed = true;
         record(
             report,
             journal,
             StageOutcome::new(
                 "grounding",
-                StageStatus::Skipped,
-                "no source text for this topic — nothing to check the drafts against",
+                StageStatus::Error,
+                "no source text for this topic — every draft withheld (fail-closed)",
             ),
         )
         .await?;
-        return Ok(approved.to_vec());
+        return Ok(Vec::new());
     };
 
     let mut platforms: Vec<Platform> = Vec::new();
@@ -1948,6 +1953,67 @@ mod tests {
         assert!(
             event.get("changes").is_none(),
             "a skipped review carries no change list: {event}"
+        );
+
+        tokio::fs::remove_file(&journal_path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn the_create_path_withholds_every_draft_when_there_is_no_source() {
+        // HB-041: the documented contract is fail-closed — "no review, no
+        // publish". A topic the harvest could not resolve to a source has
+        // nothing to verify against, so it must be withheld, never released
+        // unverified (the fabrication this gate exists to stop).
+        let journal_path = std::env::temp_dir().join(format!(
+            "autopilot-grounding-nosource-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_file(&journal_path).await;
+
+        let journal = Journal::new("run-test", "demo", journal_path.clone());
+        let mut report = RunReport {
+            run_id: "run-test".into(),
+            persona: "demo".into(),
+            dry_run: false,
+            journal: journal_path.clone(),
+            stages: Vec::new(),
+            published: Vec::new(),
+            failed: false,
+        };
+        // An empty chain would fail if the gate tried to call it; with no source
+        // it must short-circuit and withhold without a provider at all.
+        let registry = autopilot_providers::ProvidersConfig {
+            providers: Vec::new(),
+        };
+        let a = variant("A", "O cérebro gasta 20% da energia do corpo em repouso.");
+        let approved = vec![(Platform::Bluesky, &a)];
+
+        let kept = stage_grounding(&mut report, &journal, &approved, None, &registry)
+            .await
+            .expect("no source is a clean, fail-closed stop, not an error");
+
+        assert!(
+            kept.is_empty(),
+            "fail-closed: nothing is published without a source"
+        );
+        assert!(
+            report.failed,
+            "a withheld publish must not look like a clean run"
+        );
+
+        let raw = tokio::fs::read_to_string(&journal_path)
+            .await
+            .expect("journal written");
+        let event: serde_json::Value =
+            serde_json::from_str(raw.lines().next().unwrap_or("{}")).expect("valid journal JSON");
+        assert_eq!(event["stage"], "grounding");
+        assert_eq!(event["status"], "error");
+        assert!(
+            event["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("fail-closed"),
+            "the journal must say the drafts were withheld: {event}"
         );
 
         tokio::fs::remove_file(&journal_path).await.ok();
