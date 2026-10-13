@@ -81,6 +81,10 @@ pub const PENALTY_EMOJI_OVERLOAD: f64 = 0.10;
 /// Guardrail rejection: the guardrail is the authority on safety, so this is
 /// stronger than any single tell (0.50) and always sinks a text below the floor.
 pub const PENALTY_GUARDRAIL_REJECTED: f64 = 0.5;
+/// Grounding rejection: the [3.7] reviewer refused the draft because the source
+/// did not support a claim. Like the guardrail, it is an authority verdict, so
+/// it weighs the same (0.50) — the memory records the *claim*, not a wording.
+pub const PENALTY_GROUNDING_REJECTED: f64 = 0.5;
 
 /// Tunables for the craft heuristics. All values have safe defaults.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -223,6 +227,19 @@ pub fn guardrail_penalty(reason: &str) -> CraftPenalty {
     }
 }
 
+/// A penalty representing a [3.7] grounding rejection (never a craft heuristic).
+///
+/// The evidence is the **claim** the reviewer named, not the draft text: the
+/// memory must capture the kind of assertion the source did not support, so the
+/// creation stage can avoid repeating it (HB-046).
+pub fn grounding_penalty(claim: &str) -> CraftPenalty {
+    CraftPenalty {
+        rule: "grounding-rejected".to_string(),
+        penalty: PENALTY_GROUNDING_REJECTED,
+        evidence: claim.to_string(),
+    }
+}
+
 /// Score one post against the craft heuristics.
 ///
 /// `recent` is the persona's recent posts, **most recent first**; only the first
@@ -314,6 +331,31 @@ pub fn avoid_entries_with_rejections(
     let mut entries = avoid_entries(texts, config);
     for text in rejected {
         let penalty = guardrail_penalty(&format!("guardrail rejected: \"{}\"", snippet(text)));
+        if let Some(entry) = unique_entry(&entries, penalty.into()) {
+            entries.push(entry);
+        }
+        if entries.len() >= DEFAULT_MAX_AVOID {
+            break;
+        }
+    }
+    entries
+}
+
+/// The full avoid memory: craft penalties, guardrail rejections and the claims
+/// the [3.7] grounding reviewer refused.
+///
+/// The grounding refusals are recorded as *kinds of claim* (the reviewer's
+/// reason, verbatim), so the creation stage is warned off the assertion that was
+/// not grounded instead of rediscovering it every slot (HB-046).
+pub fn avoid_entries_with_verdicts(
+    texts: &[&str],
+    guardrail_rejected: &[&str],
+    grounding_rejected: &[&str],
+    config: &CraftConfig,
+) -> Vec<AvoidEntry> {
+    let mut entries = avoid_entries_with_rejections(texts, guardrail_rejected, config);
+    for claim in grounding_rejected {
+        let penalty = grounding_penalty(claim);
         if let Some(entry) = unique_entry(&entries, penalty.into()) {
             entries.push(entry);
         }
@@ -950,5 +992,30 @@ mod tests {
         );
         assert!(!sloppy.meets(config().craft_floor));
         assert!(craft_score("A clean short note.", &[], &config()).meets(config().craft_floor));
+    }
+
+    #[test]
+    fn grounding_refusals_become_avoid_entries_as_claims() {
+        let claim = "Claims the agent is 'inspectable, not someone's cloud API' — the source \
+                     never says whether it is local or cloud-based.";
+        let entries = avoid_entries_with_verdicts(&[], &[], &[claim], &config());
+        let grounding = entries
+            .iter()
+            .find(|entry| entry.rule == "grounding-rejected")
+            .expect("the refusal is recorded");
+        // The evidence is the claim itself, not a snippet of a post.
+        assert_eq!(grounding.evidence, claim);
+        assert_eq!(grounding.penalty, PENALTY_GROUNDING_REJECTED);
+    }
+
+    #[test]
+    fn identical_grounding_refusals_are_not_duplicated() {
+        let claim = "invents a version number";
+        let entries = avoid_entries_with_verdicts(&[], &[], &[claim, claim], &config());
+        let count = entries
+            .iter()
+            .filter(|entry| entry.rule == "grounding-rejected")
+            .count();
+        assert_eq!(count, 1);
     }
 }

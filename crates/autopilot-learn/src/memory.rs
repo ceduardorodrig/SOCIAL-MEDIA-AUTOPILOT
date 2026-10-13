@@ -11,7 +11,7 @@ use autopilot_core::Platform;
 use autopilot_metrics::MetricsRecord;
 use serde::{Deserialize, Serialize};
 
-use crate::craft::{AvoidEntry, CraftConfig, avoid_entries_with_rejections, craft_score_guarded};
+use crate::craft::{AvoidEntry, CraftConfig, avoid_entries_with_verdicts, craft_score_guarded};
 use crate::score::{AbOutcome, VariantStats, weighted_score};
 
 /// How many winning posts to carry forward as few-shot examples.
@@ -24,7 +24,8 @@ const SECONDS_PER_DAY: u64 = 86_400;
 const SECONDS_PER_HOUR: u64 = 3_600;
 
 /// Context that shapes a memory proposal: the craft tunables plus the texts the
-/// guardrail already rejected, when the caller has that verdict.
+/// guardrail already rejected and the claims the grounding review refused, when
+/// the caller has those verdicts.
 #[derive(Debug, Clone, Copy)]
 pub struct ProposalContext<'a> {
     /// Craft tunables (penalty magnitudes are constants; floor/base are here).
@@ -32,6 +33,10 @@ pub struct ProposalContext<'a> {
     /// Texts the guardrail rejected. They are never promoted and are recorded in
     /// the avoid memory. Empty when the caller has no guardrail verdict.
     pub guardrail_rejected: &'a [&'a str],
+    /// Claims the [3.7] grounding review refused because the source did not
+    /// support them. They are recorded in the avoid memory as *kinds of claim*
+    /// so the creation stage avoids repeating them (HB-046).
+    pub grounding_rejected: &'a [&'a str],
 }
 
 impl ProposalContext<'static> {
@@ -40,6 +45,7 @@ impl ProposalContext<'static> {
         Self {
             config,
             guardrail_rejected: &[],
+            grounding_rejected: &[],
         }
     }
 }
@@ -144,7 +150,12 @@ pub fn propose_memory_with_context(
         .map(|winner| winning_texts(records, winner, max_few_shot, &corpus, context))
         .unwrap_or_default();
 
-    let avoid = avoid_entries_with_rejections(&corpus, context.guardrail_rejected, &context.config);
+    let avoid = avoid_entries_with_verdicts(
+        &corpus,
+        context.guardrail_rejected,
+        context.grounding_rejected,
+        &context.config,
+    );
 
     let schedule_hints = outcome
         .winner
@@ -216,6 +227,37 @@ pub fn render_memory(update: &MemoryUpdate) -> Result<String> {
 pub async fn write_memory(path: &Path, update: &MemoryUpdate) -> Result<()> {
     let body = render_memory(update)?;
     autopilot_core::store::write_text(path, &body, "memory").await
+}
+
+/// Read a persisted memory proposal, or `None` when no file exists yet.
+///
+/// The engine reads this back before the creation stage so the avoid memory it
+/// proposed actually warns the next draft (HB-046). A missing file is normal
+/// (nothing learned yet); a malformed one is an error the caller decides on.
+pub async fn read_memory(path: &Path) -> Result<Option<MemoryUpdate>> {
+    let raw = match tokio::fs::read_to_string(path).await {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading memory {}", path.display()));
+        }
+    };
+    let update: MemoryUpdate = serde_yaml_ng::from_str(&raw)
+        .with_context(|| format!("parsing memory {}", path.display()))?;
+    Ok(Some(update))
+}
+
+/// The creation-stage warnings carried by a memory proposal.
+///
+/// One line per avoid entry: the rule that fired and its evidence. For a
+/// grounding refusal the evidence is the unsupported claim itself, so the
+/// creation prompt is warned off the *claim*, not a wording (HB-046).
+pub fn avoid_warnings(update: &MemoryUpdate) -> Vec<String> {
+    update
+        .avoid
+        .iter()
+        .map(|entry| format!("{}: {}", entry.rule, entry.evidence))
+        .collect()
 }
 
 /// Non-empty, de-duplicated texts of the winning variant that are clean **and**
@@ -567,6 +609,7 @@ mod tests {
         let context = ProposalContext {
             config: CraftConfig::default(),
             guardrail_rejected: &[text],
+            grounding_rejected: &[],
         };
         let update = propose_memory_with_context(
             &records,
@@ -592,5 +635,87 @@ mod tests {
             "avoid: {:?}",
             update.avoid
         );
+    }
+
+    #[test]
+    fn a_grounding_refusal_lands_in_the_avoid_memory_as_a_claim() {
+        // The evidence is the *claim* the reviewer named, not a snippet of a
+        // post — that is what makes the memory teach the creation stage (HB-046).
+        let claim = "Claims the agent is 'inspectable, not someone's cloud API' — the source \
+                     never says whether KylinBot/Xiao K is local/inspectable or cloud-based.";
+        let records = vec![
+            record_text("A", "A clean line about the kernel.", 1, 0, 0, 0),
+            record_text("B", "Another clean line about Rust.", 9, 0, 0, 0),
+        ];
+        let outcome = outcome_for(&records);
+        let context = ProposalContext {
+            config: CraftConfig::default(),
+            guardrail_rejected: &[],
+            grounding_rejected: &[claim],
+        };
+        let update = propose_memory_with_context(
+            &records,
+            "p",
+            Platform::Bluesky,
+            &outcome,
+            DEFAULT_MAX_FEW_SHOT,
+            0,
+            &context,
+        );
+
+        let grounding = update
+            .avoid
+            .iter()
+            .find(|entry| entry.rule == "grounding-rejected")
+            .expect("the refusal is recorded in the avoid memory");
+        assert_eq!(grounding.evidence, claim);
+    }
+
+    #[tokio::test]
+    async fn memory_round_trips_and_yields_avoid_warnings() {
+        let claim = "invents a version number the source never states";
+        let update = MemoryUpdate {
+            persona: "p".into(),
+            generated_at_unix: 1,
+            platform: Platform::Bluesky,
+            winner: None,
+            min_samples: 1,
+            variants: vec![],
+            few_shot: vec![],
+            avoid: vec![AvoidEntry {
+                rule: "grounding-rejected".into(),
+                penalty: 0.5,
+                evidence: claim.into(),
+            }],
+            schedule_hints: vec![],
+            reason: "test".into(),
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "autopilot-memory-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        let path = dir.join("p.yaml");
+
+        write_memory(&path, &update).await.expect("write");
+        let read = read_memory(&path).await.expect("read").expect("present");
+        assert_eq!(read.avoid, update.avoid);
+        assert_eq!(
+            avoid_warnings(&read),
+            vec![format!("grounding-rejected: {claim}")]
+        );
+
+        tokio::fs::remove_dir_all(&dir).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_missing_memory_file_reads_as_none() {
+        let path = std::env::temp_dir().join("autopilot-memory-absent.yaml");
+        assert!(read_memory(&path).await.expect("reads").is_none());
     }
 }

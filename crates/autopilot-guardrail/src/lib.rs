@@ -150,7 +150,7 @@ fn fold_accent(character: char) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autopilot_core::{Channel, Rubric, Voice};
+    use autopilot_core::{Channel, PublishingPolicy, Rubric, Voice};
 
     fn persona() -> PersonaPack {
         PersonaPack {
@@ -180,6 +180,7 @@ mod tests {
                 posts_per_day: 1,
                 windows: vec![],
             }],
+            publishing: PublishingPolicy::default(),
         }
     }
 

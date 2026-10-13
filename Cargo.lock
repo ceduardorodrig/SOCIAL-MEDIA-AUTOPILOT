@@ -243,6 +243,7 @@ dependencies = [
  "autopilot-core",
  "autopilot-guardrail",
  "autopilot-harvest",
+ "autopilot-learn",
  "autopilot-pipeline",
  "autopilot-providers",
  "autopilot-publish",

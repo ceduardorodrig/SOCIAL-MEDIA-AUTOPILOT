@@ -24,6 +24,7 @@ async fn dry_run_walks_every_stage_without_side_effects() {
         // A path that does not exist proves the dry run never reads the registry.
         config_path: PathBuf::from("tests/fixtures/does-not-exist.yaml"),
         journal_path: Some(journal.clone()),
+        memory_path: None,
         dry_run: true,
         card: CardAttachment::Off,
     };
@@ -80,6 +81,7 @@ async fn a_draft_persona_is_never_executed_for_real() {
         platform: None,
         config_path: PathBuf::from("tests/fixtures/does-not-exist.yaml"),
         journal_path: Some(journal.clone()),
+        memory_path: None,
         dry_run: false,
         card: CardAttachment::Off,
     };

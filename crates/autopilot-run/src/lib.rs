@@ -17,7 +17,10 @@
 pub mod journal;
 pub mod runner;
 
-pub use journal::{Journal, JournalEvent, PublishedEntry, read_published};
+pub use journal::{
+    GroundingRejection, Journal, JournalEvent, PublishedEntry, read_grounding_rejections,
+    read_published,
+};
 pub use runner::{
     CardAttachment, PublishedPost, RunOptions, RunReport, StageOutcome, StageStatus,
     humanize_niche, partition_variants, resolve_channels, run, select_topic, select_variants,

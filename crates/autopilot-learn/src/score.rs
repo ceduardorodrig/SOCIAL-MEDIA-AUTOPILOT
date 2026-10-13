@@ -456,4 +456,36 @@ mod tests {
         assert_eq!(stats.baseline_samples, 2);
         assert_eq!(stats.delta, 0.0);
     }
+
+    #[test]
+    fn comparison_groups_posts_by_variant_across_slots() {
+        // Sequential A/B (HB-040): a slot publishes ONE variant, so each
+        // variant's samples arrive over different slots. The comparison must
+        // aggregate by variant across that timeline — not compare two posts of
+        // a single run — and hold the per-variant minimum-sample guard.
+        let records = vec![
+            crate::test_support::record_at("A", 6, 4, 0, 0, 0),
+            crate::test_support::record_at("B", 18, 10, 0, 0, 0),
+            crate::test_support::record_at("A", 6, 6, 0, 0, 0),
+            crate::test_support::record_at("B", 18, 20, 0, 0, 0),
+        ];
+        let outcome = compare_variants(&records, 2);
+        assert_eq!(outcome.winner.as_deref(), Some("B"));
+        let a = outcome
+            .variants
+            .iter()
+            .find(|stats| stats.variant == "A")
+            .expect("A has stats");
+        assert_eq!(
+            a.samples, 2,
+            "both A posts, from different slots, are one variant"
+        );
+        assert_eq!(a.score, 5.0);
+
+        // One sample short of the guard: a single slot is not evidence, however
+        // strong the leading post looked.
+        let guarded = compare_variants(&records[..3], 2);
+        assert_eq!(guarded.winner, None);
+        assert!(guarded.reason.contains("below the minimum"));
+    }
 }

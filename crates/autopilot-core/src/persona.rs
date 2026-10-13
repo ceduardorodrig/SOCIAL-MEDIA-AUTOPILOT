@@ -21,6 +21,51 @@ fn default_min_score() -> f32 {
     0.75
 }
 
+fn default_variants_per_slot() -> usize {
+    1
+}
+
+/// How a slot chooses among a platform's approved variants.
+///
+/// The A/B comparison is **sequential** (`scoring-model.md`, HB-040): a slot
+/// releases one variant and the alternative waits for a future slot. How the
+/// slot picks is data, not a constant, so a persona can change it without a
+/// code change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SelectionRule {
+    /// Rotate per slot so consecutive slots alternate between the variants.
+    #[default]
+    Alternate,
+    /// Always take the first approved variant (deterministic, no rotation).
+    First,
+}
+
+/// How many variants a slot releases per platform and how it picks them.
+///
+/// The default is the owner-approved sequential policy: **one** variant per
+/// slot, rotating. Raising `variants_per_slot` publishes several look-alike
+/// posts in the same minute (the behaviour the redesign removed), so it is an
+/// explicit, deliberate opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishingPolicy {
+    /// How many approved variants one platform publishes per slot (at least 1).
+    #[serde(default = "default_variants_per_slot")]
+    pub variants_per_slot: usize,
+    /// How the slot picks among the approved variants.
+    #[serde(default)]
+    pub selection: SelectionRule,
+}
+
+impl Default for PublishingPolicy {
+    fn default() -> Self {
+        Self {
+            variants_per_slot: default_variants_per_slot(),
+            selection: SelectionRule::default(),
+        }
+    }
+}
+
 /// A complete persona definition: identity, voice, guardrails and channels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaPack {
@@ -45,6 +90,9 @@ pub struct PersonaPack {
     pub rubric: Rubric,
     /// One persona drives one or many platform channels.
     pub channels: Vec<Channel>,
+    /// How a slot selects and how many variants it releases (sequential A/B).
+    #[serde(default)]
+    pub publishing: PublishingPolicy,
 }
 
 /// Tone of voice and writing constraints.
@@ -178,6 +226,12 @@ impl PersonaPack {
                 problem: "at least one enabled channel is required".into(),
             });
         }
+        if self.publishing.variants_per_slot == 0 {
+            issues.push(ValidationIssue {
+                field: "publishing.variants_per_slot".into(),
+                problem: "variants_per_slot must be at least 1".into(),
+            });
+        }
         if self.active {
             for channel in &self.channels {
                 if channel.enabled && channel.handle.trim().is_empty() {
@@ -261,6 +315,7 @@ mod tests {
                 posts_per_day: 1,
                 windows: vec![],
             }],
+            publishing: PublishingPolicy::default(),
         }
     }
 
@@ -299,5 +354,33 @@ mod tests {
         pack.rubric.criteria[0].weight = 0.5;
         let issues = pack.validate();
         assert!(issues.iter().any(|i| i.field == "rubric.criteria"));
+    }
+
+    #[test]
+    fn publishing_policy_defaults_to_one_alternating_variant() {
+        let policy = PublishingPolicy::default();
+        assert_eq!(policy.variants_per_slot, 1);
+        assert_eq!(policy.selection, SelectionRule::Alternate);
+    }
+
+    #[test]
+    fn a_slot_must_release_at_least_one_variant() {
+        let mut pack = base_pack();
+        pack.publishing.variants_per_slot = 0;
+        let issues = pack.validate();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.field == "publishing.variants_per_slot")
+        );
+    }
+
+    #[test]
+    fn an_absent_publishing_block_uses_the_sequential_default() {
+        // The policy is data with a safe default: an older pack without the
+        // block must still parse as one variant per slot, alternating.
+        let yaml = "persona: demo\nniche: science\nvoice:\n  tone: curious\n  audience: adults\nrubric:\n  min_score: 0.75\nchannels:\n  - platform: bluesky\n    handle: demo\n    enabled: true\n";
+        let pack: PersonaPack = serde_yaml_ng::from_str(yaml).expect("parses");
+        assert_eq!(pack.publishing, PublishingPolicy::default());
     }
 }

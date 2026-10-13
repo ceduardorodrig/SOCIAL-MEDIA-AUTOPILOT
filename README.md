@@ -145,13 +145,17 @@ autopilot metrics collect \
   --store var/metrics.jsonl
 
 # Stage [6] — learning: score the A/B variants and propose a persona memory update.
-# Without `--write` it only prints the proposal; the persona pack is never rewritten silently.
+# It also reads the run journals (`--runs-dir`, default `var/runs`) so the [3.7]
+# grounding refusals feed the "avoid" memory, and `autopilot run` reads that
+# proposal back (default `var/learn/<slug>.json`) to warn the creation stage off
+# the claims it already refused. Without `--write` it only prints the proposal;
+# the persona pack is never rewritten silently.
 autopilot learn run \
   --persona personas/ciencia-curiosidades.yaml \
   --platform bluesky \
   --metrics var/metrics.jsonl \
   --min-samples 2 \
-  --write var/memory/ciencia-curiosidades.yaml
+  --write var/learn/ciencia-curiosidades.json
 ```
 
 Publishing credentials come from the environment (SOPS store), never from the repository:

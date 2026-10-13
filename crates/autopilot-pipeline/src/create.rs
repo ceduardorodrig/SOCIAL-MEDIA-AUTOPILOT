@@ -50,11 +50,30 @@ struct Wrapper {
 }
 
 /// Build the creation prompt for one platform and topic.
+///
+/// No avoid memory: the plain creation path. Use
+/// [`build_creation_prompt_with_avoid`] when the learning stage has warnings.
 pub fn build_creation_prompt(
     persona: &PersonaPack,
     platform: Platform,
     topic: &str,
     source: Option<Source<'_>>,
+) -> String {
+    build_creation_prompt_with_avoid(persona, platform, topic, source, &[])
+}
+
+/// Build the creation prompt, warned off claims the grounding review refused.
+///
+/// `avoid` carries the learning stage's "avoid" memory (HB-046): claims the
+/// [3.7] reviewer refused because the source did not support them, plus the
+/// shape/openings the craft score penalised. The creation stage is told never
+/// to repeat them, so the same unsupported claim is not rediscovered every slot.
+pub fn build_creation_prompt_with_avoid(
+    persona: &PersonaPack,
+    platform: Platform,
+    topic: &str,
+    source: Option<Source<'_>>,
+    avoid: &[String],
 ) -> String {
     let guidelines = render_guidelines(persona);
     let banned = render_banned_phrases(persona);
@@ -76,6 +95,22 @@ pub fn build_creation_prompt(
             .to_string(),
     };
 
+    // The [3.7] reviewer's refusals are learned, not just gated: a claim the
+    // source did not support must not be rediscovered on the next slot.
+    let avoid_block = if avoid.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nClaims and shapes a reviewer already refused — never repeat them, or anything\n\
+             like them (each was either unsupported by a source or penalised as slop):\n{}\n",
+            avoid
+                .iter()
+                .map(|claim| format!("- {claim}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+
     format!(
         "You are the creation stage of an autonomous social-media engine.\n\
          Write in {language} for the platform `{platform}`.\n\n\
@@ -86,7 +121,8 @@ pub fn build_creation_prompt(
          Never use these phrases: {banned}\n\
          Never touch these topics: {blocklist}\n\n\
          Topic to write about: {topic}\n\n\
-         {grounding}\n\n\
+         {grounding}\n\
+         {avoid_block}\n\
          Produce exactly 2 alternative variants (A and B) that could be A/B tested.\n\
          Each caption must respect the platform limit of {limit} characters and use at most\n\
          {max_tags} hashtags. Also propose a short image prompt for each variant.\n\n\
@@ -108,6 +144,7 @@ pub fn build_creation_prompt(
         blocklist = persona.blocklist.join("; "),
         topic = topic,
         grounding = grounding,
+        avoid_block = avoid_block,
         limit = platform_limit(platform),
         max_tags = persona.voice.max_hashtags,
     )
@@ -191,5 +228,36 @@ mod tests {
     #[test]
     fn empty_variant_list_is_an_error() {
         assert!(parse_variants("[]").is_err());
+    }
+
+    #[test]
+    fn the_prompt_warns_off_claims_the_reviewer_refused() {
+        let avoid = vec![
+            "grounding-rejected: Claims the agent is 'inspectable, not someone's cloud API' — \
+             the source never says whether KylinBot/Xiao K is local/inspectable or cloud-based."
+                .to_string(),
+        ];
+        let prompt = build_creation_prompt_with_avoid(
+            &persona(),
+            Platform::Bluesky,
+            "o cérebro gasta energia",
+            None,
+            &avoid,
+        );
+        assert!(prompt.contains("never repeat them"));
+        assert!(prompt.contains("inspectable, not someone's cloud API"));
+    }
+
+    #[test]
+    fn the_plain_prompt_carries_no_avoid_block() {
+        let prompt = build_creation_prompt(
+            &persona(),
+            Platform::Bluesky,
+            "o cérebro gasta energia",
+            None,
+        );
+        assert!(!prompt.contains("never repeat them"));
+        // The original constraint block is untouched.
+        assert!(prompt.contains("Produce exactly 2 alternative variants"));
     }
 }

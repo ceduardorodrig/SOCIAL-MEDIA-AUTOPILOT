@@ -10,8 +10,8 @@ use autopilot_engage::{EngageOptions, EngageReport};
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{DEFAULT_SEARXNG_ENDPOINT, SearxngClient};
 use autopilot_learn::{
-    DEFAULT_MAX_FEW_SHOT, DEFAULT_MIN_SAMPLES, compare_variants, propose_memory, render_memory,
-    write_memory,
+    CraftConfig, DEFAULT_MAX_FEW_SHOT, DEFAULT_MIN_SAMPLES, ProposalContext, compare_variants,
+    propose_memory_with_context, render_memory, write_memory,
 };
 use autopilot_metrics::{
     BlueskyMetrics, DEFAULT_BLUESKY_READ_URL, DEFAULT_METRICS_TIMEOUT, MetricsRecord,
@@ -154,6 +154,11 @@ struct RunArgs {
     /// Journal file (defaults to `var/runs/<run-id>.jsonl`).
     #[arg(long)]
     journal: Option<PathBuf>,
+    /// Persisted memory proposal to read the "avoid" warnings from (defaults to
+    /// `var/learn/<persona>.json`): the creation stage is warned off claims the
+    /// grounding review already refused.
+    #[arg(long)]
+    memory: Option<PathBuf>,
     /// Attach a generated post card to Bluesky posts: off, prompted (only when
     /// the variant carries an image prompt) or always.
     #[arg(long, value_parser = parse_card_attachment, default_value = "off")]
@@ -439,6 +444,10 @@ enum LearnCommand {
         /// JSONL store written by the metrics stage.
         #[arg(long, default_value = "var/metrics.jsonl")]
         metrics: PathBuf,
+        /// Run journals read for the [3.7] grounding refusals to feed the avoid
+        /// memory (defaults to `var/runs`).
+        #[arg(long, default_value = "var/runs")]
+        runs_dir: PathBuf,
         /// Minimum samples per variant before the comparison is conclusive.
         #[arg(long, default_value_t = DEFAULT_MIN_SAMPLES)]
         min_samples: usize,
@@ -617,6 +626,7 @@ async fn run_autopilot(args: RunArgs) -> Result<ExitCode> {
         platform: args.platform,
         config_path: args.config,
         journal_path: args.journal,
+        memory_path: args.memory,
         dry_run: args.dry_run,
         card: args.attach_card,
     };
@@ -1166,23 +1176,36 @@ async fn run_metrics(command: MetricsCommand) -> Result<ExitCode> {
     }
 }
 
+/// The samples that belong to one persona and platform.
+///
+/// The metrics store is shared across personas, and sequential A/B compares a
+/// variant over time — so filtering by variant alone must never merge two
+/// personas' posts into one comparison (`scoring-model.md` §3, HB-040).
+fn records_for(
+    records: Vec<MetricsRecord>,
+    persona: &str,
+    platform: Platform,
+) -> Vec<MetricsRecord> {
+    records
+        .into_iter()
+        .filter(|record| record.persona == persona && record.platform == platform)
+        .collect()
+}
+
 async fn run_learn(command: LearnCommand) -> Result<ExitCode> {
     match command {
         LearnCommand::Run {
             persona,
             platform,
             metrics,
+            runs_dir,
             min_samples,
             max_few_shot,
             write,
             dry_run,
         } => {
             let pack = load_persona(&persona).await?;
-            let records: Vec<MetricsRecord> = read_metrics(&metrics)
-                .await?
-                .into_iter()
-                .filter(|record| record.platform == platform)
-                .collect();
+            let records = records_for(read_metrics(&metrics).await?, &pack.persona, platform);
             if records.is_empty() {
                 println!(
                     "no metrics for {} in {} — nothing to learn yet",
@@ -1191,18 +1214,42 @@ async fn run_learn(command: LearnCommand) -> Result<ExitCode> {
                 );
             }
 
+            // HB-046: the [3.7] grounding reviewer's refusals must teach, not
+            // just gate. Read them from the run journals (the metrics store does
+            // not carry them) and feed the *claims* into the avoid memory, so the
+            // creation stage is warned off what the source did not support.
+            let rejections = autopilot_run::read_grounding_rejections(&runs_dir).await?;
+            let claims: Vec<String> = rejections
+                .iter()
+                .filter(|rejection| {
+                    rejection.persona == pack.persona && rejection.platform == platform.as_str()
+                })
+                .map(|rejection| rejection.reason.clone())
+                .collect();
+            let claim_refs: Vec<&str> = claims.iter().map(String::as_str).collect();
+            let context = ProposalContext {
+                config: CraftConfig::default(),
+                guardrail_rejected: &[],
+                grounding_rejected: &claim_refs,
+            };
+
             let outcome = compare_variants(&records, min_samples);
-            let update = propose_memory(
+            let update = propose_memory_with_context(
                 &records,
                 &pack.persona,
                 platform,
                 &outcome,
                 max_few_shot,
                 now_unix(),
+                &context,
             );
 
             println!("--- proposed memory update ---");
             print!("{}", render_memory(&update)?);
+            println!(
+                "grounding: {} refusal(s) fed into the avoid memory",
+                claim_refs.len()
+            );
             println!("outcome : {}", update.reason);
 
             match (dry_run, write) {
@@ -1293,4 +1340,45 @@ fn print_engage_report(report: &EngageReport) {
         );
     }
     println!("result   : {} action(s) executed", report.executed.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(persona: &str, platform: Platform) -> MetricsRecord {
+        MetricsRecord::from_post(
+            platform,
+            &autopilot_metrics::PostMetrics {
+                uri: format!("at://{persona}"),
+                text: "corpo".into(),
+                likes: 1,
+                replies: 0,
+                reposts: 0,
+                quotes: 0,
+            },
+            RecordContext {
+                captured_at_unix: 1,
+                persona: persona.into(),
+                variant: "A".into(),
+                topic: "t".into(),
+                published_at_unix: None,
+            },
+        )
+    }
+
+    #[test]
+    fn records_for_keeps_only_one_persona_and_platform() {
+        // Sequential A/B compares a variant over time, so two personas' posts
+        // must never land in the same comparison (the store is shared).
+        let records = vec![
+            sample("a", Platform::Bluesky),
+            sample("b", Platform::Bluesky),
+            sample("a", Platform::X),
+        ];
+        let kept = records_for(records, "a", Platform::Bluesky);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].persona, "a");
+        assert_eq!(kept[0].platform, Platform::Bluesky);
+    }
 }

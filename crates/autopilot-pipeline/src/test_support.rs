@@ -4,7 +4,7 @@
 //! fixture lives here once; a test overrides only the fields it cares about
 //! (the repository enforces DRY across test code too).
 
-use autopilot_core::{Channel, PersonaPack, Platform, Rubric, Voice};
+use autopilot_core::{Channel, PersonaPack, Platform, PublishingPolicy, Rubric, Voice};
 
 /// A minimal, valid persona pack for the stage tests.
 pub(crate) fn sample_persona() -> PersonaPack {
@@ -35,6 +35,7 @@ pub(crate) fn sample_persona() -> PersonaPack {
             posts_per_day: 1,
             windows: vec![],
         }],
+        publishing: PublishingPolicy::default(),
     }
 }
 

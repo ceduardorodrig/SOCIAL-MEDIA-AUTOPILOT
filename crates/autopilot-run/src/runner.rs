@@ -7,19 +7,22 @@
 //! partition) are separated from the effectful calls so they can be unit-tested
 //! without any network.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use autopilot_core::{PersonaPack, Platform, load_persona, now_unix};
+use autopilot_core::{
+    PersonaPack, Platform, PublishingPolicy, SelectionRule, load_persona, now_unix,
+};
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{
     ARTICLE_TIMEOUT, MAX_SOURCE_CHARS, SearxngClient, Topic, fetch_article_text,
 };
 use autopilot_pipeline::{
-    EditorOutcome, Source, TopicScore, Variant, build_creation_prompt, build_editor_prompt,
-    build_grounding_prompt, build_triage_prompt, kept_variants, parse_editor_response,
-    parse_grounding, parse_shortlist, parse_variants, review_or_keep, supported_labels,
+    EditorOutcome, Source, TopicScore, Variant, build_creation_prompt_with_avoid,
+    build_editor_prompt, build_grounding_prompt, build_triage_prompt, kept_variants,
+    parse_editor_response, parse_grounding, parse_shortlist, parse_variants, review_or_keep,
+    supported_labels,
 };
 use autopilot_providers::{JobKind, complete_with_chain, load_config};
 use autopilot_publish::{
@@ -96,6 +99,11 @@ pub struct RunOptions {
     pub config_path: PathBuf,
     /// Journal file (defaults to `var/runs/<run-id>.jsonl`).
     pub journal_path: Option<PathBuf>,
+    /// The persona's persisted memory proposal to read the "avoid" warnings
+    /// from (defaults to `var/learn/<persona>.json`, where `autopilot learn run
+    /// --write` puts it). The creation stage is warned off claims the [3.7]
+    /// reviewer already refused (HB-046).
+    pub memory_path: Option<PathBuf>,
     /// When set, no LLM call, no GPU work, no network and no publish happen.
     pub dry_run: bool,
     /// Whether a generated post card is attached to the published post.
@@ -148,6 +156,10 @@ pub struct StageOutcome {
     /// The web URL is not enough to collect metrics later: the API needs
     /// `at://did/app.bsky.feed.post/<rkey>`.
     pub uri: Option<String>,
+    /// The unsupported claim, when the stage is `grounding` and it rejected a
+    /// draft (additive). The learning stage reads it as a *kind of claim* to
+    /// avoid (HB-046).
+    pub reason: Option<String>,
 }
 
 impl StageOutcome {
@@ -160,6 +172,7 @@ impl StageOutcome {
             variant: None,
             changes: None,
             uri: None,
+            reason: None,
         }
     }
 
@@ -180,6 +193,11 @@ impl StageOutcome {
 
     fn with_uri(mut self, uri: &str) -> Self {
         self.uri = Some(uri.to_string());
+        self
+    }
+
+    fn with_reason(mut self, reason: &str) -> Self {
+        self.reason = Some(reason.to_string());
         self
     }
 }
@@ -290,23 +308,19 @@ pub fn partition_variants<'a>(
     (approved, rejected)
 }
 
-/// How many approved variants one platform publishes per slot.
-///
-/// **One.** Two near-identical variants posted in the same minute read as spam
-/// and split the audience; the A/B comparison is therefore **sequential**, not
-/// simultaneous (see [`select_variants`]).
-const VARIANTS_PER_PLATFORM_PER_SLOT: usize = 1;
-
 /// Choose which approved variants a slot publishes.
 ///
 /// A slot releases at most `per_platform` variants per platform, starting at
-/// `rotation` and wrapping, so consecutive slots **alternate** between the
-/// approved variants: over time both styles are exercised and compared through
-/// their metrics, while no single moment shows two near-identical posts.
+/// `rotation` (for [`SelectionRule::Alternate`]) or the first variant (for
+/// [`SelectionRule::First`]), and wrapping. With the default policy — one
+/// variant, alternating — consecutive slots exercise both styles over time
+/// while no single moment shows two near-identical posts (sequential A/B,
+/// HB-040). Both knobs are persona data ([`PublishingPolicy`]), not constants.
 pub fn select_variants<'a>(
     approved: &'a [(Platform, &'a Variant)],
     per_platform: usize,
     rotation: usize,
+    rule: SelectionRule,
 ) -> Vec<(Platform, &'a Variant)> {
     let take = per_platform.max(1);
     let mut platforms: Vec<Platform> = Vec::new();
@@ -326,7 +340,10 @@ pub fn select_variants<'a>(
         if group.is_empty() {
             continue;
         }
-        let start = rotation % group.len();
+        let start = match rule {
+            SelectionRule::Alternate => rotation % group.len(),
+            SelectionRule::First => 0,
+        };
         for offset in 0..take.min(group.len()) {
             selected.push((platform, group[(start + offset) % group.len()]));
         }
@@ -501,14 +518,28 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         content: &source_text,
     });
 
+    // HB-046: the [3.7] reviewer's refusals are learned, not just gated. Load
+    // the persona's avoid memory so the creation stage is warned off a claim
+    // that was already refused instead of rediscovering it every slot.
+    let avoid = load_avoid(
+        &mut report,
+        &journal,
+        &persona,
+        options.memory_path.as_deref(),
+    )
+    .await?;
+
     let drafts = stage_create(
         &mut report,
         &journal,
         &persona,
         &channels,
         &registry,
-        &topic_title,
-        source,
+        CreationInput {
+            topic: &topic_title,
+            source,
+            avoid: &avoid,
+        },
     )
     .await?;
 
@@ -556,7 +587,15 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         return Ok(report);
     }
 
-    stage_publish(&mut report, &journal, &options, &topic_title, &approved).await?;
+    stage_publish(
+        &mut report,
+        &journal,
+        &options,
+        persona.publishing,
+        &topic_title,
+        &approved,
+    )
+    .await?;
     Ok(report)
 }
 
@@ -799,6 +838,79 @@ async fn stage_triage(
     Ok(Some(title))
 }
 
+/// The memory path for a persona: the explicit override, or the default the
+/// scheduled learning stage writes (`var/learn/<slug>.json`).
+fn memory_path(persona: &str, override_path: Option<&Path>) -> PathBuf {
+    override_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(format!("var/learn/{persona}.json")))
+}
+
+/// The "avoid" warnings the learning stage left for this persona.
+///
+/// HB-046: the [3.7] grounding reviewer's refusals must teach, not just gate.
+/// The persisted memory proposal carries them (as *kinds of claim*), and the
+/// creation stage is warned off them here so the same unsupported claim is not
+/// rediscovered every slot. A missing file is normal (nothing learned yet); an
+/// unreadable one is journalled but never blocks the run — this memory is
+/// advisory, unlike the fail-closed grounding review itself.
+async fn load_avoid(
+    report: &mut RunReport,
+    journal: &Journal,
+    persona: &PersonaPack,
+    override_path: Option<&Path>,
+) -> Result<Vec<String>> {
+    let path = memory_path(&persona.persona, override_path);
+
+    let (warnings, outcome) = match autopilot_learn::read_memory(&path).await {
+        Ok(Some(update)) => {
+            let warnings = autopilot_learn::avoid_warnings(&update);
+            let detail = format!(
+                "{} avoid warning(s) loaded from {}",
+                warnings.len(),
+                path.display()
+            );
+            (
+                warnings,
+                StageOutcome::new("memory", StageStatus::Ok, detail),
+            )
+        }
+        Ok(None) => (
+            Vec::new(),
+            StageOutcome::new(
+                "memory",
+                StageStatus::Skipped,
+                format!(
+                    "no memory at {} — the creation stage starts clean",
+                    path.display()
+                ),
+            ),
+        ),
+        Err(err) => (
+            Vec::new(),
+            StageOutcome::new(
+                "memory",
+                StageStatus::Error,
+                format!(
+                    "memory at {} unreadable — continuing without avoid warnings: {err:#}",
+                    path.display()
+                ),
+            ),
+        ),
+    };
+
+    record(report, journal, outcome).await?;
+    Ok(warnings)
+}
+
+/// The inputs the creation stage writes against: the topic, the source it may
+/// cite, and the avoid memory it must respect (HB-046).
+struct CreationInput<'a> {
+    topic: &'a str,
+    source: Option<Source<'a>>,
+    avoid: &'a [String],
+}
+
 /// Stage [3] — creation. Returns the drafts grouped by platform.
 async fn stage_create(
     report: &mut RunReport,
@@ -806,12 +918,17 @@ async fn stage_create(
     persona: &PersonaPack,
     channels: &[Platform],
     registry: &autopilot_providers::ProvidersConfig,
-    topic: &str,
-    source: Option<Source<'_>>,
+    input: CreationInput<'_>,
 ) -> Result<Vec<(Platform, Vec<Variant>)>> {
     let mut drafts = Vec::new();
     for platform in channels {
-        let prompt = build_creation_prompt(persona, *platform, topic, source);
+        let prompt = build_creation_prompt_with_avoid(
+            persona,
+            *platform,
+            input.topic,
+            input.source,
+            input.avoid,
+        );
         match complete_with_chain(registry, &prompt, JobKind::Create, COMPLETION_TIMEOUT).await {
             Ok(completion) => match parse_variants(&completion.text) {
                 Ok(variants) => {
@@ -1121,7 +1238,8 @@ async fn stage_grounding<'a>(
                     ),
                 )
                 .with_platform(*candidate)
-                .with_variant(&variant.label),
+                .with_variant(&variant.label)
+                .with_reason(&reason),
             )
             .await?;
         }
@@ -1150,6 +1268,7 @@ async fn stage_publish(
     report: &mut RunReport,
     journal: &Journal,
     options: &RunOptions,
+    policy: PublishingPolicy,
     topic: &str,
     approved: &[(Platform, &Variant)],
 ) -> Result<()> {
@@ -1157,13 +1276,15 @@ async fn stage_publish(
     let mut handle = String::new();
     let run_id = report.run_id.clone();
 
-    // One slot, one variant per platform: publishing two near-identical variants
-    // at the same moment reads as spam, so the A/B comparison is sequential and
-    // the rotation alternates which variant each slot releases.
+    // One slot, one variant per platform by default: publishing two
+    // near-identical variants at the same moment reads as spam, so the A/B
+    // comparison is sequential and the rotation alternates which variant each
+    // slot releases. Both knobs are persona data (HB-040), not constants.
     let selection = select_variants(
         approved,
-        VARIANTS_PER_PLATFORM_PER_SLOT,
+        policy.variants_per_slot,
         rotation_offset(&run_id),
+        policy.selection,
     );
 
     for (platform, variant) in approved {
@@ -1436,7 +1557,7 @@ fn platform_suffix(platform: Option<Platform>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autopilot_core::{Channel, Rubric, Voice};
+    use autopilot_core::{Channel, PublishingPolicy, Rubric, Voice};
     use autopilot_pipeline::EditedVariant;
 
     fn persona() -> PersonaPack {
@@ -1483,6 +1604,7 @@ mod tests {
                     windows: vec![],
                 },
             ],
+            publishing: PublishingPolicy::default(),
         }
     }
 
@@ -1504,11 +1626,11 @@ mod tests {
 
         // Rotation 0 → A, rotation 1 → B: consecutive slots alternate, so no
         // moment ever shows two near-identical posts.
-        let first = select_variants(&approved, 1, 0);
+        let first = select_variants(&approved, 1, 0, SelectionRule::Alternate);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].1.label, "A");
 
-        let second = select_variants(&approved, 1, 1);
+        let second = select_variants(&approved, 1, 1, SelectionRule::Alternate);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].1.label, "B");
     }
@@ -1518,10 +1640,39 @@ mod tests {
         let a = variant("A", "texto a");
         let b = variant("B", "texto b");
         let approved = vec![(Platform::Bluesky, &a), (Platform::X, &b)];
-        let selected = select_variants(&approved, 1, 0);
+        let selected = select_variants(&approved, 1, 0, SelectionRule::Alternate);
         assert_eq!(selected.len(), 2);
         assert!(selected.iter().any(|(p, _)| *p == Platform::Bluesky));
         assert!(selected.iter().any(|(p, _)| *p == Platform::X));
+    }
+
+    #[test]
+    fn the_policy_decides_how_many_variants_a_slot_releases() {
+        // The count is persona data, not a constant: a policy of two releases
+        // both (the deliberate opt-in), and the default releases one.
+        let a = variant("A", "texto a");
+        let b = variant("B", "texto b");
+        let approved = vec![(Platform::Bluesky, &a), (Platform::Bluesky, &b)];
+
+        let both = select_variants(&approved, 2, 0, SelectionRule::Alternate);
+        assert_eq!(both.len(), 2);
+
+        let policy = PublishingPolicy::default();
+        let sequential = select_variants(&approved, policy.variants_per_slot, 0, policy.selection);
+        assert_eq!(sequential.len(), 1);
+    }
+
+    #[test]
+    fn the_first_selection_rule_ignores_the_rotation() {
+        let a = variant("A", "texto a");
+        let b = variant("B", "texto b");
+        let approved = vec![(Platform::Bluesky, &a), (Platform::Bluesky, &b)];
+
+        // `First` is deterministic: every slot takes A, whatever the run id.
+        for rotation in [0, 1, 2, 7] {
+            let selected = select_variants(&approved, 1, rotation, SelectionRule::First);
+            assert_eq!(selected[0].1.label, "A");
+        }
     }
 
     #[test]
@@ -1529,6 +1680,53 @@ mod tests {
         assert_eq!(rotation_offset("tech-curiosities-1791849666"), 6);
         assert_eq!(rotation_offset("persona-1791849661"), 1);
         assert_eq!(rotation_offset("no-digits"), 0);
+    }
+
+    #[test]
+    fn the_memory_defaults_to_where_learn_writes_it() {
+        assert_eq!(
+            memory_path("tech-curiosities", None),
+            PathBuf::from("var/learn/tech-curiosities.json")
+        );
+        let explicit = PathBuf::from("/tmp/memory.yaml");
+        assert_eq!(memory_path("anything", Some(&explicit)), explicit);
+    }
+
+    #[test]
+    fn a_refused_claim_in_the_memory_reaches_the_creation_prompt() {
+        // The end-to-end link HB-046 promises: a claim the [3.7] reviewer
+        // refused is read back from the memory proposal and warns the next
+        // creation, so the same assertion is not rediscovered every slot.
+        let claim = "Claims the agent is 'inspectable, not someone's cloud API' — the source \
+                     never says whether KylinBot/Xiao K is local/inspectable or cloud-based.";
+        let update = autopilot_learn::MemoryUpdate {
+            persona: "tech-curiosities".into(),
+            generated_at_unix: 0,
+            platform: Platform::Bluesky,
+            winner: None,
+            min_samples: 1,
+            variants: vec![],
+            few_shot: vec![],
+            avoid: vec![autopilot_learn::AvoidEntry {
+                rule: "grounding-rejected".into(),
+                penalty: autopilot_learn::PENALTY_GROUNDING_REJECTED,
+                evidence: claim.into(),
+            }],
+            schedule_hints: vec![],
+            reason: "test".into(),
+        };
+
+        let warnings = autopilot_learn::avoid_warnings(&update);
+        assert!(warnings[0].contains("grounding-rejected"));
+        let prompt = autopilot_pipeline::build_creation_prompt_with_avoid(
+            &persona(),
+            Platform::Bluesky,
+            "a topic",
+            None,
+            &warnings,
+        );
+        assert!(prompt.contains(claim), "the claim must reach the prompt");
+        assert!(prompt.contains("never repeat them"));
     }
 
     #[test]
