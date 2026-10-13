@@ -13,4 +13,4 @@ pub use persona::{
     PersonaPack, Platform, PublishingPolicy, Rubric, SelectionRule, ValidationIssue, Voice,
     WarmingRamp, humanize_niche, load_dir, load_persona, parse_iso_date_days, resolve_persona_path,
 };
-pub use time::{now_unix, utc_day};
+pub use time::{local_minute_of_day, minute_of_day_at, now_unix, utc_day};

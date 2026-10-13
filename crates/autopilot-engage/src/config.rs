@@ -4,6 +4,11 @@
 //! kill-switch environment variable). The engagement windows are deliberately
 //! separate from the persona's publishing windows, so interactions never ride a
 //! publishing burst.
+//!
+//! The windows are **local** wall-clock times (`HH:MM`), the same clock the
+//! systemd timer fires on and the publishing stage uses. The comparison is done
+//! with [`autopilot_core::local_minute_of_day`]; never mix a UTC minute into a
+//! local window (HB-058).
 
 use std::path::Path;
 
@@ -48,7 +53,8 @@ pub struct EngageConfig {
     /// Environment variable that, when truthy, stops the stage immediately.
     #[serde(default = "default_kill_switch_env")]
     pub kill_switch_env: String,
-    /// Execution windows (24h clock), separate from the publishing windows.
+    /// Execution windows (`HH:MM`, **local** 24h clock), separate from the
+    /// publishing windows. The systemd timer fires on the same local clock.
     #[serde(default = "default_windows")]
     pub windows: Vec<String>,
     /// Length of each window, in minutes.
@@ -310,17 +316,22 @@ impl EngageConfig {
         std::env::var(&self.kill_switch_env).is_ok_and(|value| is_truthy(&value))
     }
 
-    /// Minute of the day (UTC) for a Unix timestamp.
-    pub fn minute_of_day(now_unix: u64) -> u32 {
-        ((now_unix % 86_400) / 60) as u32
-    }
-
-    /// Whether `now_unix` falls inside one of the configured windows.
-    pub fn in_window(&self, now_unix: u64) -> bool {
-        let minute = Self::minute_of_day(now_unix);
+    /// Whether `minute_of_day` falls inside one of the configured windows.
+    ///
+    /// `minute_of_day` is the **local** minute of the day (`0..=1439`) — the same
+    /// clock the systemd timer fires on (`OnCalendar=09,13,20:35` resolves in the
+    /// server timezone) and the publishing stage uses. The window list and
+    /// `window_minutes` are local too; callers pass
+    /// [`autopilot_core::local_minute_of_day`].
+    ///
+    /// HB-058: the old code computed a **UTC** minute here and compared it against
+    /// these local windows, so the 09:35 local fire was read as 12:35 UTC — 185
+    /// minutes past the 09:30 window — and every scheduled engagement run ended
+    /// `window : outside` with `0 action(s) executed`.
+    pub fn in_window(&self, minute_of_day: u32) -> bool {
         self.windows.iter().any(|window| {
             parse_clock(window).is_some_and(|start| {
-                let offset = (minute + 1_440 - start) % 1_440;
+                let offset = (minute_of_day + 1_440 - start) % 1_440;
                 offset < self.window_minutes
             })
         })
@@ -403,21 +414,47 @@ mod tests {
     #[test]
     fn windows_are_separate_and_matched_by_offset() {
         let config = EngageConfig::parse_yaml("{}").expect("defaults");
-        // 09:40 UTC is inside the 09:30 window (45 minutes long).
-        let at_0940 = 9 * 3600 + 40 * 60;
-        assert!(config.in_window(at_0940));
+        // 09:40 local is inside the 09:30 window (45 minutes long).
+        assert!(config.in_window(9 * 60 + 40));
         // 09:20 is before the window and 10:30 is after it.
-        assert!(!config.in_window(9 * 3600 + 20 * 60));
-        assert!(!config.in_window(10 * 3600 + 30 * 60));
+        assert!(!config.in_window(9 * 60 + 20));
+        assert!(!config.in_window(10 * 60 + 30));
+    }
+
+    #[test]
+    fn a_fire_inside_the_window_engages_and_one_outside_does_not() {
+        // HB-058: the scheduler fires at 09:35 **local**, five minutes into the
+        // 09:30 window — the case the old UTC arithmetic called "outside" (at
+        // -03 that instant is 12:35 UTC, 185 minutes past the window). The
+        // decision function is exercised for real, with the local minute the
+        // live path computes. Reverting `in_window` to a UTC `now_unix` read
+        // makes the first assertion fail (575 would be read as 00:09 UTC).
+        let config = EngageConfig::parse_yaml("{}").expect("defaults");
+        assert!(config.in_window(9 * 60 + 35), "09:35 local must engage");
+        assert!(config.in_window(9 * 60 + 40), "09:40 local must engage");
+        assert!(!config.in_window(9 * 60 + 20), "09:20 local is before");
+        assert!(!config.in_window(10 * 60 + 30), "10:30 local is after");
+    }
+
+    #[test]
+    fn a_local_fire_is_judged_on_the_local_clock_not_utc() {
+        // The conversion the runner uses: the 09:35 local fire arrives as the
+        // 12:35 UTC instant, and `local_minute_of_day` (offset -03) must turn it
+        // back into 575 — inside the window. A UTC read would give 755, outside.
+        let at_1235_utc = 12 * 3600 + 35 * 60;
+        let local = autopilot_core::minute_of_day_at(at_1235_utc, -3 * 3600);
+        let config = EngageConfig::parse_yaml("{}").expect("defaults");
+        assert!(config.in_window(local));
+        assert!(!config.in_window(autopilot_core::minute_of_day_at(at_1235_utc, 0)));
     }
 
     #[test]
     fn a_window_wrapping_midnight_is_matched() {
         let config = EngageConfig::parse_yaml("windows: [\"23:50\"]\nwindow_minutes: 30\n")
             .expect("config parses");
-        assert!(config.in_window(23 * 3600 + 55 * 60));
-        assert!(config.in_window(10 * 60)); // 00:10 next day
-        assert!(!config.in_window(12 * 3600));
+        assert!(config.in_window(23 * 60 + 55));
+        assert!(config.in_window(10)); // 00:10 next day
+        assert!(!config.in_window(12 * 60));
     }
 
     #[test]

@@ -115,6 +115,7 @@ name = "autopilot-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -251,7 +252,6 @@ dependencies = [
  "autopilot-pipeline",
  "autopilot-providers",
  "autopilot-publish",
- "chrono",
  "serde",
  "serde_json",
  "tokio",

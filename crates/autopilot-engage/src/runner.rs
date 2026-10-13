@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use autopilot_core::{PersonaPack, load_persona, now_unix};
+use autopilot_core::{PersonaPack, load_persona, local_minute_of_day, now_unix};
 use autopilot_providers::{JobKind, ProvidersConfig, complete_with_chain, load_config};
 use autopilot_publish::{BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, Session, create_session};
 use serde::Deserialize;
@@ -127,7 +127,9 @@ pub async fn run(options: EngageOptions) -> Result<EngageReport> {
 
     let now = now_unix();
     let kill_switch = config.kill_switch_active();
-    let in_window = config.in_window(now);
+    // The windows are local (like the timer), so the gate is judged on the local
+    // clock — never on the UTC minute of the same instant (HB-058).
+    let in_window = config.in_window(local_minute_of_day(now));
 
     let mut report = EngageReport {
         persona: persona.persona.clone(),

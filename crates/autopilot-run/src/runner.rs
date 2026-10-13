@@ -38,7 +38,6 @@ use autopilot_publish::{
     create_post, create_session, now_rfc3339_millis, post_url, render_png_for, template_for,
     upload_blob, upload_video, validate_video,
 };
-use chrono::{Local, Timelike};
 
 use crate::journal::{Journal, PublishedEntry, read_published};
 
@@ -312,9 +311,11 @@ fn parse_window(window: &str) -> Option<i64> {
 }
 
 /// Minutes since local midnight (`0..=1439`).
+///
+/// The one local-clock conversion lives in `autopilot_core::time` (HB-058): the
+/// publishing windows are local too, so both stages must read the same clock.
 fn local_minutes_now() -> i64 {
-    let now = Local::now();
-    i64::from(now.hour()) * 60 + i64::from(now.minute())
+    i64::from(autopilot_core::local_minute_of_day(now_unix()))
 }
 
 /// The declared window a run at `now` belongs to, if any.
