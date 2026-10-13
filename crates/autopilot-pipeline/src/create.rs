@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use autopilot_core::{PersonaPack, Platform};
 use serde::{Deserialize, Serialize};
 
+use crate::grounding::Source;
 use crate::json::extract_json;
 use crate::prompt::{platform_limit, render_banned_phrases, render_guidelines};
 
@@ -24,9 +25,31 @@ struct Wrapper {
 }
 
 /// Build the creation prompt for one platform and topic.
-pub fn build_creation_prompt(persona: &PersonaPack, platform: Platform, topic: &str) -> String {
+pub fn build_creation_prompt(
+    persona: &PersonaPack,
+    platform: Platform,
+    topic: &str,
+    source: Option<Source<'_>>,
+) -> String {
     let guidelines = render_guidelines(persona);
     let banned = render_banned_phrases(persona);
+
+    // The harvest already read the page: that text — not the model's memory — is
+    // the only thing a post may cite. Without it, say so instead of inviting an
+    // invention.
+    let grounding = match source {
+        Some(source) => format!(
+            "The ONLY admissible source (url: {url}):\n\"{content}\"\n\n\
+             Ground every claim in that source. Never add a number, date, version, name,\n\
+             price, quote or comparison it does not contain: a wrong detail is worse than a\n\
+             plainer sentence.",
+            url = source.url,
+            content = source.content,
+        ),
+        None => "No source text is available: state only what the topic itself supports, and\n\
+                 never invent a specific detail."
+            .to_string(),
+    };
 
     format!(
         "You are the creation stage of an autonomous social-media engine.\n\
@@ -38,6 +61,7 @@ pub fn build_creation_prompt(persona: &PersonaPack, platform: Platform, topic: &
          Never use these phrases: {banned}\n\
          Never touch these topics: {blocklist}\n\n\
          Topic to write about: {topic}\n\n\
+         {grounding}\n\n\
          Produce exactly 2 alternative variants (A and B) that could be A/B tested.\n\
          Each caption must respect the platform limit of {limit} characters and use at most\n\
          {max_tags} hashtags. Also propose a short image prompt for each variant.\n\n\
@@ -53,6 +77,7 @@ pub fn build_creation_prompt(persona: &PersonaPack, platform: Platform, topic: &
         banned = banned,
         blocklist = persona.blocklist.join("; "),
         topic = topic,
+        grounding = grounding,
         limit = platform_limit(platform),
         max_tags = persona.voice.max_hashtags,
     )
@@ -86,8 +111,12 @@ mod tests {
 
     #[test]
     fn prompt_carries_constraints() {
-        let prompt =
-            build_creation_prompt(&persona(), Platform::Bluesky, "o cérebro gasta energia");
+        let prompt = build_creation_prompt(
+            &persona(),
+            Platform::Bluesky,
+            "o cérebro gasta energia",
+            None,
+        );
         assert!(prompt.contains("pt-BR"));
         assert!(prompt.contains("bluesky"));
         assert!(prompt.contains("300"));

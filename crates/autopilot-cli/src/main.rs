@@ -908,7 +908,7 @@ async fn run_create(command: CreateCommand) -> Result<ExitCode> {
             guard,
         } => {
             let pack = load_persona(&persona).await?;
-            let prompt = build_creation_prompt(&pack, platform, &topic);
+            let prompt = build_creation_prompt(&pack, platform, &topic, None);
             if dry_run {
                 println!("--- prompt (dry run, no LLM called) ---");
                 println!("{prompt}");

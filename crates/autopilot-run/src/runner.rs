@@ -15,9 +15,9 @@ use autopilot_core::{PersonaPack, Platform, load_persona, now_unix};
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{SearxngClient, Topic};
 use autopilot_pipeline::{
-    EditorOutcome, TopicScore, Variant, build_creation_prompt, build_editor_prompt,
-    build_triage_prompt, kept_variants, parse_editor_response, parse_shortlist, parse_variants,
-    review_or_keep,
+    EditorOutcome, Source, TopicScore, Variant, build_creation_prompt, build_editor_prompt,
+    build_grounding_prompt, build_triage_prompt, kept_variants, parse_editor_response,
+    parse_grounding, parse_shortlist, parse_variants, review_or_keep, supported_labels,
 };
 use autopilot_providers::{JobKind, complete_with_chain, load_config};
 use autopilot_publish::{
@@ -448,6 +448,17 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         return Ok(report);
     };
 
+    // The source travels with the topic. Until 12/10 the create stage wrote from
+    // the title alone, so the body came from the model's memory; the harvest had
+    // already read the page, and that text is what a post may cite.
+    let source = topics
+        .iter()
+        .find(|candidate| candidate.title == topic_title)
+        .map(|candidate| Source {
+            url: &candidate.url,
+            content: &candidate.content,
+        });
+
     let drafts = stage_create(
         &mut report,
         &journal,
@@ -455,6 +466,7 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         &channels,
         &registry,
         &topic_title,
+        source,
     )
     .await?;
 
@@ -479,6 +491,23 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
                 "publish",
                 StageStatus::Skipped,
                 "no draft cleared the guardrail — nothing was published",
+            ),
+        )
+        .await?;
+        return Ok(report);
+    }
+
+    // Stage [3.7] — the claim-vs-source review. The guardrail is deterministic:
+    // it can refuse a banned phrase, but it cannot know whether a claim is true.
+    let approved = stage_grounding(&mut report, &journal, &approved, source, &registry).await?;
+    if approved.is_empty() {
+        record(
+            &mut report,
+            &journal,
+            StageOutcome::new(
+                "publish",
+                StageStatus::Skipped,
+                "no draft was grounded in its source — nothing was published",
             ),
         )
         .await?;
@@ -736,10 +765,11 @@ async fn stage_create(
     channels: &[Platform],
     registry: &autopilot_providers::ProvidersConfig,
     topic: &str,
+    source: Option<Source<'_>>,
 ) -> Result<Vec<(Platform, Vec<Variant>)>> {
     let mut drafts = Vec::new();
     for platform in channels {
-        let prompt = build_creation_prompt(persona, *platform, topic);
+        let prompt = build_creation_prompt(persona, *platform, topic, source);
         match complete_with_chain(registry, &prompt, JobKind::Create, COMPLETION_TIMEOUT).await {
             Ok(completion) => match parse_variants(&completion.text) {
                 Ok(variants) => {
@@ -946,6 +976,134 @@ async fn stage_guardrail<'a>(
 }
 
 /// Stage [4] — publish. Only the platforms with an adapter are served.
+/// Stage [3.7] — ground every approved draft in the source it came from.
+///
+/// The guardrail is deterministic: it can refuse a banned phrase, but it cannot
+/// know whether a claim is *true*. This layer asks a sceptical reviewer — a
+/// different role on the same chain, never the writer — whether each draft is
+/// supported by the source the harvest read, and **fails closed**: an unsupported
+/// draft is dropped, and a review that cannot run drops them all. Silence costs
+/// one slot; a fabrication costs credibility.
+async fn stage_grounding<'a>(
+    report: &mut RunReport,
+    journal: &Journal,
+    approved: &'a [(Platform, &'a Variant)],
+    source: Option<Source<'_>>,
+    registry: &autopilot_providers::ProvidersConfig,
+) -> Result<Vec<(Platform, &'a Variant)>> {
+    let Some(source) = source else {
+        record(
+            report,
+            journal,
+            StageOutcome::new(
+                "grounding",
+                StageStatus::Skipped,
+                "no source text for this topic — nothing to check the drafts against",
+            ),
+        )
+        .await?;
+        return Ok(approved.to_vec());
+    };
+
+    let mut platforms: Vec<Platform> = Vec::new();
+    for (platform, _) in approved {
+        if !platforms.contains(platform) {
+            platforms.push(*platform);
+        }
+    }
+
+    let mut kept = Vec::new();
+    for platform in platforms {
+        let variants: Vec<Variant> = approved
+            .iter()
+            .filter(|(candidate, _)| *candidate == platform)
+            .map(|(_, variant)| (*variant).clone())
+            .collect();
+
+        let prompt = build_grounding_prompt(source, &variants);
+        let reviewed = match complete_with_chain(
+            registry,
+            &prompt,
+            JobKind::Other,
+            COMPLETION_TIMEOUT,
+        )
+        .await
+        {
+            Ok(completion) => parse_grounding(&completion.text),
+            Err(err) => Err(anyhow::anyhow!("{err:#}")),
+        };
+
+        let verdicts = match reviewed {
+            Ok(verdicts) => verdicts,
+            Err(err) => {
+                // Fail-closed: a review that cannot run publishes nothing.
+                report.failed = true;
+                record(
+                    report,
+                    journal,
+                    StageOutcome::new(
+                        "grounding",
+                        StageStatus::Error,
+                        format!("grounding review unavailable — every draft withheld: {err:#}"),
+                    )
+                    .with_platform(platform),
+                )
+                .await?;
+                continue;
+            }
+        };
+
+        let supported = supported_labels(&verdicts);
+        for (candidate, variant) in approved
+            .iter()
+            .filter(|(candidate, _)| *candidate == platform)
+        {
+            if supported.contains(&variant.label.as_str()) {
+                kept.push((*candidate, *variant));
+                continue;
+            }
+            let reason = verdicts
+                .iter()
+                .find(|verdict| verdict.label == variant.label)
+                .map(|verdict| verdict.reason.clone())
+                .unwrap_or_else(|| "the reviewer did not vouch for this draft".to_string());
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "grounding",
+                    StageStatus::Rejected,
+                    format!(
+                        "variant {} not supported by the source — {reason}",
+                        variant.label
+                    ),
+                )
+                .with_platform(*candidate)
+                .with_variant(&variant.label),
+            )
+            .await?;
+        }
+
+        record(
+            report,
+            journal,
+            StageOutcome::new(
+                "grounding",
+                StageStatus::Ok,
+                format!(
+                    "{} of {} draft(s) grounded in the source",
+                    kept.len(),
+                    approved.len()
+                ),
+            )
+            .with_platform(platform),
+        )
+        .await?;
+    }
+
+    Ok(kept)
+}
+
 async fn stage_publish(
     report: &mut RunReport,
     journal: &Journal,
