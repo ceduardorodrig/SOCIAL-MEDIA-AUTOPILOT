@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- card-v3 — "nebula": deep-plum radial card (1200x1200), centred text over a dot grid.
+     Placeholders ({{ARIA}}, {{TITLE_LINES}}, {{BODY_LINES}}, {{FOOTER}}) are filled by
+     crates/autopilot-publish/src/card.rs. Versioned: a visual change is a new file. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1200" viewBox="0 0 1200 1200"
+     role="img" aria-label="{{ARIA}}">
+  <defs>
+    <radialGradient id="v3-bg" cx="0.5" cy="0.35" r="0.85">
+      <stop offset="0" stop-color="#3b1d5e"/>
+      <stop offset="1" stop-color="#160b26"/>
+    </radialGradient>
+    <pattern id="v3-dots" width="80" height="80" patternUnits="userSpaceOnUse">
+      <circle cx="8" cy="8" r="3" fill="#d946ef"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="1200" fill="url(#v3-bg)"/>
+  <rect width="1200" height="1200" fill="url(#v3-dots)" opacity="0.22"/>
+
+  <g stroke="#d946ef" stroke-width="4" opacity="0.9">
+    <path d="M560 96H640"/>
+    <path d="M600 96V150"/>
+  </g>
+
+  <text x="600" y="300" text-anchor="middle"
+        font-family="'DejaVu Sans','Liberation Sans',sans-serif" font-size="72" font-weight="700"
+        fill="#f5e9ff" letter-spacing="1">{{TITLE_LINES}}</text>
+
+  <rect x="525" y="470" width="150" height="8" rx="4" fill="#d946ef"/>
+
+  <text x="600" y="520" text-anchor="middle"
+        font-family="'DejaVu Sans','Liberation Sans',sans-serif" font-size="50"
+        fill="#c9b6e4">{{BODY_LINES}}</text>
+
+  <text x="600" y="1120" text-anchor="middle"
+        font-family="'DejaVu Sans Mono','Liberation Mono',monospace" font-size="30"
+        fill="#e879f9">{{FOOTER}}</text>
+</svg>

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- card-v5 — "midnight": deep-blue card (1200x1200), right-aligned text, striped corner.
+     Placeholders ({{ARIA}}, {{TITLE_LINES}}, {{BODY_LINES}}, {{FOOTER}}) are filled by
+     crates/autopilot-publish/src/card.rs. Versioned: a visual change is a new file. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1200" viewBox="0 0 1200 1200"
+     role="img" aria-label="{{ARIA}}">
+  <defs>
+    <linearGradient id="v5-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#050b1f"/>
+      <stop offset="1" stop-color="#0a1633"/>
+    </linearGradient>
+    <pattern id="v5-stripes" width="48" height="48" patternUnits="userSpaceOnUse"
+             patternTransform="rotate(45)">
+      <rect width="24" height="48" fill="#38bdf8"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="1200" fill="url(#v5-bg)"/>
+  <rect x="0" y="0" width="440" height="440" fill="url(#v5-stripes)" opacity="0.18"/>
+  <rect x="0" y="1176" width="1200" height="24" fill="#38bdf8" opacity="0.85"/>
+
+  <text x="1104" y="300" text-anchor="end"
+        font-family="'DejaVu Sans','Liberation Sans',sans-serif" font-size="70" font-weight="800"
+        fill="#e0f2fe" letter-spacing="-1">{{TITLE_LINES}}</text>
+
+  <rect x="784" y="470" width="320" height="8" fill="#38bdf8"/>
+
+  <text x="1104" y="520" text-anchor="end"
+        font-family="'DejaVu Sans','Liberation Sans',sans-serif" font-size="52"
+        fill="#93c5fd">{{BODY_LINES}}</text>
+
+  <text x="1104" y="1120" text-anchor="end"
+        font-family="'DejaVu Sans Mono','Liberation Mono',monospace" font-size="30"
+        fill="#7dd3fc">{{FOOTER}}</text>
+</svg>

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- card-v6 — "poster": black card (1200x1200) with a red block, a full-width rule and a
+     lower-third oversized title. Placeholders ({{ARIA}}, {{TITLE_LINES}}, {{BODY_LINES}},
+     {{FOOTER}}) are filled by crates/autopilot-publish/src/card.rs. Versioned file. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1200" viewBox="0 0 1200 1200"
+     role="img" aria-label="{{ARIA}}">
+  <defs>
+    <linearGradient id="v6-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#101010"/>
+      <stop offset="1" stop-color="#1c1c1c"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="1200" fill="url(#v6-bg)"/>
+  <rect x="96" y="180" width="160" height="160" fill="#ef4444"/>
+  <rect x="96" y="470" width="1008" height="14" fill="#ef4444"/>
+
+  <text x="96" y="600" font-family="'DejaVu Sans','Liberation Sans',sans-serif"
+        font-size="88" font-weight="900" fill="#fafafa" letter-spacing="-2">{{TITLE_LINES}}</text>
+
+  <text x="96" y="770" font-family="'DejaVu Sans','Liberation Sans',sans-serif"
+        font-size="48" fill="#d4d4d4">{{BODY_LINES}}</text>
+
+  <text x="96" y="1120" font-family="'DejaVu Sans Mono','Liberation Mono',monospace"
+        font-size="30" fill="#a3a3a3" letter-spacing="3">{{FOOTER}}</text>
+</svg>

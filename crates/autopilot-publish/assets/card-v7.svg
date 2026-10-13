@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- card-v7 — "orbit": deep-teal card (1200x1200), centred text with a pink concentric ring.
+     Placeholders ({{ARIA}}, {{TITLE_LINES}}, {{BODY_LINES}}, {{FOOTER}}) are filled by
+     crates/autopilot-publish/src/card.rs. Versioned: a visual change is a new file. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1200" viewBox="0 0 1200 1200"
+     role="img" aria-label="{{ARIA}}">
+  <defs>
+    <radialGradient id="v7-bg" cx="0.5" cy="0.5" r="0.85">
+      <stop offset="0" stop-color="#064e3b"/>
+      <stop offset="1" stop-color="#042f2e"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="1200" fill="url(#v7-bg)"/>
+
+  <g fill="none" stroke="#f472b6">
+    <circle cx="1000" cy="200" r="150" stroke-width="6" opacity="0.7"/>
+    <circle cx="1000" cy="200" r="90" stroke-width="3" opacity="0.5"/>
+    <circle cx="1000" cy="200" r="30" stroke-width="14" opacity="0.9"/>
+  </g>
+
+  <text x="600" y="320" text-anchor="middle"
+        font-family="'DejaVu Sans','Liberation Sans',sans-serif" font-size="72" font-weight="700"
+        fill="#ecfeff" letter-spacing="0.5">{{TITLE_LINES}}</text>
+
+  <text x="600" y="540" text-anchor="middle"
+        font-family="'DejaVu Sans','Liberation Sans',sans-serif" font-size="50"
+        fill="#99f6e4">{{BODY_LINES}}</text>
+
+  <text x="600" y="1120" text-anchor="middle"
+        font-family="'DejaVu Sans Mono','Liberation Mono',monospace" font-size="30"
+        fill="#5eead4">{{FOOTER}}</text>
+</svg>

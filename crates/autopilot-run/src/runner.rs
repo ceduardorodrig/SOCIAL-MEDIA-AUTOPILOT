@@ -23,10 +23,10 @@ use autopilot_pipeline::{
 };
 use autopilot_providers::{JobKind, complete_with_chain, load_config};
 use autopilot_publish::{
-    BlueskyCredentials, CARD_HEIGHT, CARD_MIME_TYPE, CARD_TEMPLATE_VERSION, CARD_WIDTH, CardSpec,
+    BlueskyCredentials, CARD_HEIGHT, CARD_MIME_TYPE, CARD_WIDTH, CardIdentity, CardSpec,
     DEFAULT_BLUESKY_BASE_URL, DEFAULT_RSVG_BINARY, PostImage, Session, alt_text,
     build_post_record_with_images, create_post, create_session, now_rfc3339_millis, post_url,
-    render_png, upload_blob,
+    render_png_for, template_for, upload_blob,
 };
 use chrono::{Local, Timelike};
 
@@ -1309,9 +1309,14 @@ async fn stage_card_image(
         Some(card) => CardSpec::from_post(&card.title, &card.body, &session.handle),
         None => CardSpec::from_post(topic, &variant.text, &session.handle),
     };
+    // The template rotates per post: the identity is the run, the variant and
+    // the persona — not the text — so a re-run of the same post reproduces the
+    // same card, while consecutive posts vary.
+    let identity = CardIdentity::new(run_id, &variant.label, &session.handle);
+    let template = template_for(&identity);
     let png = PathBuf::from(DEFAULT_CARD_DIR).join(format!("{run_id}-{}.png", variant.label));
     let result = async {
-        let svg = render_png(&spec, &png, DEFAULT_RSVG_BINARY).await?;
+        let svg = render_png_for(&spec, &identity, &png, DEFAULT_RSVG_BINARY).await?;
         let bytes = tokio::fs::read(&png).await?;
         let blob = upload_blob(
             DEFAULT_BLUESKY_BASE_URL,
@@ -1334,7 +1339,8 @@ async fn stage_card_image(
                     "card",
                     StageStatus::Ok,
                     format!(
-                        "attached {CARD_TEMPLATE_VERSION} card {}x{} ({} bytes) from {} and {}",
+                        "attached {} card {}x{} ({} bytes) from {} and {}",
+                        template.name,
                         CARD_WIDTH,
                         CARD_HEIGHT,
                         blob.size,

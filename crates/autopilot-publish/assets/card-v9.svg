@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- card-v9 — "console": GitHub-dark card (1200x1200), monospace title, `</>` corner mark.
+     Placeholders ({{ARIA}}, {{TITLE_LINES}}, {{BODY_LINES}}, {{FOOTER}}) are filled by
+     crates/autopilot-publish/src/card.rs. Versioned: a visual change is a new file. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1200" viewBox="0 0 1200 1200"
+     role="img" aria-label="{{ARIA}}">
+  <defs>
+    <linearGradient id="v9-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#161b22"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="1200" fill="url(#v9-bg)"/>
+  <rect x="0" y="0" width="1200" height="10" fill="#34d399"/>
+
+  <g fill="none" stroke="#34d399" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"
+     opacity="0.9">
+    <path d="M1016 96l-28 32 28 32"/>
+    <path d="M1064 168l40-96"/>
+    <path d="M1148 96l28 32-28 32"/>
+  </g>
+
+  <text x="96" y="300" font-family="'DejaVu Sans Mono','Liberation Mono',monospace"
+        font-size="62" font-weight="700" fill="#e6edf3">{{TITLE_LINES}}</text>
+
+  <text x="96" y="520" font-family="'DejaVu Sans Mono','Liberation Mono',monospace"
+        font-size="48" fill="#8b949e">{{BODY_LINES}}</text>
+
+  <text x="96" y="1120" font-family="'DejaVu Sans Mono','Liberation Mono',monospace"
+        font-size="30" fill="#34d399">{{FOOTER}}</text>
+</svg>

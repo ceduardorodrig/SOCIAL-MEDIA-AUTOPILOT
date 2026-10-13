@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- card-v4 — "grove": forest card (1200x1200) framed by amber corner brackets.
+     Placeholders ({{ARIA}}, {{TITLE_LINES}}, {{BODY_LINES}}, {{FOOTER}}) are filled by
+     crates/autopilot-publish/src/card.rs. Versioned: a visual change is a new file. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1200" viewBox="0 0 1200 1200"
+     role="img" aria-label="{{ARIA}}">
+  <defs>
+    <linearGradient id="v4-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0c1f17"/>
+      <stop offset="1" stop-color="#123227"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="1200" fill="url(#v4-bg)"/>
+
+  <g fill="none" stroke="#fbbf24" stroke-width="10" stroke-linecap="square">
+    <path d="M72 72h180M72 72v180"/>
+    <path d="M1128 1128H948M1128 1128v-180"/>
+  </g>
+
+  <text x="120" y="320" font-family="'DejaVu Sans','Liberation Sans',sans-serif"
+        font-size="66" font-weight="700" fill="#ecfdf5" letter-spacing="-0.5">{{TITLE_LINES}}</text>
+
+  <text x="120" y="540" font-family="'DejaVu Sans','Liberation Sans',sans-serif"
+        font-size="52" fill="#a7d9c4">{{BODY_LINES}}</text>
+
+  <text x="120" y="1120" font-family="'DejaVu Sans Mono','Liberation Mono',monospace"
+        font-size="30" fill="#6ee7b7">{{FOOTER}}</text>
+</svg>

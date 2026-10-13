@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- card-v11 — "dusk": indigo-to-crimson gradient card (1200x1200), orange vertical rule,
+     diamond mark, italic body. Placeholders ({{ARIA}}, {{TITLE_LINES}}, {{BODY_LINES}},
+     {{FOOTER}}) are filled by crates/autopilot-publish/src/card.rs. Versioned file. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1200" viewBox="0 0 1200 1200"
+     role="img" aria-label="{{ARIA}}">
+  <defs>
+    <linearGradient id="v11-bg" x1="0" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#1e1b4b"/>
+      <stop offset="0.55" stop-color="#6b21a8"/>
+      <stop offset="1" stop-color="#9f1239"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="1200" fill="url(#v11-bg)"/>
+  <rect x="96" y="300" width="10" height="620" rx="5" fill="#fb923c"/>
+
+  <rect x="96" y="180" width="26" height="26" transform="rotate(45 109 193)" fill="#fdba74"/>
+
+  <text x="150" y="320" font-family="'DejaVu Sans','Liberation Sans',sans-serif"
+        font-size="70" font-weight="700" fill="#fff7ed" letter-spacing="-0.5">{{TITLE_LINES}}</text>
+
+  <text x="150" y="540" font-family="'DejaVu Sans','Liberation Sans',sans-serif"
+        font-size="52" font-style="italic" fill="#fed7aa">{{BODY_LINES}}</text>
+
+  <text x="150" y="1120" font-family="'DejaVu Sans Mono','Liberation Mono',monospace"
+        font-size="30" fill="#fdba74">{{FOOTER}}</text>
+</svg>

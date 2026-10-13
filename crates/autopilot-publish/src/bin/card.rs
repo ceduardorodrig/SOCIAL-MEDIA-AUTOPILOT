@@ -1,17 +1,18 @@
 //! `card` — offline post-card generator for Bluesky.
 //!
-//! Fills the versioned SVG template from a post's topic/text and rasterises it
-//! with `rsvg-convert`. No GPU, no network, no image-generation model: the card
-//! is typography over the persona palette. `--dry-run` prints the filled SVG and
-//! the alt text and writes nothing.
+//! Fills the versioned SVG template the post's own content selects (one of the
+//! [`autopilot_publish::card::CARD_TEMPLATES`] identities) from a post's
+//! topic/text and rasterises it with `rsvg-convert`. No GPU, no network, no
+//! image-generation model: the card is typography over the persona palette.
+//! `--dry-run` prints the filled SVG and the alt text and writes nothing.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use autopilot_publish::card::{
-    CARD_HEIGHT, CARD_MIME_TYPE, CARD_TEMPLATE_VERSION, CARD_WIDTH, CardSpec, DEFAULT_RSVG_BINARY,
-    alt_text, png_dimensions, render_png, render_svg,
+    CARD_HEIGHT, CARD_MIME_TYPE, CARD_WIDTH, CardSpec, DEFAULT_RSVG_BINARY, alt_text,
+    png_dimensions, render_png_with, render_svg_with, template_for_spec,
 };
 use clap::{Parser, Subcommand};
 
@@ -73,18 +74,19 @@ async fn execute(cli: Cli) -> Result<()> {
     } = cli.command;
 
     let spec = CardSpec::from_post(&topic, &text, &footer);
-    println!("template : {CARD_TEMPLATE_VERSION}");
+    let template = template_for_spec(&spec);
+    println!("template : {}", template.name);
     println!("mime     : {CARD_MIME_TYPE}");
     println!("size     : {CARD_WIDTH}x{CARD_HEIGHT}");
     println!("alt      : {}", alt_text(&spec));
 
     if dry_run {
         println!("--- filled SVG (dry run, nothing written) ---");
-        println!("{}", render_svg(&spec));
+        println!("{}", render_svg_with(&spec, template));
         return Ok(());
     }
 
-    let svg = render_png(&spec, &out, &rsvg).await?;
+    let svg = render_png_with(&spec, template, &out, &rsvg).await?;
     let bytes = tokio::fs::read(&out)
         .await
         .with_context(|| format!("reading the rendered card {}", out.display()))?;
