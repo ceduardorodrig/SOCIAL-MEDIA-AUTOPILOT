@@ -1302,7 +1302,13 @@ async fn stage_card_image(
         return Ok(None);
     }
 
-    let spec = CardSpec::from_post(topic, &variant.text, &session.handle);
+    // The card states the information; the post text introduces it. Rendering
+    // the post text into the image — what happened until 2026-10-13 — made the
+    // picture repeat the post. Fall back to the old shape when no card was sent.
+    let spec = match variant.card.as_ref().filter(|card| card.is_usable()) {
+        Some(card) => CardSpec::from_post(&card.title, &card.body, &session.handle),
+        None => CardSpec::from_post(topic, &variant.text, &session.handle),
+    };
     let png = PathBuf::from(DEFAULT_CARD_DIR).join(format!("{run_id}-{}.png", variant.label));
     let result = async {
         let svg = render_png(&spec, &png, DEFAULT_RSVG_BINARY).await?;
@@ -1480,6 +1486,7 @@ mod tests {
             text: text.into(),
             hashtags: vec![],
             image_prompt: String::new(),
+            card: None,
         }
     }
 

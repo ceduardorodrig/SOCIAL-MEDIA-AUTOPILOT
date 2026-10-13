@@ -62,9 +62,17 @@ struct Wrapper {
 /// admissible evidence, and must judge each draft separately so one bad variant
 /// does not cost the slot.
 pub fn build_grounding_prompt(source: Source<'_>, variants: &[Variant]) -> String {
+    // The card is published too, so it is judged too: a fabricated fact in the
+    // image is a fabrication like any other.
     let drafts = variants
         .iter()
-        .map(|variant| format!("[{}] {}", variant.label, variant.text))
+        .map(|variant| match &variant.card {
+            Some(card) if card.is_usable() => format!(
+                "[{}] {}\n    (card — title: {} | fact: {})",
+                variant.label, variant.text, card.title, card.body
+            ),
+            _ => format!("[{}] {}", variant.label, variant.text),
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
 
@@ -79,7 +87,9 @@ pub fn build_grounding_prompt(source: Source<'_>, variants: &[Variant]) -> Strin
          claim. General knowledge is NOT admissible evidence — if the source does not say\n\
          it, the draft may not either. A draft that stays inside the source, or that only\n\
          states an opinion about it, is supported.\n\
-         Judge each draft separately. When in doubt, mark it NOT supported: silence costs\n\
+         Judge each draft separately. A draft may carry a \"(card — …)\" line: that text is\n\
+         published inside the image, so judge it exactly as strictly as the caption.\n\
+         When in doubt, mark it NOT supported: silence costs\n\
          one slot, a fabrication costs credibility.\n\n\
          Answer with JSON only: [{{\"label\": \"A\", \"supported\": true|false, \"reason\": \"<one line>\"}}]",
         url = source.url,
@@ -132,6 +142,7 @@ pub fn supported_labels(verdicts: &[GroundingVerdict]) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::create::CardContent;
 
     fn variant(label: &str, text: &str) -> Variant {
         Variant {
@@ -139,6 +150,7 @@ mod tests {
             text: text.to_string(),
             hashtags: Vec::new(),
             image_prompt: String::new(),
+            card: None,
         }
     }
 
@@ -158,6 +170,22 @@ mod tests {
         // The reviewer is not the writer: it must never be asked to rewrite.
         assert!(prompt.contains("the writer and NOT a copy-editor"));
         assert!(prompt.contains("When in doubt, mark it NOT supported"));
+    }
+
+    #[test]
+    fn the_prompt_includes_the_card_the_image_will_publish() {
+        // The card is rendered into the image, so a fabricated fact there is a
+        // fabrication — the reviewer must see it.
+        let mut with_card = variant("A", "the caption");
+        with_card.card = Some(CardContent {
+            title: "7 GB".into(),
+            body: "mostly models".into(),
+        });
+        let prompt = build_grounding_prompt(source(), &[with_card]);
+        assert!(
+            prompt.contains("card — title: 7 GB | fact: mostly models"),
+            "the card must reach the reviewer: {prompt}"
+        );
     }
 
     #[test]

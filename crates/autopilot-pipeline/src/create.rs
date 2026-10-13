@@ -8,6 +8,27 @@ use crate::grounding::Source;
 use crate::json::extract_json;
 use crate::prompt::{platform_limit, render_banned_phrases, render_guidelines};
 
+/// The information a post's card carries.
+///
+/// The card is **not** the post text: the post *introduces* and comments, the
+/// card *states* the information (a number, a name, a concrete detail from the
+/// source). Rendering the post text into the image — which is what happened
+/// until 2026-10-13 — makes the picture repeat the post.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CardContent {
+    /// Headline for the card. Short: the card wraps it over two lines.
+    pub title: String,
+    /// The fact the card states, taken from the source.
+    pub body: String,
+}
+
+impl CardContent {
+    /// True when the card has something to show.
+    pub fn is_usable(&self) -> bool {
+        !self.title.trim().is_empty() && !self.body.trim().is_empty()
+    }
+}
+
 /// One content variant (A or B) for a platform.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Variant {
@@ -17,6 +38,10 @@ pub struct Variant {
     pub hashtags: Vec<String>,
     #[serde(default)]
     pub image_prompt: String,
+    /// What the card (if one is attached) should say. Absent for a text-only
+    /// post, and absent in older responses — hence the default.
+    #[serde(default)]
+    pub card: Option<CardContent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,8 +90,13 @@ pub fn build_creation_prompt(
          Produce exactly 2 alternative variants (A and B) that could be A/B tested.\n\
          Each caption must respect the platform limit of {limit} characters and use at most\n\
          {max_tags} hashtags. Also propose a short image prompt for each variant.\n\n\
+         Each variant also carries a \"card\": the information the image will state — a short\n\
+         headline plus one concrete fact from the source (a number, a name, a detail). The\n\
+         caption is an INTRODUCTION to that card — your angle, why it matters — and never a\n\
+         restatement of it: the reader sees both, so they must not say the same thing.\n\n\
          Reply with ONLY a JSON array (no prose, no markdown) of objects with the keys\n\
-         \"label\" (\"A\" or \"B\"), \"text\", \"hashtags\" (array of strings) and \"image_prompt\".\n",
+         \"label\" (\"A\" or \"B\"), \"text\", \"hashtags\" (array of strings), \"image_prompt\",\n\
+         and \"card\" (an object with \"title\" and \"body\").\n",
         language = persona.language,
         platform = platform.as_str(),
         display_name = persona.display_name,
@@ -104,6 +134,29 @@ pub fn parse_variants(raw: &str) -> Result<Vec<Variant>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn it_parses_a_card_and_tolerates_its_absence() {
+        // The card is what the image states; an older response without one must
+        // still parse (hence `#[serde(default)]` on the field).
+        let raw = r#"[{"label":"A","text":"t","card":{"title":"7 GB","body":"mostly models"}},
+                       {"label":"B","text":"u"}]"#;
+        let variants = parse_variants(raw).expect("parses");
+        let card = variants[0].card.as_ref().expect("A carries a card");
+        assert_eq!(card.title, "7 GB");
+        assert_eq!(card.body, "mostly models");
+        assert!(card.is_usable());
+        assert!(variants[1].card.is_none());
+    }
+
+    #[test]
+    fn an_empty_card_is_not_usable() {
+        let card = CardContent {
+            title: "  ".into(),
+            body: "fact".into(),
+        };
+        assert!(!card.is_usable());
+    }
 
     fn persona() -> PersonaPack {
         crate::test_support::sample_persona_with_voice()

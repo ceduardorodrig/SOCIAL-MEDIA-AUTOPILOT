@@ -16,7 +16,7 @@ pub mod triage;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use create::{Variant, build_creation_prompt, parse_variants};
+pub use create::{CardContent, Variant, build_creation_prompt, parse_variants};
 pub use editor::{
     EditedVariant, EditorOutcome, build_editor_prompt, kept_variants, parse_editor_response,
     review_or_keep,

@@ -243,6 +243,7 @@ fn rewrite(original: &Variant, text: &str) -> Variant {
         text: text.trim().to_string(),
         hashtags: original.hashtags.clone(),
         image_prompt: original.image_prompt.clone(),
+        card: original.card.clone(),
     }
 }
 
@@ -260,6 +261,7 @@ mod tests {
             text: text.into(),
             hashtags: vec!["#ciencia".into()],
             image_prompt: "a brain".into(),
+            card: None,
         }
     }
 
