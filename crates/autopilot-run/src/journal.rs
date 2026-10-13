@@ -35,6 +35,11 @@ pub struct JournalEvent<'a> {
     /// The web URL in `detail` is for humans; the API needs `at://…`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uri: Option<&'a str>,
+    /// The format the slot actually published (`text`, `card`, `video`). It is
+    /// the publish step's own record, so the weekly per-format budget can be
+    /// counted back from the journal (HB-034).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<&'a str>,
     /// The unsupported claim a rejection named (additive: only the `grounding`
     /// stage). Kept as a field, not buried in `detail`, so the learning stage
     /// can read the *claim* rather than parse a sentence (HB-046).
@@ -49,6 +54,8 @@ pub struct PublishedEntry {
     pub platform: String,
     pub variant: String,
     pub uri: String,
+    /// The format actually published (`text`, `card`, `video`), when recorded.
+    pub format: Option<String>,
     /// When the journal recorded the publication (Unix seconds).
     pub published_at_unix: u64,
 }
@@ -82,6 +89,8 @@ struct JournalLine {
     variant: Option<String>,
     #[serde(default)]
     uri: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -133,6 +142,7 @@ pub async fn read_published(runs_dir: &Path) -> Result<Vec<PublishedEntry>> {
             platform,
             variant,
             uri,
+            format: event.format,
             published_at_unix: event.at_unix,
         });
     }
@@ -214,6 +224,7 @@ impl Journal {
             variant: outcome.variant.as_deref(),
             changes: outcome.changes.as_deref(),
             uri: outcome.uri.as_deref(),
+            format: outcome.format.as_deref(),
             reason: outcome.reason.as_deref(),
         };
         append_line(&self.path, &event, "journal").await
@@ -291,5 +302,46 @@ mod tests {
         let missing = std::env::temp_dir().join("autopilot-journal-does-not-exist");
         let rejections = read_grounding_rejections(&missing).await.expect("reads");
         assert!(rejections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_published_format_is_recovered_from_the_journal() {
+        // HB-034: the weekly per-format budget is counted back from the journal,
+        // so the publish line must carry the format it actually released.
+        let dir = temp_runs_dir("format").await;
+        let path = dir.join("demo-1.jsonl");
+        let card = serde_json::json!({
+            "at_unix": 100,
+            "run_id": "demo-1",
+            "persona": "demo",
+            "stage": "publish",
+            "status": "published",
+            "platform": "bluesky",
+            "variant": "A",
+            "uri": "at://did:plc:abc/app.bsky.feed.post/1",
+            "format": "card",
+        });
+        let text = serde_json::json!({
+            "at_unix": 90,
+            "run_id": "demo-1",
+            "persona": "demo",
+            "stage": "publish",
+            "status": "published",
+            "platform": "bluesky",
+            "variant": "B",
+            "uri": "at://did:plc:abc/app.bsky.feed.post/2",
+        });
+        tokio::fs::write(&path, format!("{card}\n{text}\n"))
+            .await
+            .expect("write journal");
+
+        let published = read_published(&dir).await.expect("reads");
+        assert_eq!(published.len(), 2);
+        assert_eq!(published[0].variant, "A");
+        assert_eq!(published[0].format.as_deref(), Some("card"));
+        // An older line without a format reads back as unknown (None), not lost.
+        assert_eq!(published[1].format, None);
+
+        tokio::fs::remove_dir_all(&dir).await.expect("cleanup");
     }
 }

@@ -44,13 +44,124 @@ pub enum SelectionRule {
     First,
 }
 
-/// How many variants a slot releases per platform and how it picks them.
+fn default_text_budget() -> u16 {
+    12
+}
+
+fn default_card_budget() -> u16 {
+    6
+}
+
+fn default_video_budget() -> u16 {
+    0
+}
+
+/// The medium a post uses, one per slot (`content-formats.md` §2).
+///
+/// The format is decided per topic by the creation stage (a filled
+/// `image_prompt` means a card, an empty one means text), but the *frequency*
+/// policy constrains which formats a slot may release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    /// Text only — the baseline, always available once the account is warm.
+    Text,
+    /// A post with a generated card (image).
+    Card,
+    /// A short video.
+    Video,
+}
+
+impl Format {
+    /// Stable, lower-case label used by the journal and the console.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Format::Text => "text",
+            Format::Card => "card",
+            Format::Video => "video",
+        }
+    }
+
+    /// Read a format back from its journal label. An unknown or absent label is
+    /// treated as text: the baseline format, so an older journal line never
+    /// disappears from the weekly accounting (HB-034).
+    pub fn from_label(label: Option<&str>) -> Format {
+        match label.map(str::trim) {
+            Some("card") => Format::Card,
+            Some("video") => Format::Video,
+            _ => Format::Text,
+        }
+    }
+}
+
+/// Weekly budget per format (`content-formats.md` §3), engine defaults.
+///
+/// The budget is **not rigid**: it exists to avoid monotony, not to impose a
+/// single ceiling — text is cheap and conversational, so it carries more volume
+/// than card or video, which cost production and attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FormatBudgets {
+    /// Text posts allowed per week (the baseline; the highest volume).
+    #[serde(default = "default_text_budget")]
+    pub text: u16,
+    /// Card (image) posts allowed per week.
+    #[serde(default = "default_card_budget")]
+    pub card: u16,
+    /// Short-video posts allowed per week (`0` until the pipeline is validated).
+    #[serde(default = "default_video_budget")]
+    pub video: u16,
+}
+
+impl FormatBudgets {
+    /// The weekly budget for one format.
+    pub fn budget(&self, format: Format) -> u16 {
+        match format {
+            Format::Text => self.text,
+            Format::Card => self.card,
+            Format::Video => self.video,
+        }
+    }
+}
+
+impl Default for FormatBudgets {
+    fn default() -> Self {
+        Self {
+            text: default_text_budget(),
+            card: default_card_budget(),
+            video: default_video_budget(),
+        }
+    }
+}
+
+/// Warming-ramp activation for a new account (`content-formats.md` §1).
+///
+/// A new account does not post at volume: the engine holds it to week 1
+/// (text only) and releases more formats as it warms. The ramp is **inert**
+/// until the pack declares when the account started — an older pack (no
+/// `started_on`) is treated as a mature account and keeps posting exactly as it
+/// did before.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarmingRamp {
+    /// ISO `YYYY-MM-DD` date the account started posting; absent means mature.
+    #[serde(default)]
+    pub started_on: Option<String>,
+}
+
+impl WarmingRamp {
+    /// The ramp start as days since 1970-01-01 (UTC), or `None` when inert.
+    pub fn start_day(&self) -> Option<i64> {
+        self.started_on.as_deref().and_then(parse_iso_date_days)
+    }
+}
+
+/// How many variants a slot releases per platform and how it picks them, plus
+/// the **format/frequency policy** the slot must respect (HB-034).
 ///
 /// The default is the owner-approved sequential policy: **one** variant per
 /// slot, rotating. Raising `variants_per_slot` publishes several look-alike
 /// posts in the same minute (the behaviour the redesign removed), so it is an
 /// explicit, deliberate opt-in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishingPolicy {
     /// How many approved variants one platform publishes per slot (at least 1).
     #[serde(default = "default_variants_per_slot")]
@@ -58,6 +169,12 @@ pub struct PublishingPolicy {
     /// How the slot picks among the approved variants.
     #[serde(default)]
     pub selection: SelectionRule,
+    /// Weekly budget per format (`content-formats.md` §3).
+    #[serde(default)]
+    pub formats: FormatBudgets,
+    /// Warming ramp for a new account (`content-formats.md` §1).
+    #[serde(default)]
+    pub warming: WarmingRamp,
 }
 
 impl Default for PublishingPolicy {
@@ -65,6 +182,8 @@ impl Default for PublishingPolicy {
         Self {
             variants_per_slot: default_variants_per_slot(),
             selection: SelectionRule::default(),
+            formats: FormatBudgets::default(),
+            warming: WarmingRamp::default(),
         }
     }
 }
@@ -285,6 +404,14 @@ impl PersonaPack {
                 problem: "variants_per_slot must be at least 1".into(),
             });
         }
+        if let Some(started_on) = &self.publishing.warming.started_on
+            && parse_iso_date_days(started_on).is_none()
+        {
+            issues.push(ValidationIssue {
+                field: "publishing.warming.started_on".into(),
+                problem: format!("`{started_on}` is not a valid YYYY-MM-DD date"),
+            });
+        }
         if self.active {
             for channel in &self.channels {
                 if channel.enabled && channel.handle.trim().is_empty() {
@@ -353,6 +480,61 @@ pub async fn load_dir(dir: &Path) -> Result<Vec<PersonaPack>> {
 
     packs.sort_by(|a, b| a.persona.cmp(&b.persona));
     Ok(packs)
+}
+
+/// Parse an ISO `YYYY-MM-DD` date into days since 1970-01-01 (UTC).
+///
+/// Returns `None` for anything that is not a real calendar date, so a typo in
+/// `publishing.warming.started_on` can never silently disable the ramp (it is a
+/// validation issue instead). The date is a *day number*, not a formatted
+/// string, because the run only needs to know how old the account is.
+pub fn parse_iso_date_days(value: &str) -> Option<i64> {
+    let mut parts = value.trim().split('-');
+    let (year, month, day) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return None;
+    }
+    let year: i64 = year.parse().ok()?;
+    let month: i64 = month.parse().ok()?;
+    let day: i64 = day.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+/// Days in `month` of `year` (1-based month).
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+    }
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Days since the Unix epoch for a proleptic-Gregorian date
+/// (Howard Hinnant's `days_from_civil`), valid for any year.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = (month + 9) % 12;
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 #[cfg(test)]
@@ -531,5 +713,100 @@ mod tests {
         assert_eq!(humanize_niche("science-curiosities"), "science curiosities");
         assert_eq!(humanize_niche("astrology_horoscope"), "astrology horoscope");
         assert_eq!(humanize_niche("  spaced  out "), "spaced out");
+    }
+
+    #[test]
+    fn the_format_budget_defaults_match_the_content_policy() {
+        // content-formats.md §3: text 12, card 6, video 0 until validated.
+        let budgets = FormatBudgets::default();
+        assert_eq!(budgets.budget(Format::Text), 12);
+        assert_eq!(budgets.budget(Format::Card), 6);
+        assert_eq!(budgets.budget(Format::Video), 0);
+    }
+
+    #[test]
+    fn the_warming_ramp_is_inert_until_a_pack_declares_its_start() {
+        assert_eq!(WarmingRamp::default().start_day(), None);
+        assert_eq!(
+            WarmingRamp {
+                started_on: Some("2026-10-13".into())
+            }
+            .start_day(),
+            parse_iso_date_days("2026-10-13")
+        );
+    }
+
+    #[test]
+    fn a_pack_with_a_bad_warming_date_is_rejected() {
+        let mut pack = base_pack();
+        pack.publishing.warming.started_on = Some("13/10/2026".into());
+        let issues = pack.validate();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.field == "publishing.warming.started_on"),
+            "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn iso_dates_parse_to_real_calendar_days_only() {
+        assert_eq!(parse_iso_date_days("1970-01-01"), Some(0));
+        assert_eq!(parse_iso_date_days("1970-01-02"), Some(1));
+        // 1970-01-08 is a Thursday exactly seven days later.
+        assert_eq!(parse_iso_date_days("1970-01-08"), Some(7));
+        // A leap day is real in a leap year and impossible otherwise.
+        assert_eq!(parse_iso_date_days("2024-02-29"), Some(19782));
+        assert_eq!(parse_iso_date_days("2023-02-29"), None);
+        // Anything that is not a strict YYYY-MM-DD date is not a date.
+        for junk in [
+            "2026-13-01",
+            "2026-00-10",
+            "2026-1-1",
+            "13/10/2026",
+            "",
+            "2026-10",
+        ] {
+            assert_eq!(parse_iso_date_days(junk), None, "junk: {junk}");
+        }
+    }
+
+    #[test]
+    fn a_format_label_round_trips_and_falls_back_to_text() {
+        assert_eq!(Format::Text.as_str(), "text");
+        assert_eq!(Format::from_label(Some("card")), Format::Card);
+        assert_eq!(Format::from_label(Some("video")), Format::Video);
+        // An unknown or absent label is the baseline, never an error.
+        assert_eq!(Format::from_label(Some("gif")), Format::Text);
+        assert_eq!(Format::from_label(None), Format::Text);
+    }
+
+    #[test]
+    fn the_publishing_policy_carries_the_format_and_warming_defaults() {
+        let policy = PublishingPolicy::default();
+        assert_eq!(policy.formats, FormatBudgets::default());
+        assert_eq!(policy.warming, WarmingRamp::default());
+    }
+
+    #[test]
+    fn a_pack_can_override_the_budgets_and_declare_a_warming_start() {
+        // The engine's policy is data: a pack opts into a different cadence
+        // without a code change (HB-034). The block parses from YAML as the
+        // owner will write it.
+        let yaml = "persona: demo\nniche: science\nvoice:\n  tone: curious\n  audience: adults\nblocklist:\n  - forbidden\nrubric:\n  min_score: 0.75\nchannels:\n  - platform: bluesky\n    handle: demo\n    enabled: true\npublishing:\n  formats:\n    text: 9\n    card: 2\n    video: 1\n  warming:\n    started_on: 2026-10-13\n";
+        let pack: PersonaPack = serde_yaml_ng::from_str(yaml).expect("parses");
+        assert_eq!(
+            pack.publishing.formats,
+            FormatBudgets {
+                text: 9,
+                card: 2,
+                video: 1,
+            }
+        );
+        assert_eq!(
+            pack.publishing.warming.started_on.as_deref(),
+            Some("2026-10-13")
+        );
+        assert!(pack.validate().is_empty(), "{:?}", pack.validate());
     }
 }

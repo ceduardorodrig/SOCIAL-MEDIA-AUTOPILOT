@@ -1,0 +1,36 @@
+# Persona pack fixture for the HB-034 slot gate.
+# Active, with **no** publishing windows, so the day-ceiling gate (a slot is an
+# opportunity, not an obligation) is the only reason a run can skip.
+
+persona: slot-gate-demo
+display_name: "Slot Gate Demo"
+niche: demo-niche
+language: en
+active: true
+
+voice:
+  tone: "curious"
+  audience: "tests"
+  guidelines: []
+  banned_phrases: []
+  max_hashtags: 3
+  emojis_allowed: true
+
+few_shot: []
+
+blocklist:
+  - "forbidden"
+
+rubric:
+  min_score: 0.75
+  criteria:
+    - name: hook
+      weight: 1.0
+      description: "does the hook land?"
+
+channels:
+  - platform: bluesky
+    handle: "slot-gate.bsky.social"
+    enabled: true
+    posts_per_day: 1
+    windows: []

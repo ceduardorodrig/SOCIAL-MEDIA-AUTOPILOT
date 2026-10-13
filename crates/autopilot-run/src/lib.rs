@@ -23,6 +23,8 @@ pub use journal::{
     read_published,
 };
 pub use runner::{
-    CardAttachment, PublishedPost, RunOptions, RunReport, StageOutcome, StageStatus,
-    partition_variants, resolve_channels, run, select_harvest_query, select_topic, select_variants,
+    CardAttachment, FormatCounts, PublishedPost, RunOptions, RunReport, StageOutcome, StageStatus,
+    channel_ceiling, day_has_room, effective_format, intended_format, partition_variants,
+    published_on, resolve_channels, run, select_harvest_query, select_topic, select_variants,
+    warming_ceiling, warming_releases, warming_week, week_counts, week_start,
 };

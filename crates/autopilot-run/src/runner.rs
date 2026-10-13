@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use autopilot_core::{
-    PersonaPack, Platform, PublishingPolicy, SelectionRule, load_persona, now_unix,
+    Format, FormatBudgets, PersonaPack, Platform, PublishingPolicy, SelectionRule, load_persona,
+    now_unix, utc_day,
 };
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{
@@ -33,7 +34,7 @@ use autopilot_publish::{
 };
 use chrono::{Local, Timelike};
 
-use crate::journal::Journal;
+use crate::journal::{Journal, PublishedEntry, read_published};
 
 /// How long to wait for one LLM completion.
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -160,6 +161,10 @@ pub struct StageOutcome {
     /// draft (additive). The learning stage reads it as a *kind of claim* to
     /// avoid (HB-046).
     pub reason: Option<String>,
+    /// The format actually published, when the stage is `publish` (additive):
+    /// `text`, `card` or `video`. Recorded so the weekly per-format budget is
+    /// counted back from the journal (HB-034).
+    pub format: Option<String>,
 }
 
 impl StageOutcome {
@@ -173,6 +178,7 @@ impl StageOutcome {
             changes: None,
             uri: None,
             reason: None,
+            format: None,
         }
     }
 
@@ -198,6 +204,11 @@ impl StageOutcome {
 
     fn with_reason(mut self, reason: &str) -> Self {
         self.reason = Some(reason.to_string());
+        self
+    }
+
+    fn with_format(mut self, format: Format) -> Self {
+        self.format = Some(format.as_str().to_string());
         self
     }
 }
@@ -304,6 +315,180 @@ pub fn matching_window(windows: &[String], now: i64, tolerance: i64) -> Option<S
             })
         })
         .cloned()
+}
+
+/// The format a slot intends to publish, before the frequency policy runs.
+///
+/// The creation stage fills `image_prompt` when the topic's angle suits a card
+/// (`content-formats.md` §2), so the card mode plus that prompt is the intent;
+/// an empty prompt is a text post.
+pub fn intended_format(image_prompt: &str, card: CardAttachment) -> Format {
+    if card.should_attach(image_prompt) {
+        Format::Card
+    } else {
+        Format::Text
+    }
+}
+
+/// The warming-ramp week (1-based) for an account `age_days` old.
+///
+/// `content-formats.md` §1: week 1 is text-only, week 2 adds the card, week 3+
+/// is steady state. A future or just-started account (age <= 0) is week 1.
+pub fn warming_week(age_days: i64) -> u8 {
+    (age_days.max(0) / 7 + 1).clamp(1, 3) as u8
+}
+
+/// The daily posting ceiling the ramp imposes on its week.
+///
+/// Week 1 holds a new account to one post a day; weeks 2+ allow two. The
+/// declared `posts_per_day` is the upper bound, so the ramp only ever tightens.
+pub fn warming_ceiling(age_days: i64) -> u8 {
+    match warming_week(age_days) {
+        1 => 1,
+        _ => 2,
+    }
+}
+
+/// The formats a ramp week releases.
+pub fn warming_releases(age_days: i64) -> &'static [Format] {
+    const WEEK_1: [Format; 1] = [Format::Text];
+    const WEEK_2: [Format; 2] = [Format::Text, Format::Card];
+    const STEADY: [Format; 3] = [Format::Text, Format::Card, Format::Video];
+    match warming_week(age_days) {
+        1 => &WEEK_1,
+        2 => &WEEK_2,
+        _ => &STEADY,
+    }
+}
+
+/// How many posts this persona and platform released on a given UTC day.
+pub fn published_on(
+    published: &[PublishedEntry],
+    persona: &str,
+    platform: &str,
+    day: i64,
+) -> usize {
+    published
+        .iter()
+        .filter(|entry| {
+            entry.persona == persona
+                && entry.platform == platform
+                && utc_day(entry.published_at_unix) == day
+        })
+        .count()
+}
+
+/// The Monday (UTC) that starts the week containing `day`.
+///
+/// 1970-01-01 was a Thursday, so a `+3` offset lands Monday on a multiple of
+/// seven.
+pub fn week_start(day: i64) -> i64 {
+    day - (day + 3).rem_euclid(7)
+}
+
+/// How many posts of each format a channel already released this week.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FormatCounts {
+    pub text: u16,
+    pub card: u16,
+    pub video: u16,
+}
+
+impl FormatCounts {
+    /// The count for one format.
+    pub fn count(&self, format: Format) -> u16 {
+        match format {
+            Format::Text => self.text,
+            Format::Card => self.card,
+            Format::Video => self.video,
+        }
+    }
+}
+
+/// The per-format counts a channel released in the week starting `week_start_day`.
+///
+/// The format comes from the publish journal line, so the accounting reads back
+/// exactly what went out (HB-034). An unlabelled older line counts as text.
+pub fn week_counts(
+    published: &[PublishedEntry],
+    persona: &str,
+    platform: &str,
+    week_start_day: i64,
+) -> FormatCounts {
+    let mut counts = FormatCounts::default();
+    for entry in published {
+        if entry.persona != persona || entry.platform != platform {
+            continue;
+        }
+        if utc_day(entry.published_at_unix) < week_start_day {
+            continue;
+        }
+        let slot = match Format::from_label(entry.format.as_deref()) {
+            Format::Text => &mut counts.text,
+            Format::Card => &mut counts.card,
+            Format::Video => &mut counts.video,
+        };
+        *slot = slot.saturating_add(1);
+    }
+    counts
+}
+
+/// The format a slot may actually publish, after the ramp and the weekly budget.
+///
+/// `content-formats.md` §3: the budget is **not rigid** — a card that would
+/// exceed the week's card budget ships as text (the baseline) instead of being
+/// lost, because the content commands and the budget only avoids monotony. Only
+/// a slot whose text budget is *also* spent waits for the next slot (`None`).
+pub fn effective_format(
+    intended: Format,
+    age_days: Option<i64>,
+    budgets: &FormatBudgets,
+    counts: &FormatCounts,
+) -> Option<Format> {
+    let allowed = |format: Format| {
+        let released = age_days.is_none_or(|age| warming_releases(age).contains(&format));
+        released && counts.count(format) < budgets.budget(format)
+    };
+    if allowed(intended) {
+        return Some(intended);
+    }
+    if intended != Format::Text && allowed(Format::Text) {
+        return Some(Format::Text);
+    }
+    None
+}
+
+/// The day's posting ceiling for one platform, tightened by the warming ramp.
+pub fn channel_ceiling(persona: &PersonaPack, platform: Platform, age_days: Option<i64>) -> u8 {
+    let declared = persona
+        .channels
+        .iter()
+        .filter(|channel| channel.enabled && channel.platform == platform)
+        .map(|channel| channel.posts_per_day)
+        .max()
+        .unwrap_or(0);
+    match age_days {
+        Some(age) => declared.min(warming_ceiling(age)),
+        None => declared,
+    }
+}
+
+/// Whether **any** targeted channel still has room under the day's ceiling.
+///
+/// This is the "slot is an opportunity, not an obligation" gate: when every
+/// channel already met its declared `posts_per_day` (tightened by the ramp), the
+/// slot is skipped before any LLM call, so an extra scheduler fire costs nothing.
+pub fn day_has_room(
+    persona: &PersonaPack,
+    platforms: &[Platform],
+    published: &[PublishedEntry],
+    day: i64,
+    age_days: Option<i64>,
+) -> bool {
+    platforms.iter().any(|platform| {
+        let ceiling = channel_ceiling(persona, *platform, age_days) as usize;
+        published_on(published, &persona.persona, platform.as_str(), day) < ceiling
+    })
 }
 
 /// Split drafts into guardrail-approved and rejected (with the verdict).
@@ -432,6 +617,14 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
     // windows. The scheduler is aligned to the hl-infer batch windows and fires
     // more often than the persona posts, so this is what keeps the account at
     // its declared cadence instead of one post per fire.
+    //
+    // The day gate (below) is the second half of the same contract: a slot is an
+    // *opportunity*, not an obligation. Once every targeted channel has met its
+    // declared `posts_per_day` (tightened by the warming ramp for a new
+    // account), the slot is skipped before any LLM call, so an extra scheduler
+    // fire costs nothing. A missed slot is never compensated with a burst.
+    let mut published: Vec<PublishedEntry> = Vec::new();
+    let mut age_days: Option<i64> = None;
     if !options.dry_run {
         let windows: Vec<String> = persona
             .channels
@@ -455,6 +648,46 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
                     StageStatus::Skipped,
                     format!(
                         "outside the publishing windows {windows:?} — waiting for the next one"
+                    ),
+                ),
+            )
+            .await?;
+            return Ok(report);
+        }
+
+        let runs_dir = report
+            .journal
+            .parent()
+            .unwrap_or_else(|| Path::new("var/runs"));
+        published = read_published(runs_dir).await?;
+        let day = utc_day(now_unix());
+        age_days = persona
+            .publishing
+            .warming
+            .start_day()
+            .map(|start| day - start);
+
+        if !day_has_room(&persona, &channels, &published, day, age_days) {
+            let reached = channels
+                .iter()
+                .map(|platform| {
+                    format!(
+                        "{} {}/{}",
+                        platform.as_str(),
+                        published_on(&published, &persona.persona, platform.as_str(), day),
+                        channel_ceiling(&persona, *platform, age_days)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            record(
+                &mut report,
+                &journal,
+                StageOutcome::new(
+                    "run",
+                    StageStatus::Skipped,
+                    format!(
+                        "the day's ceiling is reached ({reached}) — a slot is an opportunity, not an obligation"
                     ),
                 ),
             )
@@ -620,9 +853,13 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         &mut report,
         &journal,
         &options,
-        persona.publishing,
+        &persona.publishing,
         &topic_title,
         &approved,
+        &SlotState {
+            published: &published,
+            age_days,
+        },
     )
     .await?;
     Ok(report)
@@ -1165,7 +1402,6 @@ async fn stage_guardrail<'a>(
     Ok(approved)
 }
 
-/// Stage [4] — publish. Only the platforms with an adapter are served.
 /// Stage [3.7] — ground every approved draft in the source it came from.
 ///
 /// The guardrail is deterministic: it can refuse a banned phrase, but it cannot
@@ -1300,13 +1536,27 @@ async fn stage_grounding<'a>(
     Ok(kept)
 }
 
+/// The frequency-policy state resolved once per run (HB-034).
+///
+/// The journal read and the account age are shared by the day gate and by every
+/// platform's publish step, so they travel together instead of as loose
+/// arguments.
+struct SlotState<'a> {
+    /// The posts already published (the journal, read once before the gates).
+    published: &'a [PublishedEntry],
+    /// The account's age in days, or `None` for a mature account (ramp inert).
+    age_days: Option<i64>,
+}
+
+/// Stage [4] — publish. Only the platforms with an adapter are served.
 async fn stage_publish(
     report: &mut RunReport,
     journal: &Journal,
     options: &RunOptions,
-    policy: PublishingPolicy,
+    policy: &PublishingPolicy,
     topic: &str,
     approved: &[(Platform, &Variant)],
+    slot: &SlotState<'_>,
 ) -> Result<()> {
     let mut session: Option<Session> = None;
     let mut handle = String::new();
@@ -1359,6 +1609,52 @@ async fn stage_publish(
             continue;
         }
 
+        // Frequency policy (HB-034): the format the creation stage chose must fit
+        // the warming ramp and the week's per-format budget. A card that would
+        // overshoot the budget ships as text (the baseline); only a slot whose
+        // text budget is *also* spent waits for the next slot.
+        let intended = intended_format(&variant.image_prompt, options.card);
+        let counts = week_counts(
+            slot.published,
+            &report.persona,
+            platform.as_str(),
+            week_start(utc_day(now_unix())),
+        );
+        let Some(format) = effective_format(intended, slot.age_days, &policy.formats, &counts)
+        else {
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "publish",
+                    StageStatus::Skipped,
+                    "the week's format budget is spent — waiting for the next slot",
+                )
+                .with_platform(*platform)
+                .with_variant(&variant.label),
+            )
+            .await?;
+            continue;
+        };
+        if format != intended {
+            record(
+                report,
+                journal,
+                StageOutcome::new(
+                    "slot",
+                    StageStatus::Ok,
+                    format!(
+                        "{} is not available this slot — publishing as {} instead",
+                        intended.as_str(),
+                        format.as_str()
+                    ),
+                )
+                .with_platform(*platform)
+                .with_variant(&variant.label),
+            )
+            .await?;
+        }
+
         if session.is_none() {
             match open_bluesky_session().await {
                 Ok(created) => {
@@ -1389,8 +1685,9 @@ async fn stage_publish(
         };
 
         // The guardrail already approved the text; the card is a rendering of it.
+        // The format the frequency policy resolved decides whether it is a card.
         let images =
-            match stage_card_image(report, journal, options, &run_id, topic, variant, current)
+            match stage_card_image(report, journal, format, &run_id, topic, variant, current)
                 .await?
             {
                 Some(image) => vec![image],
@@ -1411,7 +1708,8 @@ async fn stage_publish(
                     )
                     .with_platform(*platform)
                     .with_variant(&variant.label)
-                    .with_uri(&uri),
+                    .with_uri(&uri)
+                    .with_format(format),
                 )
                 .await?;
                 report.published.push(PublishedPost {
@@ -1449,13 +1747,13 @@ async fn stage_publish(
 async fn stage_card_image(
     report: &mut RunReport,
     journal: &Journal,
-    options: &RunOptions,
+    format: Format,
     run_id: &str,
     topic: &str,
     variant: &Variant,
     session: &Session,
 ) -> Result<Option<PostImage>> {
-    if !options.card.should_attach(&variant.image_prompt) {
+    if format != Format::Card {
         return Ok(None);
     }
 
@@ -2095,5 +2393,189 @@ mod tests {
         );
 
         tokio::fs::remove_file(&journal_path).await.ok();
+    }
+
+    /// A published entry on a given UTC day (`day` = days since the epoch).
+    fn entry(persona: &str, platform: &str, day: i64, format: Option<Format>) -> PublishedEntry {
+        PublishedEntry {
+            persona: persona.into(),
+            platform: platform.into(),
+            variant: "A".into(),
+            uri: format!("at://{persona}/{day}"),
+            format: format.map(|value| value.as_str().to_string()),
+            published_at_unix: (day as u64) * 86_400,
+        }
+    }
+
+    #[test]
+    fn the_warming_ramp_opens_one_week_at_a_time() {
+        // content-formats.md §1: week 1 text-only, week 2 adds the card, week 3+
+        // adds the video. The week is 1-based and clamps at steady state.
+        assert_eq!(warming_week(0), 1);
+        assert_eq!(warming_week(6), 1);
+        assert_eq!(warming_week(7), 2);
+        assert_eq!(warming_week(13), 2);
+        assert_eq!(warming_week(14), 3);
+        assert_eq!(warming_week(400), 3);
+        // A start date in the future is still week 1, never a negative week.
+        assert_eq!(warming_week(-5), 1);
+
+        assert_eq!(warming_releases(0), [Format::Text]);
+        assert!(warming_releases(7).contains(&Format::Card));
+        assert!(!warming_releases(7).contains(&Format::Video));
+        assert!(warming_releases(14).contains(&Format::Video));
+
+        assert_eq!(warming_ceiling(0), 1);
+        assert_eq!(warming_ceiling(7), 2);
+        assert_eq!(warming_ceiling(14), 2);
+    }
+
+    #[test]
+    fn the_week_starts_on_monday() {
+        // 1970-01-01 was a Thursday (day 0), so its Monday is three days back.
+        assert_eq!(week_start(0), -3);
+        assert_eq!(week_start(3), -3);
+        assert_eq!(week_start(4), 4);
+        // 1970-01-08 (Thursday, day 7) belongs to the week of Monday the 5th.
+        assert_eq!(week_start(7), 4);
+    }
+
+    #[test]
+    fn published_on_counts_only_that_day_and_channel() {
+        let history = vec![
+            entry("demo", "bluesky", 10, Some(Format::Text)),
+            entry("demo", "bluesky", 10, Some(Format::Card)),
+            entry("demo", "bluesky", 9, Some(Format::Text)),
+            entry("outra", "bluesky", 10, Some(Format::Text)),
+            entry("demo", "x", 10, Some(Format::Text)),
+        ];
+        assert_eq!(published_on(&history, "demo", "bluesky", 10), 2);
+        assert_eq!(published_on(&history, "demo", "bluesky", 9), 1);
+        assert_eq!(published_on(&history, "demo", "x", 10), 1);
+        assert_eq!(published_on(&history, "demo", "bluesky", 11), 0);
+    }
+
+    #[test]
+    fn week_counts_totals_each_format_and_ignores_earlier_weeks() {
+        // Day 10 is a Saturday; its week starts Monday day 4.
+        let history = vec![
+            entry("demo", "bluesky", 10, Some(Format::Card)),
+            entry("demo", "bluesky", 9, Some(Format::Text)),
+            entry("demo", "bluesky", 4, Some(Format::Text)),
+            entry("demo", "bluesky", 3, Some(Format::Card)), // previous week
+            entry("outra", "bluesky", 10, Some(Format::Card)),
+        ];
+        let counts = week_counts(&history, "demo", "bluesky", week_start(10));
+        assert_eq!(counts.text, 2);
+        assert_eq!(counts.card, 1);
+        assert_eq!(counts.video, 0);
+        // An unlabelled older line counts as the baseline format, never lost.
+        let legacy = vec![entry("demo", "bluesky", 10, None)];
+        assert_eq!(week_counts(&legacy, "demo", "bluesky", 4).text, 1);
+    }
+
+    #[test]
+    fn a_card_over_budget_becomes_text_but_a_full_text_budget_waits() {
+        let budgets = FormatBudgets::default();
+        let mut counts = FormatCounts::default();
+        assert_eq!(
+            effective_format(Format::Card, None, &budgets, &counts),
+            Some(Format::Card)
+        );
+
+        // The card budget is spent, so the card ships as text (content commands).
+        counts.card = budgets.card;
+        assert_eq!(
+            effective_format(Format::Card, None, &budgets, &counts),
+            Some(Format::Text)
+        );
+
+        // The text budget is *also* spent: the slot waits for the next one.
+        counts.text = budgets.text;
+        assert_eq!(
+            effective_format(Format::Card, None, &budgets, &counts),
+            None
+        );
+        assert_eq!(
+            effective_format(Format::Text, None, &budgets, &counts),
+            None
+        );
+    }
+
+    #[test]
+    fn the_ramp_holds_a_new_account_to_text_even_with_budget_left() {
+        let budgets = FormatBudgets::default();
+        let counts = FormatCounts::default();
+        // Week 1: a card the LLM wanted becomes text, because the ramp releases
+        // no card yet — not because a budget ran out.
+        assert_eq!(
+            effective_format(Format::Card, Some(0), &budgets, &counts),
+            Some(Format::Text)
+        );
+        // Week 2 releases the card, and it has budget.
+        assert_eq!(
+            effective_format(Format::Card, Some(7), &budgets, &counts),
+            Some(Format::Card)
+        );
+    }
+
+    #[test]
+    fn the_daily_ceiling_is_declared_and_tightened_by_the_ramp() {
+        let mut persona = persona();
+        persona.channels[0].posts_per_day = 2; // bluesky
+        assert_eq!(channel_ceiling(&persona, Platform::Bluesky, None), 2);
+        assert_eq!(channel_ceiling(&persona, Platform::Bluesky, Some(0)), 1);
+        assert_eq!(channel_ceiling(&persona, Platform::Bluesky, Some(7)), 2);
+    }
+
+    #[test]
+    fn a_slot_is_an_opportunity_not_an_obligation() {
+        // One post a day is declared; the journal already holds today's post, so
+        // the slot has no room and the run would skip before any LLM call.
+        let persona = persona();
+        let day = 20_000;
+        let history = vec![entry("demo", "bluesky", day, Some(Format::Text))];
+        assert!(!day_has_room(
+            &persona,
+            &[Platform::Bluesky],
+            &history,
+            day,
+            None
+        ));
+        // Yesterday's post does not fill today's slot.
+        assert!(day_has_room(
+            &persona,
+            &[Platform::Bluesky],
+            &history,
+            day + 1,
+            None
+        ));
+
+        // The run proceeds while *any* targeted channel still has room.
+        let history = vec![entry("demo", "bluesky", day, Some(Format::Text))];
+        assert!(day_has_room(
+            &persona,
+            &[Platform::Bluesky, Platform::X],
+            &history,
+            day,
+            None
+        ));
+    }
+
+    #[test]
+    fn the_intended_format_follows_the_card_mode_and_the_prompt() {
+        assert_eq!(
+            intended_format("a terminal", CardAttachment::Off),
+            Format::Text
+        );
+        assert_eq!(
+            intended_format("a terminal", CardAttachment::WhenPrompted),
+            Format::Card
+        );
+        assert_eq!(
+            intended_format("   ", CardAttachment::WhenPrompted),
+            Format::Text
+        );
+        assert_eq!(intended_format("", CardAttachment::Always), Format::Card);
     }
 }
