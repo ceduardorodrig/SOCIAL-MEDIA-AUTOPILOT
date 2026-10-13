@@ -18,7 +18,8 @@ pub mod video;
 pub(crate) mod test_support;
 
 pub use create::{
-    CardContent, Variant, build_creation_prompt, build_creation_prompt_with_avoid, parse_variants,
+    CardContent, Variant, build_creation_prompt, build_creation_prompt_with_avoid,
+    build_creation_prompt_with_policy, declared_availability, parse_variants,
 };
 pub use editor::{
     EditedVariant, EditorOutcome, build_editor_prompt, kept_variants, parse_editor_response,

@@ -61,7 +61,7 @@ fn default_video_budget() -> u16 {
 /// The format is decided per topic by the creation stage (a filled
 /// `image_prompt` means a card, an empty one means text), but the *frequency*
 /// policy constrains which formats a slot may release.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
     /// Text only — the baseline, always available once the account is warm.
@@ -91,6 +91,58 @@ impl Format {
             Some("video") => Format::Video,
             _ => Format::Text,
         }
+    }
+}
+
+/// The formats a slot may release this week, after the warming ramp and the
+/// weekly per-format budget (`content-formats.md` §3, HB-034).
+///
+/// The creation model is told which formats the budget and the ramp leave
+/// available so **it chooses** the format for the topic instead of the engine
+/// imposing one; the engine keeps only a deterministic safety net
+/// ([`crate`]-level `effective_format`). This is pure data so both the prompt
+/// (in `autopilot-pipeline`) and the publish gate (in `autopilot-run`) share one
+/// shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FormatAvailability {
+    pub text: bool,
+    pub card: bool,
+    pub video: bool,
+}
+
+impl FormatAvailability {
+    /// Every format released (the state a pack with no accounting starts from).
+    pub fn all() -> Self {
+        Self {
+            text: true,
+            card: true,
+            video: true,
+        }
+    }
+
+    /// Whether one format is available this slot.
+    pub fn allows(self, format: Format) -> bool {
+        match format {
+            Format::Text => self.text,
+            Format::Card => self.card,
+            Format::Video => self.video,
+        }
+    }
+
+    /// Whether any format is available at all.
+    pub fn any(self) -> bool {
+        self.text || self.card || self.video
+    }
+
+    /// Whether every format is available (nothing to constrain the model about).
+    pub fn unrestricted(self) -> bool {
+        self.text && self.card && self.video
+    }
+}
+
+impl Default for FormatAvailability {
+    fn default() -> Self {
+        Self::all()
     }
 }
 
@@ -136,21 +188,34 @@ impl Default for FormatBudgets {
 /// Warming-ramp activation for a new account (`content-formats.md` §1).
 ///
 /// A new account does not post at volume: the engine holds it to week 1
-/// (text only) and releases more formats as it warms. The ramp is **inert**
-/// until the pack declares when the account started — an older pack (no
-/// `started_on`) is treated as a mature account and keeps posting exactly as it
-/// did before.
+/// (text only) and releases more formats as it warms. The ramp is **autonomous**:
+/// the engine detects the account's birth from its own history (the first
+/// publication recorded in the run journals), and `started_on` is only an
+/// explicit **override** for the rare case the operator wants to force a start.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WarmingRamp {
-    /// ISO `YYYY-MM-DD` date the account started posting; absent means mature.
+    /// Explicit ISO `YYYY-MM-DD` override for the ramp start. When absent the
+    /// engine auto-detects the birth from the first recorded publication.
     #[serde(default)]
     pub started_on: Option<String>,
 }
 
 impl WarmingRamp {
-    /// The ramp start as days since 1970-01-01 (UTC), or `None` when inert.
+    /// The **declared** ramp start as days since 1970-01-01 (UTC), or `None`.
     pub fn start_day(&self) -> Option<i64> {
         self.started_on.as_deref().and_then(parse_iso_date_days)
+    }
+
+    /// Resolve the ramp start day: the explicit override wins, else the
+    /// auto-detected birth (`earliest_record_day`).
+    ///
+    /// Returns `None` when neither exists — an **empty base** (no journal and no
+    /// override) is treated as a mature account with **no ramp**, never as an
+    /// eternal "week 1": an old account whose journals were cleared must not be
+    /// throttled, and a brand-new account starts ramping from its first recorded
+    /// post onward.
+    pub fn resolve_start_day(&self, earliest_record_day: Option<i64>) -> Option<i64> {
+        self.start_day().or(earliest_record_day)
     }
 }
 
@@ -734,6 +799,61 @@ mod tests {
             .start_day(),
             parse_iso_date_days("2026-10-13")
         );
+    }
+
+    #[test]
+    fn the_ramp_resolves_the_override_first_then_the_detected_birth() {
+        // HB-034: the ramp is autonomous. The explicit `started_on` is an
+        // override; without it the engine uses the auto-detected birth.
+        let declared = WarmingRamp {
+            started_on: Some("2026-10-13".into()),
+        };
+        assert_eq!(
+            declared.resolve_start_day(Some(100)),
+            parse_iso_date_days("2026-10-13"),
+            "an explicit override wins over the detected birth"
+        );
+
+        // No override: the detected birth is the ramp start.
+        assert_eq!(
+            WarmingRamp::default().resolve_start_day(Some(100)),
+            Some(100)
+        );
+
+        // Empty base (no override, no record): no ramp — never an eternal week 1.
+        assert_eq!(WarmingRamp::default().resolve_start_day(None), None);
+        // An invalid override falls through to the detected birth (it never
+        // silently disables the ramp; validation flags the bad date).
+        let bad = WarmingRamp {
+            started_on: Some("13/10/2026".into()),
+        };
+        assert_eq!(bad.resolve_start_day(Some(42)), Some(42));
+    }
+
+    #[test]
+    fn format_availability_reports_and_defaults_to_all() {
+        assert_eq!(FormatAvailability::default(), FormatAvailability::all());
+        assert!(FormatAvailability::all().allows(Format::Video));
+        assert!(FormatAvailability::all().any());
+        assert!(FormatAvailability::all().unrestricted());
+
+        let restricted = FormatAvailability {
+            text: true,
+            card: false,
+            video: false,
+        };
+        assert!(restricted.allows(Format::Text));
+        assert!(!restricted.allows(Format::Card));
+        assert!(!restricted.allows(Format::Video));
+        assert!(restricted.any());
+        assert!(!restricted.unrestricted());
+
+        let none = FormatAvailability {
+            text: false,
+            card: false,
+            video: false,
+        };
+        assert!(!none.any());
     }
 
     #[test]

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use autopilot_core::{
-    Format, FormatBudgets, PersonaPack, Platform, PublishingPolicy, SelectionRule, load_persona,
-    now_unix, utc_day,
+    Format, FormatAvailability, FormatBudgets, PersonaPack, Platform, PublishingPolicy,
+    SelectionRule, load_persona, now_unix, utc_day,
 };
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{
@@ -24,7 +24,7 @@ use autopilot_media::{
     VERTICAL_HEIGHT, VERTICAL_WIDTH, VideoPlan, render as render_media,
 };
 use autopilot_pipeline::{
-    EditorOutcome, Source, TopicScore, Variant, build_creation_prompt_with_avoid,
+    EditorOutcome, Source, TopicScore, Variant, build_creation_prompt_with_policy,
     build_editor_prompt, build_grounding_prompt, build_triage_prompt, kept_variants,
     parse_editor_response, parse_grounding, parse_shortlist, parse_variants, review_or_keep,
     supported_labels,
@@ -387,6 +387,55 @@ pub fn warming_releases(age_days: i64) -> &'static [Format] {
     }
 }
 
+/// The account's **birth day** (UTC, days since the epoch) as the earliest
+/// publication recorded in the run journals (HB-034).
+///
+/// The warming ramp is autonomous: it does not depend on an operator filling in
+/// `started_on`. The first publication the engine ever recorded is the account's
+/// birth — the journals (`var/runs`) are the primary source of truth for "what
+/// happened in a run", and the metrics store is a secondary one. `None` when no
+/// publication has ever been recorded (an empty base), which the ramp reads as
+/// "no ramp" — a mature account, never an eternal week 1.
+pub fn detected_start_day(published: &[PublishedEntry]) -> Option<i64> {
+    published
+        .iter()
+        .map(|entry| utc_day(entry.published_at_unix))
+        .min()
+}
+
+/// Whether a format may be released this week: the warming ramp has opened it
+/// **and** its weekly budget is not spent.
+///
+/// This is the single predicate the prompt's availability and the publish gate's
+/// [`effective_format`] both read, so the model is told exactly what the engine
+/// will enforce (HB-034).
+pub fn format_available(
+    format: Format,
+    age_days: Option<i64>,
+    budgets: &FormatBudgets,
+    counts: &FormatCounts,
+) -> bool {
+    let released = age_days.is_none_or(|age| warming_releases(age).contains(&format));
+    released && counts.count(format) < budgets.budget(format)
+}
+
+/// The formats a slot may release this week, after the ramp and the budget.
+///
+/// Handed to the creation prompt so the **model** chooses the format among the
+/// available ones; the engine keeps only [`effective_format`] as a deterministic
+/// safety net.
+pub fn format_availability(
+    age_days: Option<i64>,
+    budgets: &FormatBudgets,
+    counts: &FormatCounts,
+) -> FormatAvailability {
+    FormatAvailability {
+        text: format_available(Format::Text, age_days, budgets, counts),
+        card: format_available(Format::Card, age_days, budgets, counts),
+        video: format_available(Format::Video, age_days, budgets, counts),
+    }
+}
+
 /// How many posts this persona and platform released on a given UTC day.
 pub fn published_on(
     published: &[PublishedEntry],
@@ -459,29 +508,45 @@ pub fn week_counts(
     counts
 }
 
-/// The format a slot may actually publish, after the ramp and the weekly budget.
+/// The format a slot may actually publish — the deterministic **safety net**.
 ///
-/// `content-formats.md` §3: the budget is **not rigid** — a card that would
-/// exceed the week's card budget ships as text (the baseline) instead of being
-/// lost, because the content commands and the budget only avoids monotony. Only
-/// a slot whose text budget is *also* spent waits for the next slot (`None`).
+/// `content-formats.md` §3: the model chooses the format from the availability
+/// it was given ([`format_availability`]); this function only guarantees the
+/// engine never violates the policy when the model's choice conflicts with it.
+/// A card (or video) that would exceed the week's budget ships as text (the
+/// baseline) instead of being lost — never dropped without the embed it asked
+/// for. Only a slot whose text budget is *also* spent waits (`None`).
 pub fn effective_format(
     intended: Format,
     age_days: Option<i64>,
     budgets: &FormatBudgets,
     counts: &FormatCounts,
 ) -> Option<Format> {
-    let allowed = |format: Format| {
-        let released = age_days.is_none_or(|age| warming_releases(age).contains(&format));
-        released && counts.count(format) < budgets.budget(format)
-    };
-    if allowed(intended) {
+    if format_available(intended, age_days, budgets, counts) {
         return Some(intended);
     }
-    if intended != Format::Text && allowed(Format::Text) {
+    if intended != Format::Text && format_available(Format::Text, age_days, budgets, counts) {
         return Some(Format::Text);
     }
     None
+}
+
+/// The weekly budgets for one platform, after the learned adjustment (HB-034).
+///
+/// The learned movement is scoped **per persona × platform**: the memory
+/// proposal was learned for one platform, so it only adjusts that platform's
+/// budget; every other channel keeps the pack's declared budgets.
+pub fn budgets_for_platform(
+    base: &FormatBudgets,
+    memory: Option<&autopilot_learn::MemoryUpdate>,
+    platform: Platform,
+) -> FormatBudgets {
+    match memory {
+        Some(update) if update.platform == platform => {
+            autopilot_learn::apply_budget_adjustments(base, &update.budget_adjustments)
+        }
+        _ => *base,
+    }
 }
 
 /// The day's posting ceiling for one platform, tightened by the warming ramp.
@@ -687,10 +752,15 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
             .unwrap_or_else(|| Path::new("var/runs"));
         published = read_published(runs_dir).await?;
         let day = utc_day(now_unix());
+        // HB-034: the ramp is autonomous. The explicit `started_on` is an
+        // override; otherwise the engine detects the account's birth from the
+        // first publication it ever recorded in the journals. An empty base (no
+        // record, no override) is a mature account with **no ramp** — never an
+        // eternal week 1.
         age_days = persona
             .publishing
             .warming
-            .start_day()
+            .resolve_start_day(detected_start_day(&published))
             .map(|start| day - start);
 
         if !day_has_room(&persona, &channels, &published, day, age_days) {
@@ -807,15 +877,20 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
     });
 
     // HB-046: the [3.7] reviewer's refusals are learned, not just gated. Load
-    // the persona's avoid memory so the creation stage is warned off a claim
-    // that was already refused instead of rediscovering it every slot.
-    let avoid = load_avoid(
+    // the persona's memory so the creation stage is warned off a claim that was
+    // already refused — and so the learned per-format budget (HB-034) reaches
+    // the slot's format policy instead of being rediscovered every week.
+    let memory = load_memory(
         &mut report,
         &journal,
         &persona,
         options.memory_path.as_deref(),
     )
     .await?;
+    let avoid = memory
+        .as_ref()
+        .map(autopilot_learn::avoid_warnings)
+        .unwrap_or_default();
 
     let drafts = stage_create(
         &mut report,
@@ -827,6 +902,9 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
             topic: &topic_title,
             source,
             avoid: &avoid,
+            published: &published,
+            age_days,
+            memory: memory.as_ref(),
         },
     )
     .await?;
@@ -888,6 +966,7 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
             published: &published,
             age_days,
             media: &media,
+            memory: memory.as_ref(),
         },
     )
     .await?;
@@ -1158,37 +1237,39 @@ fn memory_path(persona: &str, override_path: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(format!("var/learn/{persona}.json")))
 }
 
-/// The "avoid" warnings the learning stage left for this persona.
+/// The persona's persisted memory proposal, or `None` when nothing has been
+/// learned yet.
 ///
 /// HB-046: the [3.7] grounding reviewer's refusals must teach, not just gate.
-/// The persisted memory proposal carries them (as *kinds of claim*), and the
-/// creation stage is warned off them here so the same unsupported claim is not
-/// rediscovered every slot. A missing file is normal (nothing learned yet); an
-/// unreadable one is journalled but never blocks the run — this memory is
-/// advisory, unlike the fail-closed grounding review itself.
-async fn load_avoid(
+/// The persisted memory carries them (as *kinds of claim*), and the creation
+/// stage is warned off them here so the same unsupported claim is not
+/// rediscovered every slot. HB-034: the same file carries the learned
+/// per-format budget movements the slot applies. A missing file is normal
+/// (nothing learned yet); an unreadable one is journalled but never blocks the
+/// run — this memory is advisory, unlike the fail-closed grounding review itself.
+async fn load_memory(
     report: &mut RunReport,
     journal: &Journal,
     persona: &PersonaPack,
     override_path: Option<&Path>,
-) -> Result<Vec<String>> {
+) -> Result<Option<autopilot_learn::MemoryUpdate>> {
     let path = memory_path(&persona.persona, override_path);
 
-    let (warnings, outcome) = match autopilot_learn::read_memory(&path).await {
+    let (update, outcome) = match autopilot_learn::read_memory(&path).await {
         Ok(Some(update)) => {
-            let warnings = autopilot_learn::avoid_warnings(&update);
             let detail = format!(
-                "{} avoid warning(s) loaded from {}",
-                warnings.len(),
-                path.display()
+                "loaded from {} — {} avoid warning(s), {} budget adjustment(s)",
+                path.display(),
+                update.avoid.len(),
+                update.budget_adjustments.len()
             );
             (
-                warnings,
+                Some(update),
                 StageOutcome::new("memory", StageStatus::Ok, detail),
             )
         }
         Ok(None) => (
-            Vec::new(),
+            None,
             StageOutcome::new(
                 "memory",
                 StageStatus::Skipped,
@@ -1199,12 +1280,12 @@ async fn load_avoid(
             ),
         ),
         Err(err) => (
-            Vec::new(),
+            None,
             StageOutcome::new(
                 "memory",
                 StageStatus::Error,
                 format!(
-                    "memory at {} unreadable — continuing without avoid warnings: {err:#}",
+                    "memory at {} unreadable — continuing without it: {err:#}",
                     path.display()
                 ),
             ),
@@ -1212,15 +1293,19 @@ async fn load_avoid(
     };
 
     record(report, journal, outcome).await?;
-    Ok(warnings)
+    Ok(update)
 }
 
 /// The inputs the creation stage writes against: the topic, the source it may
-/// cite, and the avoid memory it must respect (HB-046).
+/// cite, the avoid memory it must respect (HB-046) and the slot's format policy
+/// — the live counts, the account age and the learned budget (HB-034).
 struct CreationInput<'a> {
     topic: &'a str,
     source: Option<Source<'a>>,
     avoid: &'a [String],
+    published: &'a [PublishedEntry],
+    age_days: Option<i64>,
+    memory: Option<&'a autopilot_learn::MemoryUpdate>,
 }
 
 /// Stage [3] — creation. Returns the drafts grouped by platform.
@@ -1233,13 +1318,27 @@ async fn stage_create(
     input: CreationInput<'_>,
 ) -> Result<Vec<(Platform, Vec<Variant>)>> {
     let mut drafts = Vec::new();
+    let day = utc_day(now_unix());
     for platform in channels {
-        let prompt = build_creation_prompt_with_avoid(
+        // HB-034: the slot's real format availability (warming ramp + weekly
+        // per-format budget + learned adjustment) is handed to the model, which
+        // then chooses the format for the topic. The engine's deterministic gate
+        // (`effective_format`) stays as the safety net, not the decider.
+        let counts = week_counts(
+            input.published,
+            &persona.persona,
+            platform.as_str(),
+            week_start(day),
+        );
+        let budgets = budgets_for_platform(&persona.publishing.formats, input.memory, *platform);
+        let availability = format_availability(input.age_days, &budgets, &counts);
+        let prompt = build_creation_prompt_with_policy(
             persona,
             *platform,
             input.topic,
             input.source,
             input.avoid,
+            &availability,
         );
         match complete_with_chain(registry, &prompt, JobKind::Create, COMPLETION_TIMEOUT).await {
             Ok(completion) => match parse_variants(&completion.text) {
@@ -1582,10 +1681,11 @@ async fn stage_grounding<'a>(
 
 /// The frequency-policy state resolved once per run (HB-034).
 ///
-/// The journal read and the account age are shared by the day gate and by every
-/// platform's publish step, so they travel together instead of as loose
-/// arguments. The media configuration travels with them: it is resolved once for
-/// the run and consumed only when the policy releases the video format.
+/// The journal read, the account age and the learned budget are shared by the
+/// day gate and by every platform's publish step, so they travel together
+/// instead of as loose arguments. The media configuration travels with them: it
+/// is resolved once for the run and consumed only when the policy releases the
+/// video format.
 struct SlotState<'a> {
     /// The posts already published (the journal, read once before the gates).
     published: &'a [PublishedEntry],
@@ -1593,6 +1693,9 @@ struct SlotState<'a> {
     age_days: Option<i64>,
     /// Media configuration (Piper binary/voice, motion, scene images).
     media: &'a MediaConfig,
+    /// The persona's memory proposal, carrying the learned per-format budget
+    /// (HB-034) the publish gate applies.
+    memory: Option<&'a autopilot_learn::MemoryUpdate>,
 }
 
 /// Stage [4] — publish. Only the platforms with an adapter are served.
@@ -1657,22 +1760,23 @@ async fn stage_publish(
         }
 
         // Frequency policy (HB-034): the format the creation stage chose must fit
-        // the warming ramp and the week's per-format budget. A card that would
-        // overshoot the budget ships as text (the baseline); only a slot whose
-        // text budget is *also* spent waits for the next slot.
+        // the warming ramp and the week's per-format budget. The model was told
+        // the availability and chose accordingly; this is the deterministic
+        // safety net — a card that would overshoot the budget ships as text (the
+        // baseline), and only a slot whose text budget is *also* spent waits.
         let intended = intended_format(
             &variant.image_prompt,
             variant.video_plan.as_ref(),
             options.card,
         );
+        let budgets = budgets_for_platform(&policy.formats, slot.memory, *platform);
         let counts = week_counts(
             slot.published,
             &report.persona,
             platform.as_str(),
             week_start(utc_day(now_unix())),
         );
-        let Some(format) = effective_format(intended, slot.age_days, &policy.formats, &counts)
-        else {
+        let Some(format) = effective_format(intended, slot.age_days, &budgets, &counts) else {
             record(
                 report,
                 journal,
@@ -2277,6 +2381,7 @@ mod tests {
                 penalty: autopilot_learn::PENALTY_GROUNDING_REJECTED,
                 evidence: claim.into(),
             }],
+            budget_adjustments: vec![],
             schedule_hints: vec![],
             reason: "test".into(),
         };
@@ -2887,6 +2992,135 @@ mod tests {
             effective_format(Format::Video, Some(14), &budgets, &spent_all),
             None
         );
+    }
+
+    #[test]
+    fn the_ramp_birth_is_detected_from_the_first_published_post() {
+        // HB-034: the ramp is autonomous — the birth is the earliest
+        // publication ever recorded, not a field someone fills in by hand.
+        assert_eq!(detected_start_day(&[]), None, "an empty base has no birth");
+
+        let one = vec![entry("demo", "bluesky", 20_000, Some(Format::Text))];
+        assert_eq!(detected_start_day(&one), Some(20_000));
+
+        let history = vec![
+            entry("demo", "bluesky", 20_010, Some(Format::Card)),
+            entry("demo", "bluesky", 20_000, Some(Format::Text)),
+            entry("demo", "bluesky", 20_005, Some(Format::Text)),
+        ];
+        assert_eq!(detected_start_day(&history), Some(20_000));
+    }
+
+    #[test]
+    fn a_brand_new_account_ramps_from_its_first_post_and_an_old_one_does_not() {
+        // One post, published today: the account is in week 1 (text only).
+        let day = 20_000;
+        let one = vec![entry("demo", "bluesky", day, Some(Format::Text))];
+        let start = detected_start_day(&one).expect("a birth");
+        let age = day - start;
+        assert_eq!(warming_week(age), 1);
+        assert_eq!(warming_ceiling(age), 1);
+        assert!(!warming_releases(age).contains(&Format::Card));
+
+        // The same account a month later is at steady state — the ramp opened
+        // on its own, with no `started_on` ever written.
+        let old = vec![entry("demo", "bluesky", day - 30, Some(Format::Text))];
+        let start = detected_start_day(&old).expect("a birth");
+        let age = day - start;
+        assert_eq!(warming_week(age), 3);
+        assert!(warming_releases(age).contains(&Format::Video));
+    }
+
+    #[test]
+    fn the_format_availability_mirrors_the_ramp_and_the_budget() {
+        let budgets = FormatBudgets::default();
+        let counts = FormatCounts::default();
+        // Week 1 releases text only.
+        assert_eq!(
+            format_availability(Some(0), &budgets, &counts),
+            FormatAvailability {
+                text: true,
+                card: false,
+                video: false,
+            }
+        );
+        // Steady state releases text and card; the default video budget is 0, so
+        // the video stays unavailable even after the ramp.
+        assert_eq!(
+            format_availability(Some(21), &budgets, &counts),
+            FormatAvailability {
+                text: true,
+                card: true,
+                video: false,
+            }
+        );
+        // A spent card budget removes the card from the availability.
+        let spent_card = FormatCounts {
+            card: budgets.card,
+            ..FormatCounts::default()
+        };
+        let limited = format_availability(None, &budgets, &spent_card);
+        assert!(!limited.allows(Format::Card));
+        assert!(limited.allows(Format::Text));
+    }
+
+    #[test]
+    fn the_model_choice_is_degraded_by_the_safety_net_never_dropped_embedless() {
+        // The model chose a card; the card budget is spent. The deterministic
+        // fallback ships the post as text — never a card without budget, and
+        // never a post that promised an embed and lost it silently.
+        let budgets = FormatBudgets::default();
+        let spent_card = FormatCounts {
+            card: budgets.card,
+            ..FormatCounts::default()
+        };
+        assert_eq!(
+            effective_format(Format::Card, None, &budgets, &spent_card),
+            Some(Format::Text)
+        );
+        // Text is spent too: the slot waits for the next one.
+        let spent_all = FormatCounts {
+            card: budgets.card,
+            text: budgets.text,
+            ..FormatCounts::default()
+        };
+        assert_eq!(
+            effective_format(Format::Card, None, &budgets, &spent_all),
+            None
+        );
+    }
+
+    #[test]
+    fn the_learned_budget_only_moves_the_platform_it_was_learned_for() {
+        // HB-034: the learned adjustment is scoped per persona × platform, so a
+        // proposal learned on bluesky never changes the X budget.
+        let base = FormatBudgets::default();
+        let update = autopilot_learn::MemoryUpdate {
+            persona: "demo".into(),
+            generated_at_unix: 0,
+            platform: Platform::Bluesky,
+            winner: None,
+            min_samples: 1,
+            variants: vec![],
+            few_shot: vec![],
+            avoid: vec![],
+            budget_adjustments: vec![autopilot_learn::BudgetAdjustment {
+                format: Format::Card,
+                step: 1,
+                samples: 10,
+                mean_score: 30.0,
+                baseline: 10.0,
+                reason: "card beats the median".into(),
+            }],
+            schedule_hints: vec![],
+            reason: "test".into(),
+        };
+        let bluesky = budgets_for_platform(&base, Some(&update), Platform::Bluesky);
+        assert_eq!(bluesky.card, base.card + 1);
+        let x = budgets_for_platform(&base, Some(&update), Platform::X);
+        assert_eq!(x, base, "the X budget is untouched");
+        // No memory at all: the pack's declared budget.
+        assert_eq!(budgets_for_platform(&base, None, Platform::Bluesky), base);
     }
 
     #[tokio::test]

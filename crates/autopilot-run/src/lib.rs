@@ -24,7 +24,8 @@ pub use journal::{
 };
 pub use runner::{
     CardAttachment, FormatCounts, PublishedPost, RunOptions, RunReport, StageOutcome, StageStatus,
-    channel_ceiling, day_has_room, effective_format, intended_format, partition_variants,
-    published_on, resolve_channels, run, select_harvest_query, select_topic, select_variants,
-    warming_ceiling, warming_releases, warming_week, week_counts, week_start,
+    budgets_for_platform, channel_ceiling, day_has_room, detected_start_day, effective_format,
+    format_availability, format_available, intended_format, partition_variants, published_on,
+    resolve_channels, run, select_harvest_query, select_topic, select_variants, warming_ceiling,
+    warming_releases, warming_week, week_counts, week_start,
 };

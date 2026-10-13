@@ -10,6 +10,7 @@
 //! operator passes `--write`.
 
 pub mod craft;
+pub mod format;
 pub mod memory;
 pub mod score;
 
@@ -21,6 +22,10 @@ pub use craft::{
     PENALTY_GROUNDING_REJECTED, avoid_entries, avoid_entries_with_rejections,
     avoid_entries_with_verdicts, craft_score, craft_score_guarded, grounding_penalty,
     guardrail_penalty,
+};
+pub use format::{
+    BudgetAdjustment, DEFAULT_FORMAT_MIN_SAMPLES, FORMAT_BUDGET_STEP, FormatStat,
+    apply_budget_adjustments, budget_adjustments, format_performance,
 };
 pub use memory::{
     DEFAULT_MAX_FEW_SHOT, MemoryUpdate, ProposalContext, ScheduleHint, avoid_warnings, best_hour,

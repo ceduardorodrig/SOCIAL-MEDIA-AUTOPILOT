@@ -1,7 +1,7 @@
 //! Stage [3] — creation: draft A/B variants adapted to one platform.
 
 use anyhow::{Context, Result};
-use autopilot_core::{PersonaPack, Platform};
+use autopilot_core::{FormatAvailability, PersonaPack, Platform};
 use autopilot_media::VideoPlan;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,19 @@ struct Wrapper {
     variants: Vec<Variant>,
 }
 
+/// The availability a pack declares on its own, before any weekly accounting.
+///
+/// Used by the prompt builders that have no live counts: text and card are the
+/// baseline (always offered) and video only when the pack budgets one — the
+/// pre-HB-034 behaviour, preserved for the plain `create` command.
+pub fn declared_availability(persona: &PersonaPack) -> FormatAvailability {
+    FormatAvailability {
+        text: true,
+        card: true,
+        video: persona.publishing.formats.video > 0,
+    }
+}
+
 /// Build the creation prompt for one platform and topic.
 ///
 /// No avoid memory: the plain creation path. Use
@@ -74,12 +87,41 @@ pub fn build_creation_prompt(
 /// [3.7] reviewer refused because the source did not support them, plus the
 /// shape/openings the craft score penalised. The creation stage is told never
 /// to repeat them, so the same unsupported claim is not rediscovered every slot.
+///
+/// This convenience form uses the pack's declared availability; a live run uses
+/// [`build_creation_prompt_with_policy`] with the slot's real availability.
 pub fn build_creation_prompt_with_avoid(
     persona: &PersonaPack,
     platform: Platform,
     topic: &str,
     source: Option<Source<'_>>,
     avoid: &[String],
+) -> String {
+    build_creation_prompt_with_policy(
+        persona,
+        platform,
+        topic,
+        source,
+        avoid,
+        &declared_availability(persona),
+    )
+}
+
+/// Build the creation prompt with the slot's real **format availability**.
+///
+/// `content-formats.md` §3: the weekly per-format budget and the warming ramp
+/// leave some formats available and others not. The model is told which is which
+/// so **it decides** the format for the topic — publish it in another available
+/// format, or leave it for a later slot — instead of the engine silently
+/// degrading the choice. The engine keeps a deterministic safety net
+/// (`effective_format`), but the decision is the model's.
+pub fn build_creation_prompt_with_policy(
+    persona: &PersonaPack,
+    platform: Platform,
+    topic: &str,
+    source: Option<Source<'_>>,
+    avoid: &[String],
+    availability: &FormatAvailability,
 ) -> String {
     let guidelines = render_guidelines(persona);
     let banned = render_banned_phrases(persona);
@@ -117,10 +159,18 @@ pub fn build_creation_prompt_with_avoid(
         )
     };
 
-    // HB-035: a short-video plan is asked for only when the policy budgets one,
-    // so a text/card-only pack keeps a byte-identical prompt (video defaults to
-    // a zero budget).
-    let video_block = if persona.publishing.formats.video > 0 {
+    // HB-034: the budget state is handed to the model, which then chooses the
+    // format. A fully unrestricted slot says nothing (the model is free).
+    let policy_block = if availability.unrestricted() {
+        String::new()
+    } else {
+        render_format_policy(*availability)
+    };
+
+    // HB-035: a short-video plan is asked for only when the policy releases the
+    // video this slot (budget + ramp), so a text/card-only pack keeps a
+    // byte-identical prompt (video defaults to a zero budget).
+    let video_block = if availability.video {
         crate::video::VIDEO_PLAN_INSTRUCTION.to_string()
     } else {
         String::new()
@@ -140,11 +190,13 @@ pub fn build_creation_prompt_with_avoid(
          {avoid_block}\n\
          Produce exactly 2 alternative variants (A and B) that could be A/B tested.\n\
          Each caption must respect the platform limit of {limit} characters and use at most\n\
-         {max_tags} hashtags. Also propose a short image prompt for each variant.\n\n\
+         {max_tags} hashtags. Also propose a short image prompt for each variant that should\n\
+         carry a card, and leave it empty for a text-only post.\n\n\
          Each variant also carries a \"card\": the information the image will state — a short\n\
          headline plus one concrete fact from the source (a number, a name, a detail). The\n\
          caption is an INTRODUCTION to that card — your angle, why it matters — and never a\n\
          restatement of it: the reader sees both, so they must not say the same thing.\n\n\
+         {policy_block}\
          {video_block}Reply with ONLY a JSON array (no prose, no markdown) of objects with the keys\n\
          \"label\" (\"A\" or \"B\"), \"text\", \"hashtags\" (array of strings), \"image_prompt\",\n\
          and \"card\" (an object with \"title\" and \"body\").\n",
@@ -160,9 +212,40 @@ pub fn build_creation_prompt_with_avoid(
         topic = topic,
         grounding = grounding,
         avoid_block = avoid_block,
+        policy_block = policy_block,
         video_block = video_block,
         limit = platform_limit(platform),
         max_tags = persona.voice.max_hashtags,
+    )
+}
+
+/// Render the per-slot format policy the model must respect (HB-034).
+///
+/// One line per format says whether the weekly budget and the warming ramp leave
+/// it available. The instruction makes the choice the model's: use an available
+/// format, and never propose a format that is not available.
+fn render_format_policy(availability: FormatAvailability) -> String {
+    let state = |available: bool| {
+        if available {
+            "available"
+        } else {
+            "NOT available"
+        }
+    };
+    format!(
+        "\nFormat policy for this slot (weekly per-format budget + warming ramp):\n\
+         - text: {text}\n\
+         - card (image): {card}\n\
+         - short video: {video}\n\
+         Choose the format per variant from the formats marked available above: a fact, an\n\
+         opinion or a correction suits text; a list, a comparison or something visual suits a\n\
+         card; a story, a demo or a sequence of steps suits a short video. Signal a card with\n\
+         a non-empty \"image_prompt\" and a short video with the video plan; leave both out for\n\
+         text. Never propose a format marked NOT available — write the topic in another\n\
+         available format, or leave it for a later slot.\n\n",
+        text = state(availability.text),
+        card = state(availability.card),
+        video = state(availability.video),
     )
 }
 
@@ -308,5 +391,69 @@ mod tests {
         assert!(!prompt.contains("never repeat them"));
         // The original constraint block is untouched.
         assert!(prompt.contains("Produce exactly 2 alternative variants"));
+    }
+
+    #[test]
+    fn the_prompt_tells_the_model_which_formats_the_budget_leaves() {
+        // HB-034: the model decides the format, so the slot's real availability
+        // must reach the prompt — a spent card budget is stated, not silently
+        // enforced. A fully available slot adds no constraint block.
+        let pack = persona();
+        let unrestricted = build_creation_prompt_with_policy(
+            &pack,
+            Platform::Bluesky,
+            "a topic",
+            None,
+            &[],
+            &FormatAvailability::all(),
+        );
+        assert!(
+            !unrestricted.contains("Format policy for this slot"),
+            "an unrestricted slot constrains nothing"
+        );
+
+        let card_spent = FormatAvailability {
+            text: true,
+            card: false,
+            video: false,
+        };
+        let prompt = build_creation_prompt_with_policy(
+            &pack,
+            Platform::Bluesky,
+            "a topic",
+            None,
+            &[],
+            &card_spent,
+        );
+        assert!(prompt.contains("Format policy for this slot"));
+        assert!(prompt.contains("- text: available"));
+        assert!(prompt.contains("- card (image): NOT available"));
+        assert!(prompt.contains("- short video: NOT available"));
+        assert!(
+            prompt.contains("Never propose a format marked NOT available"),
+            "the model must be told to choose among the available formats"
+        );
+        // The video JSON instruction follows the availability, not the pack.
+        assert!(!prompt.contains("video_plan"));
+    }
+
+    #[test]
+    fn a_released_video_budget_asks_for_the_video_plan() {
+        let pack = persona();
+        let availability = FormatAvailability {
+            text: true,
+            card: true,
+            video: true,
+        };
+        let prompt = build_creation_prompt_with_policy(
+            &pack,
+            Platform::Bluesky,
+            "a topic",
+            None,
+            &[],
+            &availability,
+        );
+        assert!(prompt.contains("video_plan"));
+        assert!(prompt.contains("\"scenes\""));
     }
 }

@@ -1,18 +1,20 @@
 //! `autopilot` CLI — Phase 0 tooling for the Social Media Autopilot harness.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use autopilot_core::{
-    Platform, ValidationIssue, load_dir, load_persona, now_unix, resolve_persona_path,
+    Format, Platform, ValidationIssue, load_dir, load_persona, now_unix, resolve_persona_path,
 };
 use autopilot_engage::{EngageOptions, EngageReport};
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{DEFAULT_SEARXNG_ENDPOINT, SearxngClient};
 use autopilot_learn::{
-    CraftConfig, DEFAULT_MAX_FEW_SHOT, DEFAULT_MIN_SAMPLES, ProposalContext, compare_variants,
+    CraftConfig, DEFAULT_FORMAT_MIN_SAMPLES, DEFAULT_MAX_FEW_SHOT, DEFAULT_MIN_SAMPLES,
+    ProposalContext, budget_adjustments, compare_variants, format_performance,
     propose_memory_with_context, render_memory, write_memory,
 };
 use autopilot_metrics::{
@@ -476,6 +478,10 @@ enum LearnCommand {
         /// How many winning posts to keep as few-shot examples.
         #[arg(long, default_value_t = DEFAULT_MAX_FEW_SHOT)]
         max_few_shot: usize,
+        /// Minimum samples per **format** before its weekly budget may move
+        /// (HB-034). Below it the per-format comparison is inconclusive.
+        #[arg(long, default_value_t = DEFAULT_FORMAT_MIN_SAMPLES)]
+        format_min_samples: usize,
         /// Persist the proposal here (omit to only print it).
         #[arg(long)]
         write: Option<PathBuf>,
@@ -1230,6 +1236,7 @@ async fn run_learn(command: LearnCommand) -> Result<ExitCode> {
             runs_dir,
             min_samples,
             max_few_shot,
+            format_min_samples,
             write,
             dry_run,
         } => {
@@ -1262,6 +1269,30 @@ async fn run_learn(command: LearnCommand) -> Result<ExitCode> {
                 grounding_rejected: &claim_refs,
             };
 
+            // HB-034 §4: the metrics store is keyed by post URI and does not
+            // carry the format; the run journal does. Join them so the scorer can
+            // answer "does a card perform better than text *for this persona*?"
+            // and propose a conservative per-format budget movement.
+            let published = autopilot_run::read_published(&runs_dir).await?;
+            let format_of: HashMap<String, Format> = published
+                .iter()
+                .filter(|entry| {
+                    entry.persona == pack.persona && entry.platform == platform.as_str()
+                })
+                .map(|entry| {
+                    (
+                        entry.uri.clone(),
+                        Format::from_label(entry.format.as_deref()),
+                    )
+                })
+                .collect();
+            let format_stats = format_performance(
+                &records,
+                &format_of,
+                autopilot_learn::DEFAULT_BASELINE_WINDOW,
+            );
+            let adjustments = budget_adjustments(&format_stats, format_min_samples);
+
             let outcome = compare_variants(&records, min_samples);
             let update = propose_memory_with_context(
                 &records,
@@ -1271,7 +1302,8 @@ async fn run_learn(command: LearnCommand) -> Result<ExitCode> {
                 max_few_shot,
                 now_unix(),
                 &context,
-            );
+            )
+            .with_budget_adjustments(adjustments);
 
             println!("--- proposed memory update ---");
             print!("{}", render_memory(&update)?);
@@ -1280,6 +1312,19 @@ async fn run_learn(command: LearnCommand) -> Result<ExitCode> {
                 claim_refs.len()
             );
             println!("outcome : {}", update.reason);
+            println!(
+                "formats : {} of {} metric(s) attributed to a format from the journal",
+                format_stats.iter().map(|stat| stat.samples).sum::<usize>(),
+                records.len()
+            );
+            for adjustment in &update.budget_adjustments {
+                println!(
+                    "  {:<5} step {:+} — {}",
+                    adjustment.format.as_str(),
+                    adjustment.step,
+                    adjustment.reason
+                );
+            }
 
             match (dry_run, write) {
                 (false, Some(path)) => {

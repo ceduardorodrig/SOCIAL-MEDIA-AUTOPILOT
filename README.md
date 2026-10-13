@@ -162,6 +162,11 @@ autopilot metrics collect \
 # proposal back (default `var/learn/<slug>.json`) to warn the creation stage off
 # the claims it already refused. Without `--write` it only prints the proposal;
 # the persona pack is never rewritten silently.
+#
+# HB-034 §4: the same run joins each post's journalled format with its metrics
+# and, with enough samples (`--format-min-samples`, default 8), proposes moving
+# the weekly per-format budget by at most one post a week, normalised against the
+# persona's own median. `autopilot run` consumes that proposal.
 autopilot learn run \
   --persona personas/ciencia-curiosidades.yaml \
   --platform bluesky \
@@ -169,6 +174,14 @@ autopilot learn run \
   --min-samples 2 \
   --write var/learn/ciencia-curiosidades.json
 ```
+
+Format/frequency policy (HB-034) is data, not code: a pack sets `publishing.formats`
+(weekly text/card/video budgets) and may override the **warming ramp** with
+`publishing.warming.started_on`. The ramp is otherwise **autonomous** — the engine
+detects the account's birth from the first publication in its journals, and an empty
+base is a mature account with no ramp. A slot is an *opportunity*, not an obligation:
+the model is told which formats the budget leaves available and chooses the format per
+topic, with the engine keeping only a deterministic safety net.
 
 Publishing credentials come from the environment (SOPS store), never from the repository:
 

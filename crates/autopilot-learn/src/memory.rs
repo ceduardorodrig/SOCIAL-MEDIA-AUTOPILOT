@@ -12,6 +12,7 @@ use autopilot_metrics::MetricsRecord;
 use serde::{Deserialize, Serialize};
 
 use crate::craft::{AvoidEntry, CraftConfig, avoid_entries_with_verdicts, craft_score_guarded};
+use crate::format::BudgetAdjustment;
 use crate::score::{AbOutcome, VariantStats, weighted_score};
 
 /// How many winning posts to carry forward as few-shot examples.
@@ -67,10 +68,25 @@ pub struct MemoryUpdate {
     /// Penalised shapes/openings the creation stage should avoid reusing.
     #[serde(default)]
     pub avoid: Vec<AvoidEntry>,
+    /// Learned per-format weekly-budget movements (HB-034 §4). Empty when no
+    /// format has enough samples to move; the next run applies them.
+    #[serde(default)]
+    pub budget_adjustments: Vec<BudgetAdjustment>,
     /// Human-readable schedule hints derived from the winning samples.
     pub schedule_hints: Vec<String>,
     /// Why this update was proposed (or why it is inconclusive).
     pub reason: String,
+}
+
+impl MemoryUpdate {
+    /// Attach the learned per-format budget movements to this proposal.
+    ///
+    /// Kept as a builder so the many `propose_memory*` call sites stay
+    /// untouched: the budget analysis is a separate concern from the A/B one.
+    pub fn with_budget_adjustments(mut self, adjustments: Vec<BudgetAdjustment>) -> Self {
+        self.budget_adjustments = adjustments;
+        self
+    }
 }
 
 /// The strongest posting hour (UTC) for one variant.
@@ -186,6 +202,7 @@ pub fn propose_memory_with_context(
         variants: outcome.variants.clone(),
         few_shot,
         avoid,
+        budget_adjustments: Vec::new(),
         schedule_hints,
         reason,
     }
@@ -542,6 +559,45 @@ mod tests {
     }
 
     #[test]
+    fn budget_adjustments_round_trip_through_yaml() {
+        // HB-034: the learned per-format movement lives in the memory proposal,
+        // so it must survive the YAML the run reads back.
+        let adjustment = BudgetAdjustment {
+            format: autopilot_core::Format::Card,
+            step: 1,
+            samples: 10,
+            mean_score: 30.0,
+            baseline: 10.0,
+            reason: "card beats the median".into(),
+        };
+        let records = vec![record("A", 1, 0, 0, 0), record("B", 9, 0, 0, 0)];
+        let outcome = outcome_for(&records);
+        let update = propose_memory(
+            &records,
+            "p",
+            Platform::Bluesky,
+            &outcome,
+            DEFAULT_MAX_FEW_SHOT,
+            0,
+        )
+        .with_budget_adjustments(vec![adjustment.clone()]);
+
+        let yaml = render_memory(&update).expect("renders");
+        assert!(yaml.contains("budget_adjustments"), "yaml was: {yaml}");
+        let decoded: MemoryUpdate = serde_yaml_ng::from_str(&yaml).expect("round-trips");
+        assert_eq!(decoded.budget_adjustments, vec![adjustment]);
+    }
+
+    #[test]
+    fn an_older_memory_without_budget_adjustments_still_parses() {
+        // A memory file written before HB-034 carries no `budget_adjustments`
+        // key; it must read back as an empty list, not fail.
+        let yaml = "persona: p\ngenerated_at_unix: 1\nplatform: bluesky\nwinner: null\nmin_samples: 1\nvariants: []\nfew_shot: []\nschedule_hints: []\nreason: legacy\n";
+        let decoded: MemoryUpdate = serde_yaml_ng::from_str(yaml).expect("parses");
+        assert!(decoded.budget_adjustments.is_empty());
+    }
+
+    #[test]
     fn sloppy_high_engagement_is_never_promoted() {
         // Regression: variant A is slop with high engagement; variant B is clean
         // but low engagement. The craft gate must keep the slop out of few-shot.
@@ -687,6 +743,7 @@ mod tests {
                 penalty: 0.5,
                 evidence: claim.into(),
             }],
+            budget_adjustments: vec![],
             schedule_hints: vec![],
             reason: "test".into(),
         };
