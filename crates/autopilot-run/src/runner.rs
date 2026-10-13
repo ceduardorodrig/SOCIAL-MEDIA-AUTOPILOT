@@ -142,6 +142,10 @@ pub struct StageOutcome {
     /// What the editorial review changed, when the stage is `editor` (additive:
     /// absent for every other stage, so the journal shape is unchanged).
     pub changes: Option<Vec<String>>,
+    /// The AT URI of a published post, when the stage is `publish` (additive).
+    /// The web URL is not enough to collect metrics later: the API needs
+    /// `at://did/app.bsky.feed.post/<rkey>`.
+    pub uri: Option<String>,
 }
 
 impl StageOutcome {
@@ -153,6 +157,7 @@ impl StageOutcome {
             platform: None,
             variant: None,
             changes: None,
+            uri: None,
         }
     }
 
@@ -168,6 +173,11 @@ impl StageOutcome {
 
     fn with_changes(mut self, changes: Vec<String>) -> Self {
         self.changes = Some(changes);
+        self
+    }
+
+    fn with_uri(mut self, uri: &str) -> Self {
+        self.uri = Some(uri.to_string());
         self
     }
 }
@@ -1043,7 +1053,8 @@ async fn stage_publish(
                         format!("published to bluesky: {url}"),
                     )
                     .with_platform(*platform)
-                    .with_variant(&variant.label),
+                    .with_variant(&variant.label)
+                    .with_uri(&uri),
                 )
                 .await?;
                 report.published.push(PublishedPost {

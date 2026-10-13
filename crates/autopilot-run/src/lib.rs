@@ -17,8 +17,8 @@
 pub mod journal;
 pub mod runner;
 
-pub use journal::{Journal, JournalEvent};
+pub use journal::{Journal, JournalEvent, PublishedEntry, read_published};
 pub use runner::{
     CardAttachment, PublishedPost, RunOptions, RunReport, StageOutcome, StageStatus,
-    humanize_niche, partition_variants, resolve_channels, run, select_topic,
+    humanize_niche, partition_variants, resolve_channels, run, select_topic, select_variants,
 };

@@ -328,6 +328,58 @@ struct PostArg {
     uri: String,
 }
 
+/// One post to sample: explicit (`--post`) or discovered from the journal.
+struct Target {
+    variant: String,
+    uri: String,
+    published_at: Option<u64>,
+}
+
+/// The metrics checkpoints, in hours. `learn` compares variants, so a post is
+/// sampled once it has lived a day and again once it has lived two — the same
+/// two points the playbook promises.
+const METRICS_CHECKPOINTS_HOURS: [u64; 2] = [24, 48];
+
+/// The posts whose next checkpoint has passed and that have no sample for it.
+///
+/// This is what makes the metrics stage schedulable at all: a caller cannot know
+/// the AT URIs, so the journal (what went out and when) and the store (what we
+/// already sampled) decide. Without it the timer would have nothing to pass.
+async fn due_targets(
+    persona: &str,
+    platform: Platform,
+    store: &Path,
+    runs_dir: &Path,
+    now: u64,
+) -> Result<Vec<Target>> {
+    let published = autopilot_run::read_published(runs_dir).await?;
+    let samples = read_metrics(store).await?;
+
+    let mut due = Vec::new();
+    for entry in published {
+        if entry.persona != persona || entry.platform != platform.as_str() {
+            continue;
+        }
+        let age_hours = now.saturating_sub(entry.published_at_unix) / 3_600;
+        let wanted = METRICS_CHECKPOINTS_HOURS
+            .iter()
+            .filter(|checkpoint| age_hours >= **checkpoint)
+            .count();
+        let have = samples
+            .iter()
+            .filter(|sample| sample.uri == entry.uri)
+            .count();
+        if have < wanted {
+            due.push(Target {
+                variant: entry.variant,
+                uri: entry.uri,
+                published_at: Some(entry.published_at_unix),
+            });
+        }
+    }
+    Ok(due)
+}
+
 fn parse_post_arg(value: &str) -> Result<PostArg, String> {
     let (variant, uri) = value
         .split_once('=')
@@ -358,6 +410,9 @@ enum MetricsCommand {
         /// JSONL store for the samples (under `var/`, which is gitignored).
         #[arg(long, default_value = "var/metrics.jsonl")]
         store: PathBuf,
+        /// Run journals used to discover what is due when no `--post` is given.
+        #[arg(long, default_value = "var/runs")]
+        runs_dir: PathBuf,
         /// Base URL of the platform's public read API.
         #[arg(long)]
         base_url: Option<String>,
@@ -1031,48 +1086,66 @@ async fn run_metrics(command: MetricsCommand) -> Result<ExitCode> {
             fixture,
             published_at,
             dry_run,
+            runs_dir,
         } => {
-            if posts.is_empty() {
-                eprintln!("provide at least one --post VARIANT=URI");
-                return Ok(ExitCode::FAILURE);
-            }
-
             let source = build_metrics_source(platform, base_url)?;
-            let ids: Vec<String> = posts.iter().map(|post| post.uri.clone()).collect();
-            let request = source.request(&ids)?;
+
+            // What to sample. The scheduled case passes no `--post`: a caller
+            // cannot know the AT URIs, so the journal (what went out and when)
+            // and the store (what we already sampled) decide what is due.
+            let targets: Vec<Target> = if posts.is_empty() {
+                due_targets(&persona, platform, &store, &runs_dir, now_unix()).await?
+            } else {
+                posts
+                    .into_iter()
+                    .map(|post| Target {
+                        variant: post.variant,
+                        uri: post.uri,
+                        published_at,
+                    })
+                    .collect()
+            };
+
+            if targets.is_empty() {
+                println!("nothing due for a metrics sample");
+                return Ok(ExitCode::SUCCESS);
+            }
 
             if dry_run {
                 println!("--- request (dry run, no API call, nothing written) ---");
-                println!("GET {}", request.url);
-                for (key, value) in &request.query {
-                    println!("  {key}={value}");
+                for target in &targets {
+                    let request = source.request(std::slice::from_ref(&target.uri))?;
+                    println!("GET {}", request.url);
+                    for (key, value) in &request.query {
+                        println!("  {key}={value}");
+                    }
                 }
                 return Ok(ExitCode::SUCCESS);
             }
 
-            let parsed = match fixture {
-                Some(path) => {
-                    let raw = tokio::fs::read_to_string(&path)
-                        .await
-                        .with_context(|| format!("reading fixture {}", path.display()))?;
-                    source.parse(&raw)?
-                }
-                None => collect(&*source, &ids, DEFAULT_METRICS_TIMEOUT).await?,
-            };
-
-            let captured_at_unix = now_unix();
             let mut stored = 0usize;
-            for post in &posts {
-                let Some(metrics) = parsed.iter().find(|item| item.uri == post.uri) else {
-                    println!("missing : {} (no metrics returned)", post.uri);
+            for target in &targets {
+                let ids = vec![target.uri.clone()];
+                let parsed = match &fixture {
+                    Some(path) => {
+                        let raw = tokio::fs::read_to_string(path)
+                            .await
+                            .with_context(|| format!("reading fixture {}", path.display()))?;
+                        source.parse(&raw)?
+                    }
+                    None => collect(&*source, &ids, DEFAULT_METRICS_TIMEOUT).await?,
+                };
+
+                let Some(metrics) = parsed.iter().find(|item| item.uri == target.uri) else {
+                    println!("missing : {} (no metrics returned)", target.uri);
                     continue;
                 };
                 let context = RecordContext {
-                    captured_at_unix,
+                    captured_at_unix: now_unix(),
                     persona: persona.clone(),
-                    variant: post.variant.clone(),
+                    variant: target.variant.clone(),
                     topic: topic.clone(),
-                    published_at_unix: published_at,
+                    published_at_unix: target.published_at,
                 };
                 let record = MetricsRecord::from_post(platform, metrics, context);
                 append_metrics(&store, &record).await?;
