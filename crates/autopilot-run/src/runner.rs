@@ -26,11 +26,16 @@ use autopilot_publish::{
     build_post_record_with_images, create_post, create_session, now_rfc3339_millis, post_url,
     render_png, upload_blob,
 };
+use chrono::{Local, Timelike};
 
 use crate::journal::Journal;
 
 /// How long to wait for one LLM completion.
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How far from a declared publishing window a run may still publish: the
+/// scheduler fires a few minutes into the window's hour.
+const WINDOW_TOLERANCE_MINUTES: i64 = 45;
 
 /// How long to wait for one publishing API call.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -218,6 +223,42 @@ pub fn select_topic(shortlist: &[TopicScore], min_score: f32) -> Option<&TopicSc
     shortlist.iter().find(|topic| topic.score >= min_score)
 }
 
+/// Parse a `"HH:MM"` window into minutes since midnight.
+fn parse_window(window: &str) -> Option<i64> {
+    let (hours, minutes) = window.trim().split_once(':')?;
+    let hours: i64 = hours.trim().parse().ok()?;
+    let minutes: i64 = minutes.trim().parse().ok()?;
+    if !(0..24).contains(&hours) || !(0..60).contains(&minutes) {
+        return None;
+    }
+    Some(hours * 60 + minutes)
+}
+
+/// Minutes since local midnight (`0..=1439`).
+fn local_minutes_now() -> i64 {
+    let now = Local::now();
+    i64::from(now.hour()) * 60 + i64::from(now.minute())
+}
+
+/// The declared window a run at `now` belongs to, if any.
+///
+/// The scheduler fires more often than the persona posts (it is aligned to the
+/// `hl-infer` batch windows), so this gate is what turns "four fires a day" into
+/// the persona's own cadence. A window is a point in time and the scheduler fires
+/// a few minutes into its hour, hence the tolerance. A missed window is never
+/// compensated with a burst — the run simply skips.
+pub fn matching_window(windows: &[String], now: i64, tolerance: i64) -> Option<String> {
+    windows
+        .iter()
+        .find(|window| {
+            parse_window(window).is_some_and(|start| {
+                let delta = (now - start).abs();
+                delta <= tolerance || delta >= 24 * 60 - tolerance
+            })
+        })
+        .cloned()
+}
+
 /// Split drafts into guardrail-approved and rejected (with the verdict).
 pub fn partition_variants<'a>(
     persona: &PersonaPack,
@@ -339,6 +380,41 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
             persona.persona,
             platform_suffix(options.platform)
         );
+    }
+
+    // Cadence gate: a live run publishes only inside one of the persona's own
+    // windows. The scheduler is aligned to the hl-infer batch windows and fires
+    // more often than the persona posts, so this is what keeps the account at
+    // its declared cadence instead of one post per fire.
+    if !options.dry_run {
+        let windows: Vec<String> = persona
+            .channels
+            .iter()
+            .filter(|channel| channel.enabled)
+            .filter(|channel| match options.platform {
+                Some(platform) => platform == channel.platform,
+                None => true,
+            })
+            .flat_map(|channel| channel.windows.clone())
+            .collect();
+
+        if !windows.is_empty()
+            && matching_window(&windows, local_minutes_now(), WINDOW_TOLERANCE_MINUTES).is_none()
+        {
+            record(
+                &mut report,
+                &journal,
+                StageOutcome::new(
+                    "run",
+                    StageStatus::Skipped,
+                    format!(
+                        "outside the publishing windows {windows:?} — waiting for the next one"
+                    ),
+                ),
+            )
+            .await?;
+            return Ok(report);
+        }
     }
 
     let query = options
@@ -1229,6 +1305,39 @@ mod tests {
         assert_eq!(rotation_offset("tech-curiosities-1791849666"), 6);
         assert_eq!(rotation_offset("persona-1791849661"), 1);
         assert_eq!(rotation_offset("no-digits"), 0);
+    }
+
+    #[test]
+    fn a_window_matches_only_near_its_own_time() {
+        let windows = vec!["06:00".to_string(), "18:00".to_string()];
+        // The scheduler fires at :15 — fifteen minutes into the window's hour.
+        assert_eq!(
+            matching_window(&windows, 6 * 60 + 15, 45).as_deref(),
+            Some("06:00")
+        );
+        assert_eq!(
+            matching_window(&windows, 18 * 60 + 15, 45).as_deref(),
+            Some("18:00")
+        );
+        // 00:15 and 12:15 are far from either window: the run skips.
+        assert!(matching_window(&windows, 15, 45).is_none());
+        assert!(matching_window(&windows, 12 * 60 + 15, 45).is_none());
+    }
+
+    #[test]
+    fn window_parsing_rejects_junk() {
+        assert_eq!(parse_window("06:00"), Some(360));
+        assert_eq!(parse_window(" 18:30 "), Some(1110));
+        assert_eq!(parse_window("24:00"), None);
+        assert_eq!(parse_window("06:99"), None);
+        assert_eq!(parse_window("nope"), None);
+    }
+
+    #[test]
+    fn a_window_near_midnight_wraps_around() {
+        let windows = vec!["23:50".to_string()];
+        // 00:05 the next day is fifteen minutes after the window.
+        assert!(matching_window(&windows, 5, 45).is_some());
     }
 
     #[test]
