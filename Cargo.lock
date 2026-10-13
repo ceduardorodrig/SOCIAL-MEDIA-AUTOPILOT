@@ -246,6 +246,7 @@ dependencies = [
  "autopilot-pipeline",
  "autopilot-providers",
  "autopilot-publish",
+ "chrono",
  "serde",
  "serde_json",
  "tokio",
