@@ -36,20 +36,38 @@ pacing:
   follow_delay_max_secs: 1800
 
 interests:
-  # Curated accounts of interest in the Linux / FOSS / AI space. They are
-  # followed slowly (see the caps above), never all at once. Handles are
-  # resolved to DIDs only when a follow is actually planned.
+  # Curated by the owner — never discovered autonomously (that would be exactly
+  # the mass-follow behaviour this stage forbids). Every handle below was
+  # resolved against the public API before being added: a wrong handle is a
+  # follow that silently fails and, worse, an invented specific in a reply.
+  #
+  # The list is FINITE on purpose. With `caps.follows_per_week` at 3 the account
+  # reaches the end of it in a few weeks and then stops following — growth is
+  # bounded by the list, not by time. That is the answer to "follows grow
+  # forever": they cannot, because the source is a curated set, not a discovery
+  # engine.
   accounts:
-    - "gnome.org"
-    - "mozilla.org"
-    - "rust-lang.org"
-    - "python.org"
-    - "golang.org"
-    - "opensource.org"
-    - "eff.org"
-    - "anthropic.com"
-    - "simonwillison.net"
-    - "swyx.io"
+    - "kde.org"              # KDE
+    - "gnome.org"            # GNOME
+    - "linux.org"            # Linux.org
+    - "linuxfoundation.org"  # The Linux Foundation
+    - "linuxmint.com"        # Linux Mint
+    - "omgubuntu.co.uk"      # omg! ubuntu
+    - "nixos.org"            # NixOS Foundation
+    - "thunderbird.net"      # Thunderbird
+    - "blender.org"          # Blender
+    - "godotengine.org"      # Godot Engine
+    - "mozilla.org"          # Mozilla
+    - "rust-lang.org"        # Rust
+    - "python.org"           # Python
+    - "golang.org"           # Go
+    - "opensource.org"       # Open Source Initiative
+    - "eff.org"              # EFF
+    - "anthropic.com"        # Anthropic
+    - "simonwillison.net"    # Simon Willison
+    - "swyx.io"              # swyx
+    - "arstechnica.com"      # Ars Technica
+    - "theregister.com"      # The Register
 
 # Proactive commenting — joining the conversation on the curated accounts above.
 # This is how the account earns followers: a substantive reply to a relevant,

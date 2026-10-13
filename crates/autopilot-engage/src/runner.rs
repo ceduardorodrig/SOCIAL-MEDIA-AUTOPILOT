@@ -101,6 +101,24 @@ pub struct EngageReport {
 }
 
 /// Execute one engagement run for a persona.
+/// A rotating window over the curated accounts.
+///
+/// Taking the first N every run would probe the same few accounts forever and
+/// leave the rest of the list invisible — the proactive source would slowly
+/// starve, and the follow order would never move. The window starts at `offset`
+/// and wraps, so every account is reached over time without ever reading the
+/// whole list in one run (which would be a sweep).
+fn rotated_window(accounts: &[String], size: usize, offset: usize) -> Vec<&String> {
+    if accounts.is_empty() || size == 0 {
+        return Vec::new();
+    }
+    let take = size.min(accounts.len());
+    let start = offset % accounts.len();
+    (0..take)
+        .map(|index| &accounts[(start + index) % accounts.len()])
+        .collect()
+}
+
 pub async fn run(options: EngageOptions) -> Result<EngageReport> {
     let config = EngageConfig::load(&options.config_path).await?;
     config.validate()?;
@@ -440,7 +458,8 @@ async fn gather_live(
         follow_probe
     };
     let mut interests = Vec::new();
-    for handle in config.interests.accounts.iter().take(probe) {
+    let rotation = now_unix as usize % config.interests.accounts.len().max(1);
+    for handle in rotated_window(&config.interests.accounts, probe, rotation) {
         match get_profile(DEFAULT_BLUESKY_READ_URL, handle, DEFAULT_ENGAGE_TIMEOUT).await {
             Ok(profile) => interests.push(profile),
             Err(err) => notes.push(format!("could not resolve interest `{handle}`: {err:#}")),
@@ -900,6 +919,35 @@ channels:
         }
 
         tokio::fs::remove_dir_all(&dir).await.expect("cleanup");
+    }
+
+    #[test]
+    fn the_curated_window_rotates_so_no_account_is_left_out() {
+        let accounts: Vec<String> = (0..7).map(|i| format!("a{i}")).collect();
+
+        let first = rotated_window(&accounts, 3, 0);
+        let first: Vec<&str> = first.iter().map(|account| account.as_str()).collect();
+        assert_eq!(first, vec!["a0", "a1", "a2"]);
+
+        // Starting near the end wraps instead of running off it.
+        let wrapped = rotated_window(&accounts, 3, 5);
+        let wrapped: Vec<&str> = wrapped.iter().map(|account| account.as_str()).collect();
+        assert_eq!(wrapped, vec!["a5", "a6", "a0"]);
+
+        // Over a full rotation every account is reached: none is left invisible.
+        let mut seen: Vec<&String> = Vec::new();
+        for offset in 0..accounts.len() {
+            seen.extend(rotated_window(&accounts, 3, offset));
+        }
+        for account in &accounts {
+            assert!(seen.contains(&account), "`{account}` was never probed");
+        }
+    }
+
+    #[test]
+    fn an_empty_or_zero_sized_window_is_empty() {
+        assert!(rotated_window(&[], 3, 0).is_empty());
+        assert!(rotated_window(&["a".to_string()], 0, 0).is_empty());
     }
 
     #[test]
