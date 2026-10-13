@@ -44,6 +44,19 @@ async fn dry_run_walks_every_stage_without_side_effects() {
     for expected in ["harvest", "triage", "create", "guardrail", "publish"] {
         assert!(stages.contains(&expected), "missing stage {expected}");
     }
+
+    // HB-033 fallback: a pack with no `harvest.queries` still searches the
+    // humanised niche (`demo-niche` -> `demo niche`).
+    let harvest = report
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "harvest")
+        .expect("harvest stage recorded");
+    assert!(
+        harvest.detail.contains("demo niche"),
+        "harvest should fall back to the humanised niche, got: {}",
+        harvest.detail
+    );
     assert!(
         report
             .stages
@@ -92,6 +105,48 @@ async fn a_draft_persona_is_never_executed_for_real() {
     assert_eq!(report.stages.len(), 1);
     assert_eq!(report.stages[0].stage, "run");
     assert_eq!(report.stages[0].status, StageStatus::Skipped);
+
+    tokio::fs::remove_file(&journal).await.ok();
+}
+
+#[tokio::test]
+async fn the_harvest_query_comes_from_the_persona_pack() {
+    // HB-033: two personas in the same broad subject must harvest different
+    // sources because the pack — not the niche alone — names the query.
+    let journal = journal_path().with_extension("harvest.jsonl");
+    let _ = tokio::fs::remove_file(&journal).await;
+
+    let options = RunOptions {
+        persona_path: PathBuf::from("tests/fixtures/persona-harvest-queries.yaml"),
+        query: None,
+        limit: 5,
+        endpoint: "http://127.0.0.1:9".to_string(),
+        platform: None,
+        config_path: PathBuf::from("tests/fixtures/does-not-exist.yaml"),
+        journal_path: Some(journal.clone()),
+        memory_path: None,
+        dry_run: true,
+        card: CardAttachment::Off,
+    };
+
+    let report = run(options).await.expect("dry run succeeds");
+    let harvest = report
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "harvest")
+        .expect("harvest stage recorded");
+
+    assert!(
+        harvest.detail.contains("space mission anomalies")
+            || harvest.detail.contains("strange telescope observations"),
+        "harvest should search one of the pack's queries, got: {}",
+        harvest.detail
+    );
+    assert!(
+        !harvest.detail.contains("astronomy space curiosities"),
+        "the niche fallback must not be used when the pack declares queries: {}",
+        harvest.detail
+    );
 
     tokio::fs::remove_file(&journal).await.ok();
 }

@@ -224,13 +224,16 @@ pub struct RunReport {
     pub failed: bool,
 }
 
-/// Human-readable harvest query derived from the persona niche.
-pub fn humanize_niche(niche: &str) -> String {
-    niche
-        .replace(['-', '_'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+/// The harvest query for this slot, walked through the pack's rotation (HB-033).
+///
+/// The rotation is the same deterministic per-slot offset the variant selection
+/// uses, so consecutive slots walk the query list instead of repeating it. An
+/// empty list yields `None` (the caller then falls back to the humanised niche).
+pub fn select_harvest_query(queries: &[String], rotation: usize) -> Option<&str> {
+    if queries.is_empty() {
+        return None;
+    }
+    Some(queries[rotation % queries.len()].as_str())
 }
 
 /// Enabled channels for the run, optionally narrowed to one platform.
@@ -446,10 +449,20 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         }
     }
 
-    let query = options
-        .query
-        .clone()
-        .unwrap_or_else(|| humanize_niche(&persona.niche));
+    // HB-033: the harvest subject belongs to the persona, not to its niche
+    // alone. When the pack declares `harvest.queries` the stage walks the list
+    // in rotation (the same per-slot offset the variants use); a pack that
+    // declares none keeps the humanised-niche fallback. An explicit `--query`
+    // still overrides the pack.
+    let query = match &options.query {
+        Some(query) => query.clone(),
+        None => {
+            let queries = persona.harvest_queries();
+            select_harvest_query(&queries, rotation_offset(&report.run_id))
+                .unwrap_or_default()
+                .to_string()
+        }
+    };
 
     let topics = stage_harvest(&mut report, &journal, &options, &query).await?;
 
@@ -1557,7 +1570,7 @@ fn platform_suffix(platform: Option<Platform>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autopilot_core::{Channel, PublishingPolicy, Rubric, Voice};
+    use autopilot_core::{Channel, HarvestPolicy, PublishingPolicy, Rubric, Voice};
     use autopilot_pipeline::EditedVariant;
 
     fn persona() -> PersonaPack {
@@ -1605,6 +1618,7 @@ mod tests {
                 },
             ],
             publishing: PublishingPolicy::default(),
+            harvest: HarvestPolicy::default(),
         }
     }
 
@@ -1763,10 +1777,19 @@ mod tests {
     }
 
     #[test]
-    fn humanizes_the_niche_into_a_query() {
-        assert_eq!(humanize_niche("science-curiosities"), "science curiosities");
-        assert_eq!(humanize_niche("astrology_horoscope"), "astrology horoscope");
-        assert_eq!(humanize_niche("  spaced  out "), "spaced out");
+    fn the_harvest_queries_rotate_across_slots() {
+        // HB-033: consecutive slots walk the pack's list, so two slots never
+        // harvest the same subject; a single-query pack is unchanged.
+        let queries = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(select_harvest_query(&queries, 0), Some("a"));
+        assert_eq!(select_harvest_query(&queries, 1), Some("b"));
+        assert_eq!(select_harvest_query(&queries, 2), Some("a"));
+        assert_eq!(select_harvest_query(&["only".to_string()], 7), Some("only"));
+    }
+
+    #[test]
+    fn an_empty_query_list_has_no_selection() {
+        assert_eq!(select_harvest_query(&[], 3), None);
     }
 
     #[test]

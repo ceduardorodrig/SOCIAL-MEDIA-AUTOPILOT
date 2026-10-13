@@ -5,7 +5,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use autopilot_core::{Platform, ValidationIssue, load_dir, load_persona, now_unix};
+use autopilot_core::{
+    Platform, ValidationIssue, load_dir, load_persona, now_unix, resolve_persona_path,
+};
 use autopilot_engage::{EngageOptions, EngageReport};
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{DEFAULT_SEARXNG_ENDPOINT, SearxngClient};
@@ -133,10 +135,10 @@ enum PersonasCommand {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Persona pack to execute.
-    #[arg(long)]
+    /// Persona slug (`space-oddities`) or pack path.
+    #[arg(long, value_parser = parse_persona)]
     persona: PathBuf,
-    /// Harvest query (defaults to the persona niche).
+    /// Harvest query (defaults to the persona's `harvest.queries`, or its niche).
     #[arg(long)]
     query: Option<String>,
     /// Maximum number of harvested topics.
@@ -210,7 +212,8 @@ enum HarvestCommand {
 enum GuardrailCommand {
     /// Validate a draft against a persona pack (deterministic, no LLM).
     Check {
-        #[arg(long)]
+        /// Persona slug (`space-oddities`) or pack path.
+        #[arg(long, value_parser = parse_persona)]
         persona: PathBuf,
         #[arg(long, value_parser = parse_platform)]
         platform: Platform,
@@ -221,6 +224,16 @@ enum GuardrailCommand {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+}
+
+/// Accept both persona spellings on every `--persona` (HB-031).
+///
+/// A bare slug (`space-oddities`) resolves under `personas/`; anything that
+/// looks like a path (`personas/space-oddities.yaml`) is used verbatim. The
+/// flag previously meant a slug in `metrics collect` and a path in `learn run`,
+/// so the same spelling behaved differently. One convention now: both work.
+fn parse_persona(value: &str) -> Result<PathBuf, std::convert::Infallible> {
+    Ok(resolve_persona_path(value))
 }
 
 fn parse_platform(value: &str) -> Result<Platform, String> {
@@ -252,7 +265,8 @@ fn parse_card_attachment(value: &str) -> Result<CardAttachment, String> {
 enum TriageCommand {
     /// Harvest topics and score them against a persona.
     Run {
-        #[arg(long)]
+        /// Persona slug (`space-oddities`) or pack path.
+        #[arg(long, value_parser = parse_persona)]
         persona: PathBuf,
         #[arg(long)]
         query: String,
@@ -272,7 +286,8 @@ enum TriageCommand {
 enum CreateCommand {
     /// Draft A/B variants for a platform.
     Run {
-        #[arg(long)]
+        /// Persona slug (`space-oddities`) or pack path.
+        #[arg(long, value_parser = parse_persona)]
         persona: PathBuf,
         #[arg(long, value_parser = parse_platform)]
         platform: Platform,
@@ -302,7 +317,8 @@ enum PublishCommand {
     },
     /// Publish a guardrail-approved draft to Bluesky.
     Bluesky {
-        #[arg(long)]
+        /// Persona slug (`space-oddities`) or pack path.
+        #[arg(long, value_parser = parse_persona)]
         persona: PathBuf,
         #[arg(long)]
         text: String,
@@ -314,7 +330,8 @@ enum PublishCommand {
     },
     /// Publish a guardrail-approved draft to X (Twitter).
     X {
-        #[arg(long)]
+        /// Persona slug (`space-oddities`) or pack path.
+        #[arg(long, value_parser = parse_persona)]
         persona: PathBuf,
         #[arg(long)]
         text: String,
@@ -404,9 +421,9 @@ enum MetricsCommand {
     Collect {
         #[arg(long, value_parser = parse_platform)]
         platform: Platform,
-        /// Persona slug that produced the posts.
-        #[arg(long)]
-        persona: String,
+        /// Persona slug (`space-oddities`) or pack path that produced the posts.
+        #[arg(long, value_parser = parse_persona)]
+        persona: PathBuf,
         #[arg(long, default_value = "")]
         topic: String,
         /// A published post as `VARIANT=URI` (repeat for A/B).
@@ -437,7 +454,8 @@ enum MetricsCommand {
 enum LearnCommand {
     /// Analyse A/B metrics and propose a persona memory update.
     Run {
-        #[arg(long)]
+        /// Persona slug (`space-oddities`) or pack path.
+        #[arg(long, value_parser = parse_persona)]
         persona: PathBuf,
         #[arg(long, value_parser = parse_platform)]
         platform: Platform,
@@ -476,8 +494,8 @@ enum EngageCommand {
 
 #[derive(Args)]
 struct EngageRunArgs {
-    /// Persona pack to engage as.
-    #[arg(long)]
+    /// Persona slug (`space-oddities`) or pack path to engage as.
+    #[arg(long, value_parser = parse_persona)]
     persona: PathBuf,
     /// Engagement configuration (caps, windows, pacing).
     #[arg(long, default_value = "config/engage.yaml")]
@@ -1100,6 +1118,12 @@ async fn run_metrics(command: MetricsCommand) -> Result<ExitCode> {
         } => {
             let source = build_metrics_source(platform, base_url)?;
 
+            // HB-031: `--persona` takes a slug or a path here too. The canonical
+            // slug comes from the pack, so the store's `persona` field always
+            // matches the slug the run journals wrote.
+            let pack = load_persona(&persona).await?;
+            let persona = pack.persona;
+
             // What to sample. The scheduled case passes no `--post`: a caller
             // cannot know the AT URIs, so the journal (what went out and when)
             // and the store (what we already sampled) decide what is due.
@@ -1365,6 +1389,21 @@ mod tests {
                 published_at_unix: None,
             },
         )
+    }
+
+    #[test]
+    fn the_persona_flag_accepts_a_slug_or_a_path() {
+        // HB-031: every `--persona` shares one convention — `metrics collect`
+        // (which used a slug) and `learn run` (which demanded a path) now both
+        // take either spelling.
+        assert_eq!(
+            parse_persona("space-oddities").expect("infallible"),
+            PathBuf::from("personas/space-oddities.yaml")
+        );
+        assert_eq!(
+            parse_persona("personas/space-oddities.yaml").expect("infallible"),
+            PathBuf::from("personas/space-oddities.yaml")
+        );
     }
 
     #[test]

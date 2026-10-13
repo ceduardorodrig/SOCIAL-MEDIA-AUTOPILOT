@@ -9,7 +9,8 @@ pub mod store;
 pub mod time;
 
 pub use persona::{
-    Channel, PersonaPack, Platform, PublishingPolicy, Rubric, SelectionRule, ValidationIssue,
-    Voice, load_dir, load_persona,
+    Channel, DEFAULT_PERSONAS_DIR, HarvestPolicy, PersonaPack, Platform, PublishingPolicy, Rubric,
+    SelectionRule, ValidationIssue, Voice, humanize_niche, load_dir, load_persona,
+    resolve_persona_path,
 };
 pub use time::now_unix;

@@ -17,11 +17,12 @@
 pub mod journal;
 pub mod runner;
 
+pub use autopilot_core::humanize_niche;
 pub use journal::{
     GroundingRejection, Journal, JournalEvent, PublishedEntry, read_grounding_rejections,
     read_published,
 };
 pub use runner::{
     CardAttachment, PublishedPost, RunOptions, RunReport, StageOutcome, StageStatus,
-    humanize_niche, partition_variants, resolve_channels, run, select_topic, select_variants,
+    partition_variants, resolve_channels, run, select_harvest_query, select_topic, select_variants,
 };

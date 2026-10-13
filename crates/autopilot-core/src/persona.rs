@@ -1,9 +1,12 @@
 //! Persona pack: the configurable data package the harness loads per profile.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// Default directory where persona packs live, relative to the workspace root.
+pub const DEFAULT_PERSONAS_DIR: &str = "personas";
 
 fn default_language() -> String {
     "pt-BR".to_string()
@@ -66,6 +69,20 @@ impl Default for PublishingPolicy {
     }
 }
 
+/// The search queries a persona harvests in rotation (HB-033).
+///
+/// Deriving the query from the `niche` alone (`astronomy space curiosities`) is
+/// too thin to tell two personas apart: they would all harvest the same
+/// subjects. A persona that cares about specific sources declares them here and
+/// the harvest stage rotates through the list; a persona that declares nothing
+/// keeps the old behaviour (the humanised niche), so older packs never break.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarvestPolicy {
+    /// Search queries used in rotation. Empty falls back to the humanised niche.
+    #[serde(default)]
+    pub queries: Vec<String>,
+}
+
 /// A complete persona definition: identity, voice, guardrails and channels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaPack {
@@ -93,6 +110,9 @@ pub struct PersonaPack {
     /// How a slot selects and how many variants it releases (sequential A/B).
     #[serde(default)]
     pub publishing: PublishingPolicy,
+    /// Per-persona harvest queries (HB-033); absent means "use the niche".
+    #[serde(default)]
+    pub harvest: HarvestPolicy,
 }
 
 /// Tone of voice and writing constraints.
@@ -178,7 +198,40 @@ pub struct ValidationIssue {
     pub problem: String,
 }
 
+/// Human-readable harvest query derived from a persona niche.
+///
+/// `science-curiosities` and `astrology_horoscope` become `science curiosities`
+/// and `astrology horoscope`: a niche is a slug, a search engine wants words.
+pub fn humanize_niche(niche: &str) -> String {
+    niche
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl PersonaPack {
+    /// The harvest queries this persona rotates through (HB-033).
+    ///
+    /// A persona that configures `harvest.queries` harvests the subjects it
+    /// declares; a persona that does not falls back to the **humanised niche**,
+    /// so an older pack keeps its previous single-query behaviour. Blank entries
+    /// are ignored, so a stray line in the list never becomes an empty search.
+    pub fn harvest_queries(&self) -> Vec<String> {
+        let configured: Vec<String> = self
+            .harvest
+            .queries
+            .iter()
+            .map(|query| query.trim().to_string())
+            .filter(|query| !query.is_empty())
+            .collect();
+        if configured.is_empty() {
+            vec![humanize_niche(&self.niche)]
+        } else {
+            configured
+        }
+    }
+
     /// Validate invariants the engine relies on before running any persona.
     pub fn validate(&self) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
@@ -244,6 +297,29 @@ impl PersonaPack {
         }
 
         issues
+    }
+}
+
+/// Resolve a `--persona` value that may be a slug or a path into the pack path.
+///
+/// HB-031: the flag used to mean two things — `metrics collect` took a slug
+/// while `learn run` took a file path — so the same spelling behaved
+/// differently. The convention is now one: every `--persona` accepts **both** a
+/// bare slug (`space-oddities`, resolved under [`DEFAULT_PERSONAS_DIR`]) and a
+/// path (`personas/space-oddities.yaml`). A value with a `.yaml`/`.yml`
+/// extension or a path separator is taken as a path; anything else is a slug.
+pub fn resolve_persona_path(value: &str) -> PathBuf {
+    let trimmed = value.trim();
+    let path = Path::new(trimmed);
+    let has_pack_extension = matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("yaml" | "yml")
+    );
+    let has_separator = trimmed.contains('/') || trimmed.contains(std::path::MAIN_SEPARATOR);
+    if has_pack_extension || has_separator {
+        PathBuf::from(trimmed)
+    } else {
+        Path::new(DEFAULT_PERSONAS_DIR).join(format!("{trimmed}.yaml"))
     }
 }
 
@@ -316,6 +392,7 @@ mod tests {
                 windows: vec![],
             }],
             publishing: PublishingPolicy::default(),
+            harvest: HarvestPolicy::default(),
         }
     }
 
@@ -382,5 +459,77 @@ mod tests {
         let yaml = "persona: demo\nniche: science\nvoice:\n  tone: curious\n  audience: adults\nrubric:\n  min_score: 0.75\nchannels:\n  - platform: bluesky\n    handle: demo\n    enabled: true\n";
         let pack: PersonaPack = serde_yaml_ng::from_str(yaml).expect("parses");
         assert_eq!(pack.publishing, PublishingPolicy::default());
+        // HB-033: a pack with no harvest block keeps the niche fallback.
+        assert_eq!(pack.harvest, HarvestPolicy::default());
+        assert_eq!(pack.harvest_queries(), vec!["science".to_string()]);
+    }
+
+    #[test]
+    fn a_pack_without_harvest_queries_falls_back_to_the_humanised_niche() {
+        // The pre-HB-033 behaviour, preserved for older packs.
+        let mut pack = base_pack();
+        pack.niche = "astronomy-space-curiosities".into();
+        pack.harvest.queries = vec!["   ".into()];
+        assert_eq!(
+            pack.harvest_queries(),
+            vec!["astronomy space curiosities".to_string()]
+        );
+    }
+
+    #[test]
+    fn configured_harvest_queries_win_over_the_niche() {
+        // HB-033: two personas with the same kind of niche must be able to
+        // harvest different sources; the pack decides, not the niche alone.
+        let mut pack = base_pack();
+        pack.niche = "astronomy-space-curiosities".into();
+        pack.harvest.queries = vec![
+            "space mission anomalies".into(),
+            "".into(),
+            "weird telescope data".into(),
+        ];
+        assert_eq!(
+            pack.harvest_queries(),
+            vec![
+                "space mission anomalies".to_string(),
+                "weird telescope data".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_slug_resolves_under_the_personas_directory() {
+        // HB-031: the same `--persona` flag takes a slug or a path.
+        assert_eq!(
+            resolve_persona_path("space-oddities"),
+            PathBuf::from("personas/space-oddities.yaml")
+        );
+        assert_eq!(
+            resolve_persona_path("  space-oddities  "),
+            PathBuf::from("personas/space-oddities.yaml")
+        );
+    }
+
+    #[test]
+    fn anything_that_looks_like_a_path_is_kept_verbatim() {
+        assert_eq!(
+            resolve_persona_path("personas/space-oddities.yaml"),
+            PathBuf::from("personas/space-oddities.yaml")
+        );
+        assert_eq!(
+            resolve_persona_path("/tmp/pack.yml"),
+            PathBuf::from("/tmp/pack.yml")
+        );
+        // A separator without an extension is still a path, not a slug.
+        assert_eq!(
+            resolve_persona_path("some/dir/pack"),
+            PathBuf::from("some/dir/pack")
+        );
+    }
+
+    #[test]
+    fn humanizes_the_niche_into_a_query() {
+        assert_eq!(humanize_niche("science-curiosities"), "science curiosities");
+        assert_eq!(humanize_niche("astrology_horoscope"), "astrology horoscope");
+        assert_eq!(humanize_niche("  spaced  out "), "spaced out");
     }
 }

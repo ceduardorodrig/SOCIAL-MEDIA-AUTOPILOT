@@ -1,0 +1,41 @@
+# Persona pack fixture for the HB-033 integration test: the pack declares its
+# own `harvest.queries`, so the harvest stage must search one of them rather
+# than the humanised niche (`astronomy space curiosities`).
+
+persona: harvest-demo
+display_name: "Harvest Demo"
+niche: astronomy-space-curiosities
+language: en
+active: false
+
+voice:
+  tone: "curious"
+  audience: "tests"
+  guidelines: []
+  banned_phrases: []
+  max_hashtags: 2
+  emojis_allowed: true
+
+few_shot: []
+
+blocklist:
+  - "forbidden"
+
+rubric:
+  min_score: 0.75
+  criteria:
+    - name: hook
+      weight: 1.0
+      description: "does the hook land?"
+
+channels:
+  - platform: bluesky
+    handle: ""
+    enabled: true
+    posts_per_day: 1
+    windows: ["06:00"]
+
+harvest:
+  queries:
+    - "space mission anomalies"
+    - "strange telescope observations"

@@ -68,6 +68,18 @@ cargo build --release
 autopilot personas list
 autopilot personas validate
 
+# `--persona` takes a slug or a path, in every subcommand (HB-031):
+#   --persona space-oddities   ==   --persona personas/space-oddities.yaml
+#
+# A pack may declare its own harvest subjects, walked in rotation (HB-033) so
+# different personas harvest different sources. Without the block, the engine
+# falls back to the humanised niche (`astronomy-space-curiosities` becomes
+# `astronomy space curiosities`).
+#   harvest:
+#     queries:
+#       - "space mission anomalies"
+#       - "strange telescope observations"
+
 # One full run for a persona: harvest → triage → create → guardrail → publish.
 # --dry-run describes every stage with no LLM call, no GPU work, no network and
 # no publish. A live run needs the publishing credentials in the environment and
