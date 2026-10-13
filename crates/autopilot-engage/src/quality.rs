@@ -1,137 +1,25 @@
-//! Deterministic quality bar for a **proactive** reply.
+//! The deterministic, **structural** floor for a proactive reply.
 //!
 //! A proactive reply is the riskiest thing this stage does: we are answering a
-//! stranger nobody asked us to answer. The owner's rule is blunt — it must
-//! *contribute to the conversation*, never look like a plug. The prompt asks the
-//! model for that; this module is the deterministic half that refuses a reply
-//! that only flatters, only agrees, links out, or names our own account.
+//! stranger nobody asked us to answer. Two layers guard it, and they are kept
+//! deliberately separate:
 //!
-//! It is intentionally heuristic and cheap. It runs after the shared guardrail
-//! (blocklist, banned phrases, length) and never replaces it.
+//! - **This module** refuses only what is exact and cheap to see: a reply too
+//!   short or too thin to say anything, one that carries a link, or one that
+//!   names our own account. Those are structural facts about the text — no word
+//!   list, no judgement, nothing that goes stale when a model changes.
+//! - **[`crate::review`]** judges what needs judgement: whether the reply is
+//!   *grounded* in the post, whether it adds something, whether it invents a
+//!   specific. That is a semantic question, so it is asked of a sceptical
+//!   reviewer rather than encoded as patterns — a hardcoded list would miss the
+//!   next invention and reject honest prose that merely resembles one.
+//!
+//! It runs after the shared guardrail (blocklist, banned phrases, platform
+//! limits) and never replaces it.
 
 use autopilot_guardrail::{Issue, Verdict};
 
-/// Generic praise and filler that reads as a bot's "great post".
-const LOW_EFFORT: &[&str] = &[
-    "great post",
-    "great point",
-    "nice post",
-    "good post",
-    "great share",
-    "thanks for sharing",
-    "thank you for sharing",
-    "well said",
-    "well put",
-    "so true",
-    "spot on",
-    "love this",
-    "this is great",
-    "this is amazing",
-    "amazing work",
-    "awesome",
-    "exactly this",
-    "could not agree more",
-    "couldn't agree more",
-    "couldn't have said it better",
-    "totally agree",
-    "agree 100%",
-    "following for more",
-];
-
-/// Words that carry no substance on their own. A reply whose content words are
-/// all in here is agreement-only, however long it is.
-const FILLER: &[&str] = &[
-    "a",
-    "an",
-    "the",
-    "i",
-    "you",
-    "we",
-    "they",
-    "he",
-    "she",
-    "it",
-    "this",
-    "that",
-    "these",
-    "those",
-    "is",
-    "are",
-    "was",
-    "were",
-    "be",
-    "been",
-    "am",
-    "do",
-    "does",
-    "did",
-    "have",
-    "has",
-    "had",
-    "and",
-    "or",
-    "but",
-    "so",
-    "if",
-    "of",
-    "to",
-    "in",
-    "on",
-    "at",
-    "for",
-    "with",
-    "about",
-    "from",
-    "my",
-    "your",
-    "our",
-    "their",
-    "his",
-    "her",
-    "its",
-    "me",
-    "us",
-    "them",
-    "very",
-    "really",
-    "just",
-    "also",
-    "too",
-    "much",
-    "totally",
-    "completely",
-    "agree",
-    "agreed",
-    "yes",
-    "yep",
-    "true",
-    "exactly",
-    "indeed",
-    "absolutely",
-    "definitely",
-    "correct",
-    "right",
-    "same",
-    "post",
-    "comment",
-    "take",
-    "point",
-    "thought",
-    "opinion",
-    "thing",
-    "stuff",
-    "here",
-    "there",
-    "well",
-    "good",
-    "great",
-    "nice",
-    "thanks",
-    "thank",
-    "welcome",
-];
-
-/// Screen a proactive reply against the quality bar.
+/// Screen a proactive reply against the structural floor.
 ///
 /// `our_tokens` are the strings that must never appear (our handles, DID and
 /// display name), so the reply can never turn into a plug.
@@ -157,20 +45,6 @@ pub fn screen_proactive_reply(
             verdict,
             "QUALITY-TOO-THIN",
             format!("fewer than {min_words} words to make a point"),
-        );
-    }
-    if is_low_effort(&normalized) {
-        verdict = reject(
-            verdict,
-            "QUALITY-LOW-EFFORT",
-            "generic praise — the reply adds nothing to the conversation",
-        );
-    }
-    if is_agreement_only(&normalized) {
-        verdict = reject(
-            verdict,
-            "QUALITY-AGREEMENT-ONLY",
-            "the reply only agrees; it must add a fact, a correction or a real question",
         );
     }
     if contains_link(text) {
@@ -215,26 +89,6 @@ fn normalize(text: &str) -> String {
         })
         .collect();
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// The reply is (or opens with) generic praise and little else.
-fn is_low_effort(normalized: &str) -> bool {
-    let words = normalized.split_whitespace().count();
-    LOW_EFFORT.iter().any(|phrase| {
-        normalized == *phrase
-            || (normalized.starts_with(phrase)
-                && normalized[phrase.len()..].starts_with(' ')
-                && words <= 12)
-    })
-}
-
-/// Every content word is filler (agreement, pronouns, articles): nothing added.
-fn is_agreement_only(normalized: &str) -> bool {
-    let content = normalized
-        .split_whitespace()
-        .filter(|word| !FILLER.contains(word))
-        .count();
-    content < 3
 }
 
 /// A URL or an obvious link shortener/domain.
@@ -284,31 +138,14 @@ mod tests {
     }
 
     #[test]
-    fn generic_praise_is_rejected() {
-        for text in ["Great post!", "great post", "So true, thanks for sharing!"] {
-            let verdict = screen(text);
-            assert!(!verdict.approved, "should reject: {text}");
-            assert!(
-                verdict
-                    .issues
-                    .iter()
-                    .any(|issue| issue.rule.starts_with("QUALITY-LOW-EFFORT")
-                        || issue.rule == "QUALITY-AGREEMENT-ONLY"),
-                "unexpected issues for {text}: {:?}",
-                verdict.issues
-            );
-        }
-    }
-
-    #[test]
-    fn agreement_only_is_rejected_even_when_long() {
-        let verdict = screen("I totally agree with this take, it is really very true and correct.");
+    fn a_short_or_thin_reply_is_rejected() {
+        let verdict = screen("Try the 6.9 patch.");
         assert!(!verdict.approved);
         assert!(
             verdict
                 .issues
                 .iter()
-                .any(|issue| issue.rule == "QUALITY-AGREEMENT-ONLY")
+                .any(|issue| issue.rule == "QUALITY-TOO-SHORT" || issue.rule == "QUALITY-TOO-THIN")
         );
     }
 
@@ -338,20 +175,22 @@ mod tests {
     }
 
     #[test]
-    fn a_short_or_thin_reply_is_rejected() {
-        let verdict = screen("Try the 6.9 patch.");
-        assert!(!verdict.approved);
-        assert!(
-            verdict
-                .issues
-                .iter()
-                .any(|issue| issue.rule == "QUALITY-TOO-SHORT" || issue.rule == "QUALITY-TOO-THIN")
-        );
-    }
-
-    #[test]
     fn the_verdict_is_deterministic() {
         let text = "The 6.9 scheduler mainly helps idle latency, not throughput.";
         assert_eq!(screen(text), screen(text));
+    }
+
+    #[test]
+    fn semantics_are_left_to_the_grounding_review() {
+        // This module is the *structural* floor: praise and ungrounded claims
+        // are judgement calls and belong to `review.rs`. Keeping them out here is
+        // the point — a word list here would be exactly the hardcoding that
+        // misses the next invention.
+        let praise = screen("Great post, thanks for sharing this with everyone today!");
+        assert!(
+            praise.approved,
+            "the floor does not judge meaning: {:?}",
+            praise.issues
+        );
     }
 }

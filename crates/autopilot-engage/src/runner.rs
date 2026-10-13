@@ -28,6 +28,7 @@ use crate::planner::{Action, Plan, PlanInput, plan};
 use crate::prompt::{build_reply_prompt, parse_reply, screen_reply};
 use crate::quality::screen_proactive_reply;
 use crate::records::StrongRef;
+use crate::review::{ReviewOutcome, build_review_prompt, parse_review};
 use crate::state::{ActionKind, ActionLog, StateEntry, append_entry};
 
 /// How long to wait for one LLM completion.
@@ -580,6 +581,29 @@ impl Execution<'_> {
             ));
         }
 
+        // The generic layer: before speaking to a stranger, a sceptical reviewer
+        // decides whether the reply is grounded in the post. Fail-closed — if the
+        // review cannot run, the reply is withheld rather than risked.
+        if candidate.kind == CandidateKind::Proactive {
+            match self.review_grounding(candidate, &text).await {
+                Ok(outcome) if outcome.approved => {}
+                Ok(outcome) => {
+                    return Ok(ExecutedAction::rejected(
+                        "reply",
+                        &candidate.parent.uri,
+                        format!("grounding review refused the reply — {}", outcome.reason),
+                    ));
+                }
+                Err(err) => {
+                    return Ok(ExecutedAction::rejected(
+                        "reply",
+                        &candidate.parent.uri,
+                        format!("grounding review unavailable — reply withheld: {err:#}"),
+                    ));
+                }
+            }
+        }
+
         let uri = create_reply(
             DEFAULT_BLUESKY_BASE_URL,
             self.session,
@@ -605,6 +629,17 @@ impl Execution<'_> {
                 completion.provider_id, completion.model
             ),
         ))
+    }
+
+    /// Ask the grounding reviewer whether a proactive reply is safe to send.
+    ///
+    /// A different role on the same chain: it judges the claim, not the wording,
+    /// so it catches an invention no word list could enumerate.
+    async fn review_grounding(&self, candidate: &Candidate, reply: &str) -> Result<ReviewOutcome> {
+        let prompt = build_review_prompt(&candidate.text, reply);
+        let completion =
+            complete_with_chain(self.registry, &prompt, JobKind::Other, COMPLETION_TIMEOUT).await?;
+        parse_review(&completion.text)
     }
 
     async fn like(&mut self, subject: &StrongRef) -> Result<ExecutedAction> {

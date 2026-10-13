@@ -19,9 +19,13 @@
 //!   bypasses the blocklist or the rubric.
 //! - **Proactive comments contribute, never advertise.** A cold reply to a
 //!   stranger's post must add a fact, a correction, an experience or a real
-//!   question; `quality.rs` refuses generic praise, agreement-only replies,
-//!   links and any mention of our own account. It is additionally capped per
-//!   account per week with a long minimum gap.
+//!   question. It is judged by a **generic grounding layer** (`review.rs`): a
+//!   sceptical fact-checker on the same chain decides whether the reply is
+//!   grounded in the post, so an invented specific is caught by *judgment*, not
+//!   by a word list. `quality.rs` keeps only the deterministic, structural
+//!   floor (length, links, our own account). The layer is fail-closed — if the
+//!   review cannot run, the reply is withheld. Proactive replies are
+//!   additionally capped per account per week with a long minimum gap.
 //! - Interactions need **no GPU**. This stage adds no GPU dependency; it only
 //!   uses the existing cloud-first provider chain.
 
@@ -33,6 +37,7 @@ pub mod planner;
 pub mod prompt;
 pub mod quality;
 pub mod records;
+pub mod review;
 pub mod runner;
 pub mod state;
 
@@ -45,5 +50,6 @@ pub use planner::{Action, Plan, PlanInput, plan};
 pub use prompt::{build_reply_prompt, parse_reply, screen_reply};
 pub use quality::screen_proactive_reply;
 pub use records::StrongRef;
+pub use review::{ReviewOutcome, build_review_prompt, parse_review};
 pub use runner::{EngageOptions, EngageReport, ExecutedAction, run};
 pub use state::{ActionKind, ActionLog, StateEntry};

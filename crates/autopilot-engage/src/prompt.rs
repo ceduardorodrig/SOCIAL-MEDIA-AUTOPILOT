@@ -35,7 +35,12 @@ pub fn build_reply_prompt(persona: &PersonaPack, candidate: &Candidate) -> Strin
         CandidateKind::Proactive => {
             "\n\
              You are joining a stranger's conversation to CONTRIBUTE, never to advertise.\n\
-             Reply only if you can add something specific about the post above.\n"
+             Reply only if you can add something specific about the post above.\n\
+             Anchor the reply to what the post actually says, so it reads as a reply and not\n\
+             as a fragment: do not open with a bare assertion about the topic.\n\
+             Never state a specific you cannot ground in the post or in general knowledge you\n\
+             are certain of. A wrong detail costs more than a plainer sentence.\n\
+             Write plain text only: no code, no markdown.\n"
         }
         _ => "",
     };
