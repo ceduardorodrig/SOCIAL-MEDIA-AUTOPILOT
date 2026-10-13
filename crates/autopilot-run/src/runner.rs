@@ -256,6 +256,20 @@ pub fn select_topic(shortlist: &[TopicScore], min_score: f32) -> Option<&TopicSc
     shortlist.iter().find(|topic| topic.score >= min_score)
 }
 
+/// Resolve the harvested candidate a triage selection points at.
+///
+/// HB-057: the triage model frequently paraphrases the title it echoes back, so
+/// matching the harvest candidate by exact title alone resolved to **no**
+/// candidate — the [3.7] gate then had no source and withheld the whole slot
+/// (fail-closed, HB-041), starving the pipeline of every paraphrased title. The
+/// candidate URL travels through the shortlist and is echoed verbatim far more
+/// often, so it is a second key into the same list.
+pub fn resolve_candidate<'a>(topics: &'a [Topic], title: &str, url: &str) -> Option<&'a Topic> {
+    topics
+        .iter()
+        .find(|candidate| candidate.title == title || (!url.is_empty() && candidate.url == url))
+}
+
 /// Parse a `"HH:MM"` window into minutes since midnight.
 fn parse_window(window: &str) -> Option<i64> {
     let (hours, minutes) = window.trim().split_once(':')?;
@@ -474,20 +488,22 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
     }
 
     let registry = load_config(&options.config_path).await?;
-    let Some(topic_title) =
-        stage_triage(&mut report, &journal, &persona, &topics, &registry).await?
+    let Some(selected) = stage_triage(&mut report, &journal, &persona, &topics, &registry).await?
     else {
         return Ok(report);
     };
+    let topic_title = selected.title.clone();
 
     // The source travels with the topic. The harvest snippet is one or two
     // sentences — too thin to write against, which made the [3.7] review refuse
     // every draft (verified 2026-10-13: nothing was published) — so fetch the
     // **article body** once, for the selected topic only, and fall back to the
     // snippet when the fetch fails.
-    let candidate = topics
-        .iter()
-        .find(|candidate| candidate.title == topic_title);
+    //
+    // HB-057: the triage model paraphrases the title it echoes back, so a
+    // title-only match resolved to no candidate and the gate withheld the slot
+    // for lack of a source. The URL the shortlist carries is a second key.
+    let candidate = resolve_candidate(&topics, &topic_title, &selected.url);
     let source_text = match candidate {
         Some(candidate) => {
             match fetch_article_text(&candidate.url, ARTICLE_TIMEOUT, MAX_SOURCE_CHARS).await {
@@ -756,14 +772,16 @@ async fn stage_dry_run_plan(
     Ok(())
 }
 
-/// Stage [2] — triage. Returns the chosen topic title, or `None` to stop.
+/// Stage [2] — triage. Returns the chosen topic (its title and URL), or `None`
+/// to stop. The URL travels with the title so the create path can resolve the
+/// harvest candidate by either key (HB-057).
 async fn stage_triage(
     report: &mut RunReport,
     journal: &Journal,
     persona: &PersonaPack,
     topics: &[Topic],
     registry: &autopilot_providers::ProvidersConfig,
-) -> Result<Option<String>> {
+) -> Result<Option<TopicScore>> {
     if topics.is_empty() {
         record(
             report,
@@ -834,7 +852,7 @@ async fn stage_triage(
         return Ok(None);
     };
 
-    let title = topic.title.clone();
+    let selected = topic.clone();
     record(
         report,
         journal,
@@ -842,13 +860,13 @@ async fn stage_triage(
             "triage",
             StageStatus::Ok,
             format!(
-                "selected \"{title}\" (score {:.2}) via {} ({})",
-                topic.score, completion.provider_id, completion.model
+                "selected \"{}\" (score {:.2}) via {} ({})",
+                selected.title, selected.score, completion.provider_id, completion.model
             ),
         ),
     )
     .await?;
-    Ok(Some(title))
+    Ok(Some(selected))
 }
 
 /// The memory path for a persona: the explicit override, or the default the
@@ -1832,6 +1850,66 @@ mod tests {
             Some("good")
         );
         assert!(select_topic(&shortlist, 0.95).is_none());
+    }
+
+    #[test]
+    fn a_paraphrased_triage_title_still_resolves_to_its_source_by_url() {
+        // HB-057: the triage model echoes the title back paraphrased. Matching
+        // the harvest candidate by exact title alone resolved to *no* source, so
+        // the [3.7] gate withheld the whole slot (fail-closed, HB-041) and the
+        // pipeline starved. The URL the shortlist carries is a second key.
+        let topics = vec![
+            Topic {
+                title: "Descoberta sobre o cérebro".into(),
+                url: "https://a.example/artigo".into(),
+                content: "o cérebro consome glicose".into(),
+                engine: "google".into(),
+            },
+            Topic {
+                title: "Outro tema".into(),
+                url: "https://b.example/outro".into(),
+                content: "irrelevante".into(),
+                engine: "duckduckgo".into(),
+            },
+        ];
+
+        let resolved = resolve_candidate(
+            &topics,
+            "Como o cérebro gasta energia",
+            "https://a.example/artigo",
+        )
+        .expect("a paraphrased title still resolves through the URL");
+        assert_eq!(resolved.url, "https://a.example/artigo");
+        assert_eq!(resolved.content, "o cérebro consome glicose");
+    }
+
+    #[test]
+    fn a_paraphrased_title_without_its_url_resolves_to_no_source() {
+        // The counterpart of the fix: if neither key matches, resolution stays
+        // empty — the source is absent, and stage_grounding fail-closes exactly
+        // as HB-041 requires (no source, no publish).
+        let topics = vec![Topic {
+            title: "Descoberta sobre o cérebro".into(),
+            url: "https://a.example/artigo".into(),
+            content: "o cérebro consome glicose".into(),
+            engine: "google".into(),
+        }];
+
+        assert!(
+            resolve_candidate(&topics, "Como o cérebro gasta energia", "").is_none(),
+            "a paraphrased title with no URL has no source"
+        );
+        assert!(
+            resolve_candidate(
+                &topics,
+                "Como o cérebro gasta energia",
+                "https://outro.example"
+            )
+            .is_none(),
+            "a URL that matches no candidate is not a source"
+        );
+        // An exact title still resolves without needing the URL.
+        assert!(resolve_candidate(&topics, "Descoberta sobre o cérebro", "").is_some());
     }
 
     #[test]
