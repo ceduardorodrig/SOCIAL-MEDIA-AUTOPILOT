@@ -149,6 +149,18 @@ pub async fn run(options: EngageOptions) -> Result<EngageReport> {
         return Ok(report);
     }
 
+    // A draft pack is validated but never executed for real — the same invariant the
+    // publishing stage enforces (`!persona.active`, `autopilot-run`). It matters more
+    // here: `engage` talks to real strangers, so a draft replying from a live account
+    // is an unprompted, unreviewed public act (HB-073).
+    if !persona.active {
+        report.skipped_run = true;
+        report
+            .notes
+            .push("persona is a draft (active: false) — set active: true to engage".to_string());
+        return Ok(report);
+    }
+
     // A live run obeys the kill switch and the windows before doing anything.
     if kill_switch {
         report.notes.push(format!(
@@ -867,10 +879,15 @@ mod tests {
         .expect("write fixture");
 
         // A window that always matches, no sporadic skip: the plan is visible.
+        // `max_post_age_hours` is set far above the fixture's dates ON PURPOSE: the fixture
+        // carries hardcoded 2026-10-12 timestamps, and a real freshness window would
+        // silently make this test fail once the calendar moves past it (it did, on
+        // 2026-10-14). The freshness filter is covered by its own tests; this one is
+        // about the plan being printed without the network.
         let config_path = dir.join("engage.yaml");
         tokio::fs::write(
             &config_path,
-            "windows: [\"00:00\"]\nwindow_minutes: 1440\npacing: {run_skip_probability: 0.0}\n",
+            "windows: [\"00:00\"]\nwindow_minutes: 1440\npacing: {run_skip_probability: 0.0}\nproactive: {max_post_age_hours: 8760}\n",
         )
         .await
         .expect("write config");
@@ -919,6 +936,75 @@ channels:
         for line in &report.planned {
             println!("planned : {line}");
         }
+
+        tokio::fs::remove_dir_all(&dir).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_draft_persona_never_acts_on_real_strangers() {
+        // A draft pack must be inert in a LIVE run, exactly as it is in the publishing
+        // stage. `engage` replies to real people, so letting a draft act would be an
+        // unreviewed public act from a live account (HB-073).
+        let dir = fixture_dir();
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        let path = dir.join("fixture.json");
+        tokio::fs::write(&path, r#"{"feeds": []}"#)
+            .await
+            .expect("write fixture");
+
+        let config_path = dir.join("engage.yaml");
+        tokio::fs::write(
+            &config_path,
+            "windows: [\"00:00\"]\nwindow_minutes: 1440\npacing: {run_skip_probability: 0.0}\n",
+        )
+        .await
+        .expect("write config");
+
+        let options = EngageOptions {
+            persona_path: dir.join("persona.yaml"),
+            config_path,
+            state_path: dir.join("state.jsonl"),
+            providers_path: dir.join("providers.yaml"),
+            fixture: Some(path),
+            // LIVE — the case that used to slip through the gate.
+            dry_run: false,
+        };
+
+        // Note the absence of `active: true`: the default is false, i.e. a draft.
+        tokio::fs::write(
+            &options.persona_path,
+            r#"
+persona: tech-curiosities
+display_name: Tech Curiosities
+niche: computing-technology-ai-linux-foss
+language: en
+voice: {tone: curious, audience: developers}
+rubric: {min_score: 0.75}
+channels:
+  - platform: bluesky
+    handle: example.bsky.social
+"#,
+        )
+        .await
+        .expect("write persona");
+
+        let report = run(options).await.expect("live run");
+        assert!(!report.failed);
+        assert!(
+            report.skipped_run,
+            "a draft must be skipped, notes: {:?}",
+            report.notes
+        );
+        assert!(
+            report.executed.is_empty() && report.planned.is_empty(),
+            "a draft must not plan or act, executed: {:?}",
+            report.executed
+        );
+        assert!(
+            report.notes.iter().any(|n| n.contains("draft")),
+            "the reason must be journalled, notes: {:?}",
+            report.notes
+        );
 
         tokio::fs::remove_dir_all(&dir).await.expect("cleanup");
     }
