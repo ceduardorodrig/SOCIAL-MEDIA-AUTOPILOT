@@ -34,6 +34,23 @@ use crate::state::{ActionKind, ActionLog, StateEntry, append_entry};
 /// How long to wait for one LLM completion.
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The gateway class a reply runs in: **interactive**, not batch.
+///
+/// `hl-infer`'s rule is that *batch* classes (`Triage | Create | ImageGen`) drain
+/// only inside the fixed windows (06:00–07:00, 12:00–13:00, 18:00–19:00,
+/// 00:00–01:00), while *interactive* ones (`Transcribe | Other`) are served
+/// whenever the measured VRAM allows. The engage stage asked for `Create` — a batch
+/// class — while its own windows are `09:30 / 13:30 / 20:30`, which **never**
+/// overlap, so a local lease could never be admitted and the stage silently fell
+/// back to the free tier every time (HB-045).
+///
+/// A reply is short, single and **time-sensitive**: an answer delivered hours
+/// later, in the next batch window, is worthless. So it belongs to the interactive
+/// class, served as soon as VRAM allows — which is also how the review of that same
+/// reply (`JobKind::Other`) already runs. Pinned by a test so a future "harmless"
+/// rename cannot silently move it back into a batch class.
+const REPLY_JOB_KIND: JobKind = JobKind::Other;
+
 /// Options for one `autopilot engage run`.
 #[derive(Debug, Clone)]
 pub struct EngageOptions {
@@ -560,7 +577,7 @@ impl Execution<'_> {
     async fn reply(&mut self, candidate: &Candidate) -> Result<ExecutedAction> {
         let prompt = build_reply_prompt(self.persona, candidate);
         let completion =
-            match complete_with_chain(self.registry, &prompt, JobKind::Create, COMPLETION_TIMEOUT)
+            match complete_with_chain(self.registry, &prompt, REPLY_JOB_KIND, COMPLETION_TIMEOUT)
                 .await
             {
                 Ok(completion) => completion,
@@ -938,6 +955,19 @@ channels:
         }
 
         tokio::fs::remove_dir_all(&dir).await.expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_runs_in_the_interactive_class_not_the_batch_one() {
+        // HB-045: the engage windows (09:30/13:30/20:30) never overlap the hl-infer
+        // batch windows, so a batch class could never be admitted locally. A reply is
+        // time-sensitive, so it runs interactive. If a future edit moves it back to a
+        // batch kind, this test is the alarm.
+        assert_eq!(REPLY_JOB_KIND, JobKind::Other);
+        assert!(
+            autopilot_providers::gateway::JobKind::Other.as_str() == "other",
+            "the wire name must stay `other`"
+        );
     }
 
     #[tokio::test]
