@@ -133,6 +133,28 @@ enum PersonasCommand {
         #[arg(long, default_value = "personas")]
         dir: PathBuf,
     },
+    /// Turn a pack ON: it will act for real (publish **and** engage).
+    ///
+    /// Only an `active: true` pack may touch the outside world; a draft is validated
+    /// but inert in every live stage (HB-073).
+    Activate {
+        /// Persona slug (`space-oddities`) or pack path.
+        persona: String,
+        /// Directory the slug is resolved against (ignored when a path is given).
+        #[arg(long, default_value = "personas")]
+        dir: PathBuf,
+    },
+    /// Turn a pack OFF: it becomes a draft (validated, never acting).
+    ///
+    /// The opposite of `activate` — the safe switch when a persona misbehaves or a
+    /// channel needs a rest.
+    Deactivate {
+        /// Persona slug (`space-oddities`) or pack path.
+        persona: String,
+        /// Directory the slug is resolved against (ignored when a path is given).
+        #[arg(long, default_value = "personas")]
+        dir: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -613,10 +635,29 @@ async fn run_personas(command: PersonasCommand) -> Result<ExitCode> {
     match command {
         PersonasCommand::List { dir } => {
             let packs = load_dir(&dir).await?;
-            println!("{:<30} {:<30} {:>8}", "PERSONA", "NICHE", "CHANNELS");
+            // ACTIVE and LANGUAGE decide whether and in which language a pack acts,
+            // so they belong in the listing — the two columns that were missing and
+            // made the on/off switch undiscoverable.
+            println!(
+                "{:<24} {:<8} {:<6} {:<32} {:>8}",
+                "PERSONA", "ACTIVE", "LANG", "NICHE", "CHANNELS"
+            );
             for p in &packs {
-                println!("{:<30} {:<30} {:>8}", p.persona, p.niche, p.channels.len());
+                println!(
+                    "{:<24} {:<8} {:<6} {:<32} {:>8}",
+                    p.persona,
+                    if p.active { "yes" } else { "DRAFT" },
+                    p.language,
+                    p.niche,
+                    p.channels.len()
+                );
             }
+            let live = packs.iter().filter(|p| p.active).count();
+            println!(
+                "\n{} pack(s), {} active. Toggle with `autopilot personas activate|deactivate <slug>`.",
+                packs.len(),
+                live
+            );
             Ok(ExitCode::SUCCESS)
         }
         PersonasCommand::Validate { dir } => {
@@ -638,7 +679,157 @@ async fn run_personas(command: PersonasCommand) -> Result<ExitCode> {
                 Ok(ExitCode::FAILURE)
             }
         }
+        PersonasCommand::Activate { persona, dir } => set_active(&persona, &dir, true).await,
+        PersonasCommand::Deactivate { persona, dir } => set_active(&persona, &dir, false).await,
     }
+}
+
+/// Resolve a user-supplied persona into a pack path.
+///
+/// A bare slug is resolved under `dir` (so `--dir` is honoured, which
+/// `parse_persona` does not do — it hardcodes `personas/`); anything that already
+/// looks like a path is used verbatim, like the rest of the CLI.
+fn resolve_pack(persona: &str, dir: &Path) -> PathBuf {
+    let candidate = Path::new(persona);
+    let looks_like_path = candidate
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
+        || candidate.components().count() > 1;
+    if looks_like_path {
+        candidate.to_path_buf()
+    } else {
+        dir.join(format!("{persona}.yaml"))
+    }
+}
+
+/// Rewrite a pack's `active:` line, preserving every other byte.
+///
+/// Pure and synchronous on purpose: it is the part that must be tested, and the
+/// packs carry comments and an ordering that carry meaning — a YAML round-trip
+/// would silently drop them. Only a top-level (column 0) `active:` line is
+/// touched, so a nested `active:` inside a sub-object can never be hit.
+/// Idempotent: rewriting the same value returns an unchanged text.
+fn rewrite_active(text: &str, active: bool) -> Result<(String, String)> {
+    let desired = if active {
+        "active: true"
+    } else {
+        "active: false"
+    };
+
+    // A top-level key has no indentation, so requiring column 0 is what keeps this
+    // from ever touching a nested `active:` (or a `# active:` comment).
+    let is_key = |line: &str| {
+        line.strip_prefix("active:")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    };
+    let is_language_key = |line: &str| {
+        line.strip_prefix("language:")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    };
+
+    if text.lines().any(is_key) {
+        let mut out = String::with_capacity(text.len() + 16);
+        let mut before = String::new();
+        let mut done = false;
+        for line in text.lines() {
+            if !done && is_key(line) {
+                before = line["active:".len()..].trim().to_string();
+                out.push_str(desired);
+                done = true;
+            } else {
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        Ok((out, before))
+    } else {
+        // No `active:` line: put it beside `language:` so the pack keeps its
+        // grouping. Without a `language:` line either, refuse rather than guess
+        // where a top-level key belongs.
+        let mut out = String::with_capacity(text.len() + 16);
+        let mut inserted = false;
+        for line in text.lines() {
+            out.push_str(line);
+            out.push('\n');
+            if !inserted && is_language_key(line) {
+                out.push_str(desired);
+                out.push('\n');
+                inserted = true;
+            }
+        }
+        if !inserted {
+            bail!("the pack has neither `active:` nor `language:` — add `{desired}` by hand");
+        }
+        Ok((out, String::from("<absent>")))
+    }
+}
+
+/// Flip a pack's `active:` line, preserving every other byte of the file.
+///
+/// Idempotent: writing the same value changes nothing.
+async fn set_active(persona: &str, dir: &Path, active: bool) -> Result<ExitCode> {
+    let path = resolve_pack(persona, dir);
+    if !path.exists() {
+        bail!(
+            "persona pack not found at `{}` (looked in `{}` — pass --dir or a slug)",
+            path.display(),
+            dir.display()
+        );
+    }
+
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("read persona pack {}", path.display()))?;
+    let (updated, before) = rewrite_active(&text, active)?;
+
+    if updated == text {
+        println!(
+            "{} is already {}",
+            path.display(),
+            if active { "active" } else { "a draft" }
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    tokio::fs::write(&path, updated)
+        .await
+        .with_context(|| format!("write persona pack {}", path.display()))?;
+
+    // Re-validate: a pack that was just switched on must satisfy the stricter
+    // invariants (an active pack needs a handle on every enabled channel).
+    let pack = load_persona(&path).await?;
+    let issues = pack.validate();
+    let state = if issues.is_empty() {
+        "valid"
+    } else {
+        for issue in &issues {
+            eprintln!(
+                "fail {} :: {} — {}",
+                pack.persona, issue.field, issue.problem
+            );
+        }
+        "INVALID"
+    };
+
+    println!(
+        "{}: active {} -> {}   ({})",
+        path.display(),
+        if before.is_empty() {
+            "<empty>"
+        } else {
+            &before
+        },
+        active,
+        state
+    );
+    if !issues.is_empty() {
+        eprintln!(
+            "{} validation issue(s) — the pack was written, fix it before the next run",
+            issues.len()
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Execute the full pipeline for one persona pack (`autopilot run`).
@@ -1439,6 +1630,104 @@ mod tests {
                 published_at_unix: None,
             },
         )
+    }
+
+    // A pack as the engine really ships one: comments first, then the keys.
+    const PACK: &str = "# Persona pack — demo\n\
+        # Content language: en (global audience). Config keys stay in English.\n\
+        persona: demo\n\
+        display_name: Demo\n\
+        niche: computing-technology-ai-linux-foss\n\
+        language: en\n\
+        active: false\n\
+        blocklist:\n  - sumae\n\
+        voice: {tone: curious, audience: developers}\n\
+        channels:\n  - platform: bluesky\n    handle: demo.bsky.social\n";
+
+    #[test]
+    fn activating_flips_the_line_and_keeps_every_other_byte() {
+        let (out, before) = rewrite_active(PACK, true).expect("rewrite");
+        assert_eq!(before, "false");
+        assert!(out.contains("active: true"));
+        assert!(!out.contains("active: false"));
+        // The comments and the ordering are the point of a surgical edit.
+        assert!(out.starts_with(PACK.lines().next().expect("first line")));
+        for comment in PACK.lines().filter(|l| l.starts_with('#')) {
+            assert!(out.contains(comment), "lost comment {comment:?}");
+        }
+        // Nothing else moved: only the one line differs.
+        let changed: Vec<(&str, &str)> = PACK
+            .lines()
+            .zip(out.lines())
+            .filter(|(a, b)| a != b)
+            .collect();
+        assert_eq!(
+            changed.len(),
+            1,
+            "only the active line may change: {changed:?}"
+        );
+    }
+
+    #[test]
+    fn activating_twice_is_a_no_op() {
+        let (once, _) = rewrite_active(PACK, true).expect("first");
+        let (twice, _) = rewrite_active(&once, true).expect("second");
+        assert_eq!(once, twice, "the rewrite must be idempotent");
+    }
+
+    #[test]
+    fn deactivating_an_active_pack_reports_the_change() {
+        let (on, _) = rewrite_active(PACK, true).expect("activate");
+        let (off, before) = rewrite_active(&on, false).expect("deactivate");
+        assert_eq!(before, "true");
+        assert!(off.contains("active: false"));
+    }
+
+    #[test]
+    fn a_pack_without_the_line_gets_it_next_to_language() {
+        let text = "persona: nolang\nniche: x\nlanguage: en\nchannels: []\n";
+        let (out, before) = rewrite_active(text, true).expect("insert");
+        assert_eq!(before, "<absent>");
+        assert_eq!(
+            out,
+            "persona: nolang\nniche: x\nlanguage: en\nactive: true\nchannels: []\n"
+        );
+    }
+
+    #[test]
+    fn a_pack_with_neither_line_is_refused_rather_than_guessed_at() {
+        let text = "persona: bare\nniche: x\nchannels: []\n";
+        let err = rewrite_active(text, true).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("neither"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_nested_active_key_and_a_commented_one_are_never_touched() {
+        let text = "persona: nested\nlanguage: en\n# active: false (a comment, not a key)\n\
+                    some_block:\n  active: false\nchannels: []\n";
+        let (out, before) = rewrite_active(text, true).expect("rewrite");
+        // The nested key and the comment survive verbatim; a new top-level line is added.
+        assert!(out.contains("  active: false"), "nested key was rewritten");
+        assert!(out.contains("# active: false (a comment, not a key)"));
+        assert!(out.contains("language: en\nactive: true\n"));
+        assert_eq!(before, "<absent>");
+    }
+
+    #[test]
+    fn a_slug_resolves_under_the_given_dir_but_a_path_is_verbatim() {
+        let dir = Path::new("/somewhere/else");
+        assert_eq!(resolve_pack("demo", dir), dir.join("demo.yaml"));
+        assert_eq!(
+            resolve_pack("personas/demo.yaml", dir),
+            Path::new("personas/demo.yaml")
+        );
+        assert_eq!(
+            resolve_pack("/abs/demo.YML", dir),
+            Path::new("/abs/demo.YML")
+        );
     }
 
     #[test]
