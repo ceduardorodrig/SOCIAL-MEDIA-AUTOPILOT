@@ -226,6 +226,7 @@ name = "autopilot-publish"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "autopilot-core",
  "axum",
  "base64 0.22.1",
  "chrono",

@@ -182,6 +182,7 @@ mod tests {
             }],
             publishing: PublishingPolicy::default(),
             harvest: HarvestPolicy::default(),
+            visual: None,
         }
     }
 

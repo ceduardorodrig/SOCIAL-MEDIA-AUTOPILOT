@@ -267,6 +267,34 @@ pub struct HarvestPolicy {
     pub queries: Vec<String>,
 }
 
+/// Per-persona **card** visual identity (HB-032).
+///
+/// A feed must not look like one initiative: two personas run by the same engine
+/// must be visually distinguishable, or a reader cannot tell them apart. The
+/// card crate already ships several visually distinct templates and rotates them
+/// per post; this block scopes **which** templates belong to *this* persona — a
+/// **pool**, not one template — so the card still rotates inside the persona's
+/// own set (variety within a feed is kept, HB-055b) while two personas with
+/// different pools provably never render the same card.
+///
+/// The block is optional and purely additive: an absent or empty pool inherits
+/// every template (the global rotation), so an older pack behaves exactly as
+/// before. A pool that names a template outside the catalogue is rejected where
+/// the catalogue is known (`personas validate`, the run gate) — never a silent
+/// fallback, which is how two personas come to share a look.
+///
+/// The avatar is deliberately **not** part of this block: it already lives per
+/// persona under `personas/<slug>/assets/` (its own path and pipeline).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisualIdentity {
+    /// Card template names (`card-v1` … `card-vN`) this persona may use, drawn
+    /// from the engine's catalogue. Empty inherits every template. Duplicates
+    /// and blank entries are allowed in YAML but flagged by validation; the
+    /// accessor drops the blanks.
+    #[serde(default)]
+    pub templates: Vec<String>,
+}
+
 /// A complete persona definition: identity, voice, guardrails and channels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaPack {
@@ -297,6 +325,9 @@ pub struct PersonaPack {
     /// Per-persona harvest queries (HB-033); absent means "use the niche".
     #[serde(default)]
     pub harvest: HarvestPolicy,
+    /// Per-persona card visual identity (HB-032); absent inherits every template.
+    #[serde(default)]
+    pub visual: Option<VisualIdentity>,
 }
 
 /// Tone of voice and writing constraints.
@@ -416,6 +447,25 @@ impl PersonaPack {
         }
     }
 
+    /// The card template pool this persona owns (HB-032).
+    ///
+    /// Blank entries are dropped; an empty result means "inherit every template"
+    /// (the global rotation), which is exactly what a pack without a `visual`
+    /// block gets — so the previous behaviour is preserved byte-for-byte.
+    pub fn visual_templates(&self) -> Vec<String> {
+        self.visual
+            .as_ref()
+            .map(|visual| {
+                visual
+                    .templates
+                    .iter()
+                    .map(|template| template.trim().to_string())
+                    .filter(|template| !template.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Validate invariants the engine relies on before running any persona.
     pub fn validate(&self) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
@@ -476,6 +526,28 @@ impl PersonaPack {
                 field: "publishing.warming.started_on".into(),
                 problem: format!("`{started_on}` is not a valid YYYY-MM-DD date"),
             });
+        }
+        // HB-032: the card pool is checked for blank and duplicate names here.
+        // Membership against the real catalogue is checked where the catalogue is
+        // known (`personas validate`, the run gate) — never a silent fallback.
+        if let Some(visual) = &self.visual {
+            let mut seen: Vec<&str> = Vec::new();
+            for name in &visual.templates {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    issues.push(ValidationIssue {
+                        field: "visual.templates".into(),
+                        problem: "a card template name must not be blank".into(),
+                    });
+                } else if seen.contains(&trimmed) {
+                    issues.push(ValidationIssue {
+                        field: "visual.templates".into(),
+                        problem: format!("card template `{trimmed}` is listed twice"),
+                    });
+                } else {
+                    seen.push(trimmed);
+                }
+            }
         }
         if self.active {
             for channel in &self.channels {
@@ -640,12 +712,52 @@ mod tests {
             }],
             publishing: PublishingPolicy::default(),
             harvest: HarvestPolicy::default(),
+            visual: None,
         }
     }
 
     #[test]
     fn valid_pack_has_no_issues() {
         assert!(base_pack().validate().is_empty());
+    }
+
+    #[test]
+    fn a_pack_without_a_visual_block_stays_valid_and_inherits_every_template() {
+        // HB-032 back-compat: no `visual` block validates and inherits the whole
+        // catalogue (an empty pool), so an older pack is untouched.
+        let mut pack = base_pack();
+        pack.visual = None;
+        assert!(pack.validate().is_empty());
+        assert!(pack.visual_templates().is_empty());
+    }
+
+    #[test]
+    fn a_visual_block_scopes_the_card_pool() {
+        let yaml = "persona: demo\nniche: science\nvoice:\n  tone: curious\n  audience: adults\nblocklist:\n  - forbidden\nrubric:\n  min_score: 0.75\nchannels:\n  - platform: bluesky\n    handle: demo\n    enabled: true\nvisual:\n  templates: [card-v3, card-v7]\n";
+        let pack: PersonaPack = serde_yaml_ng::from_str(yaml).expect("parses");
+        assert_eq!(
+            pack.visual_templates(),
+            vec!["card-v3".to_string(), "card-v7".to_string()]
+        );
+        assert!(pack.validate().is_empty(), "{:?}", pack.validate());
+    }
+
+    #[test]
+    fn a_blank_or_duplicate_template_name_is_a_validation_issue() {
+        let mut pack = base_pack();
+        pack.visual = Some(VisualIdentity {
+            templates: vec!["card-v1".into(), "card-v1".into(), "  ".into()],
+        });
+        let issues = pack.validate();
+        assert!(
+            issues.iter().any(|i| i.field == "visual.templates"),
+            "expected a visual.templates issue, got {issues:?}"
+        );
+        // The accessor still yields the usable names (blanks dropped).
+        assert_eq!(
+            pack.visual_templates(),
+            vec!["card-v1".to_string(), "card-v1".to_string()]
+        );
     }
 
     #[test]

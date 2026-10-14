@@ -39,6 +39,7 @@ pub(crate) fn sample_persona() -> PersonaPack {
         }],
         publishing: PublishingPolicy::default(),
         harvest: HarvestPolicy::default(),
+        visual: None,
     }
 }
 

@@ -13,6 +13,13 @@
 //! re-render of the same post therefore reproduces the same card, while consecutive
 //! posts land on different templates.
 //!
+//! A feed must also not make every *persona* look like one initiative (HB-032):
+//! the catalogue is scoped per persona as a **pool** ([`resolve_pool`],
+//! [`template_for_spec_in_pool`]). A persona declares the templates that are
+//! "its" — the rotation still runs *inside* that pool, keeping the variety — and
+//! two personas with different pools never render the same card. A pack with no
+//! pool inherits the whole catalogue, byte-for-byte the old behaviour.
+//!
 //! Why an SVG template + `rsvg-convert` instead of a Rust image crate?
 //!
 //! * the visual is data (a reviewable, diffable, versioned file), not code;
@@ -332,6 +339,12 @@ impl CardIdentity {
 /// (the raw FNV tail is biased modulo a small, non-power-of-two list). No
 /// `RandomState`, no time, no allocation: identical on every run and platform.
 pub fn template_index(key: &str) -> usize {
+    bucket(hash_key(key), CARD_TEMPLATES.len())
+}
+
+/// FNV-1a over the key bytes, finished with SplitMix64 for a flat low-bit
+/// distribution. Pure and platform-independent.
+fn hash_key(key: &str) -> u64 {
     let mut hash = FNV_OFFSET_BASIS;
     for byte in key.as_bytes() {
         hash ^= u64::from(*byte);
@@ -342,10 +355,13 @@ pub fn template_index(key: &str) -> usize {
     hash ^= hash >> 27;
     hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
     hash ^= hash >> 31;
+    hash
+}
 
-    let len = CARD_TEMPLATES.len().max(1) as u128;
-    // Multiply-shift instead of `%`: maps the 64-bit hash onto `len` buckets with
-    // no modulo bias.
+/// Map a 64-bit hash onto `len` buckets with no modulo bias (multiply-shift).
+/// A zero/empty length still maps to bucket 0, so the caller stays total.
+fn bucket(hash: u64, len: usize) -> usize {
+    let len = len.max(1) as u128;
     ((u128::from(hash) * len) >> 64) as usize
 }
 
@@ -382,6 +398,93 @@ pub fn template_for_spec(spec: &CardSpec) -> &'static CardTemplate {
 /// The default (first) template.
 pub fn default_template() -> &'static CardTemplate {
     &CARD_TEMPLATES[0]
+}
+
+/// Every template in the catalogue, in rotation order — the "inherit all" pool.
+fn all_templates() -> Vec<&'static CardTemplate> {
+    CARD_TEMPLATES.iter().collect()
+}
+
+/// The catalogue's template names, in rotation order (for docs and errors).
+pub fn template_names() -> Vec<&'static str> {
+    CARD_TEMPLATES
+        .iter()
+        .map(|template| template.name)
+        .collect()
+}
+
+/// Resolve a persona's template **pool** (names) to the templates it refers to,
+/// in catalogue order (HB-032).
+///
+/// An **empty** pool inherits the whole catalogue — the global rotation and the
+/// exact behaviour a pack without a `visual` block gets, so back-compat is
+/// byte-for-byte. A **non-empty** pool naming a template outside the catalogue is
+/// an error, never a silent widening: a typo must not quietly hand a persona the
+/// whole catalogue back, because that is exactly how two personas come to share
+/// a look. Duplicate names collapse.
+pub fn resolve_pool(pool: &[String]) -> Result<Vec<&'static CardTemplate>> {
+    let known = all_templates();
+    if pool.is_empty() {
+        return Ok(known);
+    }
+    for name in pool {
+        let wanted = name.trim();
+        if !known.iter().any(|template| template.name == wanted) {
+            bail!(
+                "unknown card template `{wanted}` (known templates: {})",
+                template_names().join(", ")
+            );
+        }
+    }
+    Ok(known
+        .into_iter()
+        .filter(|template| pool.iter().any(|name| name.trim() == template.name))
+        .collect())
+}
+
+/// Deterministic index of a stable key inside a template **pool**.
+pub fn template_index_in_pool(pool: &[&'static CardTemplate], key: &str) -> usize {
+    bucket(hash_key(key), pool.len())
+}
+
+/// The template a persona's pool selects for a stable key.
+///
+/// The pool must be non-empty for a meaningful choice; an empty pool selects
+/// nothing, so this keeps the function total by falling back to the default.
+pub fn template_for_key_in_pool(
+    pool: &[&'static CardTemplate],
+    key: &str,
+) -> &'static CardTemplate {
+    match pool.get(template_index_in_pool(pool, key)) {
+        Some(template) => template,
+        None => &CARD_TEMPLATES[0],
+    }
+}
+
+/// The template a persona's pool selects for a spec's own content.
+///
+/// The key is the spec's content — identical to the global path — so a persona
+/// that inherits every template selects exactly what it did before HB-032.
+pub fn template_for_spec_in_pool(
+    spec: &CardSpec,
+    pool: &[&'static CardTemplate],
+) -> &'static CardTemplate {
+    template_for_key_in_pool(pool, &spec_key(spec))
+}
+
+/// The template a persona's pool selects for a post identity (the run path).
+pub fn template_for_identity_in_pool(
+    identity: &CardIdentity,
+    pool: &[&'static CardTemplate],
+) -> &'static CardTemplate {
+    template_for_key_in_pool(pool, &identity.key())
+}
+
+/// Fill the template a persona's pool selects for a spec's content.
+///
+/// Pure and deterministic: the same spec and pool always yield the same SVG.
+pub fn render_svg_in_pool(spec: &CardSpec, pool: &[&'static CardTemplate]) -> String {
+    render_svg_with(spec, template_for_spec_in_pool(spec, pool))
 }
 
 /// Fill the template selected from a spec's own content with escaped, wrapped text.
@@ -514,6 +617,23 @@ pub async fn render_png_for(
     rsvg_binary: &str,
 ) -> Result<PathBuf> {
     render_png_with(spec, template_for(identity), png_path, rsvg_binary).await
+}
+
+/// Rasterise a spec to a PNG using the template a persona's pool selects for its
+/// own content (HB-032).
+pub async fn render_png_in_pool(
+    spec: &CardSpec,
+    pool: &[&'static CardTemplate],
+    png_path: &Path,
+    rsvg_binary: &str,
+) -> Result<PathBuf> {
+    render_png_with(
+        spec,
+        template_for_spec_in_pool(spec, pool),
+        png_path,
+        rsvg_binary,
+    )
+    .await
 }
 
 /// Rasterise a spec to a PNG with a specific template, writing the filled SVG
@@ -821,6 +941,103 @@ mod tests {
         let first = template_for(&identity).name;
         assert_eq!(first, template_for(&identity).name);
         assert_eq!(first, template_for_key(&identity.key()).name);
+    }
+
+    #[test]
+    fn an_empty_pool_inherits_the_whole_catalogue_in_order() {
+        let pool = resolve_pool(&[]).expect("an empty pool is valid");
+        assert_eq!(pool.len(), CARD_TEMPLATES.len());
+        assert_eq!(pool[0].name, CARD_TEMPLATES[0].name);
+    }
+
+    #[test]
+    fn an_empty_pool_selects_exactly_like_the_global_rotation() {
+        // HB-032 back-compat, proven: a pack with no `visual` block picks the very
+        // same template the global rotation always picked, for both the content
+        // key and the identity key.
+        let spec = spec();
+        let pool = resolve_pool(&[]).expect("an empty pool is valid");
+        assert_eq!(
+            template_for_spec_in_pool(&spec, &pool).name,
+            template_for_spec(&spec).name,
+        );
+        let identity = CardIdentity::new("run-9", "A", "example.bsky.social");
+        assert_eq!(
+            template_for_identity_in_pool(&identity, &pool).name,
+            template_for(&identity).name,
+        );
+        assert_eq!(
+            render_svg_in_pool(&spec, &pool),
+            render_svg_with(&spec, template_for_spec(&spec)),
+        );
+    }
+
+    #[test]
+    fn two_disjoint_pools_never_select_the_same_card() {
+        // The owner's invariant (HB-032): with disjoint pools, two personas cannot
+        // render the same card, for any content.
+        let pool_a = resolve_pool(&["card-v1".into(), "card-v2".into()]).expect("valid pool");
+        let pool_b = resolve_pool(&["card-v3".into(), "card-v4".into()]).expect("valid pool");
+        let spec = spec();
+        assert_ne!(
+            template_for_spec_in_pool(&spec, &pool_a).name,
+            template_for_spec_in_pool(&spec, &pool_b).name,
+        );
+        assert_ne!(
+            render_svg_in_pool(&spec, &pool_a),
+            render_svg_in_pool(&spec, &pool_b),
+        );
+    }
+
+    #[test]
+    fn rotation_still_varies_inside_one_personas_pool() {
+        // Variety within a feed is kept (HB-055b): a multi-template pool rotates.
+        let pool = resolve_pool(&[
+            "card-v1".into(),
+            "card-v3".into(),
+            "card-v5".into(),
+            "card-v7".into(),
+            "card-v9".into(),
+            "card-v11".into(),
+        ])
+        .expect("valid pool");
+        let mut names: Vec<&str> = Vec::new();
+        for index in 0..24 {
+            let identity = CardIdentity::new(format!("run-{index:04}"), "A", "demo");
+            names.push(template_for_identity_in_pool(&identity, &pool).name);
+        }
+        let mut distinct = names.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() >= 3,
+            "a six-template pool collapsed to {distinct:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_template_pool_pins_one_look() {
+        let pool = resolve_pool(&["card-v6".into()]).expect("valid pool");
+        assert_eq!(pool.len(), 1);
+        assert_eq!(template_for_spec_in_pool(&spec(), &pool).name, "card-v6");
+    }
+
+    #[test]
+    fn a_pool_resolves_in_catalogue_order_and_collapses_duplicates() {
+        let pool =
+            resolve_pool(&["card-v3".into(), "card-v1".into(), "card-v3".into()]).expect("valid");
+        assert_eq!(
+            pool.iter()
+                .map(|template| template.name)
+                .collect::<Vec<_>>(),
+            vec!["card-v1", "card-v3"],
+        );
+    }
+
+    #[test]
+    fn an_unknown_template_name_is_an_error_not_a_silent_widen() {
+        let err = resolve_pool(&["card-v99".into()]).expect_err("an unknown name must fail");
+        assert!(err.to_string().contains("card-v99"), "got: {err}");
     }
 
     #[test]

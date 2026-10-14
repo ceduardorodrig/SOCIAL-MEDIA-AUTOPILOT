@@ -32,11 +32,11 @@ use autopilot_pipeline::{
 use autopilot_providers::{JobKind, complete_with_chain, load_config};
 use autopilot_publish::{
     BlueskyCredentials, CARD_HEIGHT, CARD_MIME_TYPE, CARD_WIDTH, CardIdentity, CardSpec,
-    DEFAULT_BLUESKY_BASE_URL, DEFAULT_RSVG_BINARY, DEFAULT_VIDEO_BASE_URL,
+    CardTemplate, DEFAULT_BLUESKY_BASE_URL, DEFAULT_RSVG_BINARY, DEFAULT_VIDEO_BASE_URL,
     DEFAULT_VIDEO_POLL_INTERVAL, PostImage, PostVideo, Session, VIDEO_MIME_TYPE, alt_text,
     await_video_job, build_image_embed, build_post_record_with_embed, build_video_embed,
-    create_post, create_session, now_rfc3339_millis, post_url, render_png_for, template_for,
-    upload_blob, upload_video, validate_video,
+    create_post, create_session, now_rfc3339_millis, post_url, render_png_with, resolve_pool,
+    template_for_identity_in_pool, upload_blob, upload_video, validate_video,
 };
 
 use crate::journal::{Journal, PublishedEntry, read_published};
@@ -660,6 +660,12 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
     let persona = load_persona(&options.persona_path).await?;
     validate_or_bail(&persona)?;
 
+    // HB-032: the persona's card templates are scoped once, up front. An empty
+    // pool inherits the whole catalogue; a pack naming an unknown template fails
+    // the whole run here rather than silently widening back to every template
+    // (which is how two personas come to share a look).
+    let card_pool = resolve_pool(&persona.visual_templates())?;
+
     let run_id = format!("{}-{}", persona.persona, now_unix());
     let journal_path = options
         .journal_path
@@ -968,6 +974,7 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
             age_days,
             media: &media,
             memory: memory.as_ref(),
+            card_pool: &card_pool,
         },
     )
     .await?;
@@ -1697,6 +1704,10 @@ struct SlotState<'a> {
     /// The persona's memory proposal, carrying the learned per-format budget
     /// (HB-034) the publish gate applies.
     memory: Option<&'a autopilot_learn::MemoryUpdate>,
+    /// The persona's card-template pool (HB-032): this persona's cards are drawn
+    /// only from these templates, so the run never widens back to the whole
+    /// catalogue on a typo.
+    card_pool: &'a [&'static CardTemplate],
 }
 
 /// Stage [4] — publish. Only the platforms with an adapter are served.
@@ -1856,8 +1867,16 @@ async fn stage_publish(
                 }
             }
             _ => {
-                match stage_card_image(report, journal, format, &run_id, topic, variant, current)
-                    .await?
+                match stage_card_image(
+                    report,
+                    journal,
+                    format,
+                    topic,
+                    variant,
+                    current,
+                    slot.card_pool,
+                )
+                .await?
                 {
                     Some(image) => Some(build_image_embed(&[image])?),
                     None => None,
@@ -1919,10 +1938,10 @@ async fn stage_card_image(
     report: &mut RunReport,
     journal: &Journal,
     format: Format,
-    run_id: &str,
     topic: &str,
     variant: &Variant,
     session: &Session,
+    pool: &[&'static CardTemplate],
 ) -> Result<Option<PostImage>> {
     if format != Format::Card {
         return Ok(None);
@@ -1935,14 +1954,16 @@ async fn stage_card_image(
         Some(card) => CardSpec::from_post(&card.title, &card.body, &session.handle),
         None => CardSpec::from_post(topic, &variant.text, &session.handle),
     };
-    // The template rotates per post: the identity is the run, the variant and
-    // the persona — not the text — so a re-run of the same post reproduces the
-    // same card, while consecutive posts vary.
-    let identity = CardIdentity::new(run_id, &variant.label, &session.handle);
-    let template = template_for(&identity);
-    let png = PathBuf::from(DEFAULT_CARD_DIR).join(format!("{run_id}-{}.png", variant.label));
+    // HB-032: the template is chosen inside the persona's own pool, so the
+    // rotation still varies per post while two personas never share a look. The
+    // identity is the run, the variant and the persona — not the text — so a
+    // re-run of the same post reproduces the same card.
+    let identity = CardIdentity::new(report.run_id.as_str(), &variant.label, &session.handle);
+    let template = template_for_identity_in_pool(&identity, pool);
+    let png =
+        PathBuf::from(DEFAULT_CARD_DIR).join(format!("{}-{}.png", report.run_id, variant.label));
     let result = async {
-        let svg = render_png_for(&spec, &identity, &png, DEFAULT_RSVG_BINARY).await?;
+        let svg = render_png_with(&spec, template, &png, DEFAULT_RSVG_BINARY).await?;
         let bytes = tokio::fs::read(&png).await?;
         let blob = upload_blob(
             DEFAULT_BLUESKY_BASE_URL,
@@ -2274,6 +2295,7 @@ mod tests {
             ],
             publishing: PublishingPolicy::default(),
             harvest: HarvestPolicy::default(),
+            visual: None,
         }
     }
 

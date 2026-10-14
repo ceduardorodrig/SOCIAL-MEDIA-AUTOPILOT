@@ -667,6 +667,18 @@ async fn run_personas(command: PersonasCommand) -> Result<ExitCode> {
                 for issue in p.validate() {
                     issues.push((p.persona.clone(), issue));
                 }
+                // HB-032: the card pool is checked against the real catalogue
+                // here, where it is known — an unknown template is an error, not
+                // a silent fallback back to the whole catalogue.
+                if let Err(err) = autopilot_publish::card::resolve_pool(&p.visual_templates()) {
+                    issues.push((
+                        p.persona.clone(),
+                        ValidationIssue {
+                            field: "visual.templates".into(),
+                            problem: err.to_string(),
+                        },
+                    ));
+                }
             }
             if issues.is_empty() {
                 println!("all {} persona pack(s) valid", packs.len());

@@ -10,9 +10,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
+use autopilot_core::load_persona;
 use autopilot_publish::card::{
     CARD_HEIGHT, CARD_MIME_TYPE, CARD_WIDTH, CardSpec, DEFAULT_RSVG_BINARY, alt_text,
-    png_dimensions, render_png_with, render_svg_with, template_for_spec,
+    png_dimensions, render_png_in_pool, render_png_with, render_svg_in_pool, render_svg_with,
+    resolve_pool, template_for_spec, template_for_spec_in_pool,
 };
 use clap::{Parser, Subcommand};
 
@@ -43,6 +45,11 @@ enum Command {
         /// Output PNG path.
         #[arg(long)]
         out: PathBuf,
+        /// Persona pack whose `visual` pool scopes the card identity (HB-032).
+        /// Without it the card uses the whole template catalogue (the global
+        /// rotation) — the behaviour a pack with no `visual` block always had.
+        #[arg(long)]
+        persona: Option<PathBuf>,
         /// Rasteriser binary.
         #[arg(long, default_value = DEFAULT_RSVG_BINARY)]
         rsvg: String,
@@ -69,12 +76,35 @@ async fn execute(cli: Cli) -> Result<()> {
         text,
         footer,
         out,
+        persona,
         rsvg,
         dry_run,
     } = cli.command;
 
+    // HB-032: a persona pack narrows the catalogue to its own pool; without one
+    // the card keeps the global rotation (spec-content key over every template).
+    let persona_pool = match persona.as_deref() {
+        Some(path) => Some(resolve_pool(&load_persona(path).await?.visual_templates())?),
+        None => None,
+    };
+
     let spec = CardSpec::from_post(&topic, &text, &footer);
-    let template = template_for_spec(&spec);
+    let template = match &persona_pool {
+        Some(pool) => {
+            if let Some(path) = &persona {
+                println!("persona : {}", path.display());
+            }
+            println!(
+                "pool    : {}",
+                pool.iter()
+                    .map(|template| template.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            template_for_spec_in_pool(&spec, pool)
+        }
+        None => template_for_spec(&spec),
+    };
     println!("template : {}", template.name);
     println!("mime     : {CARD_MIME_TYPE}");
     println!("size     : {CARD_WIDTH}x{CARD_HEIGHT}");
@@ -82,11 +112,17 @@ async fn execute(cli: Cli) -> Result<()> {
 
     if dry_run {
         println!("--- filled SVG (dry run, nothing written) ---");
-        println!("{}", render_svg_with(&spec, template));
+        match &persona_pool {
+            Some(pool) => println!("{}", render_svg_in_pool(&spec, pool)),
+            None => println!("{}", render_svg_with(&spec, template)),
+        }
         return Ok(());
     }
 
-    let svg = render_png_with(&spec, template, &out, &rsvg).await?;
+    let svg = match &persona_pool {
+        Some(pool) => render_png_in_pool(&spec, pool, &out, &rsvg).await?,
+        None => render_png_with(&spec, template, &out, &rsvg).await?,
+    };
     let bytes = tokio::fs::read(&out)
         .await
         .with_context(|| format!("reading the rendered card {}", out.display()))?;
