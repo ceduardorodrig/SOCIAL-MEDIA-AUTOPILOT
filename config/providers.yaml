@@ -28,7 +28,7 @@ providers:
   - id: ollama
     kind: ollama
     model: gemma4:e2b
-    endpoint: http://127.0.0.1:11434
+    endpoint: http://psicopompo:11434
     priority: 300
     timeout_ms: 15000
     role: "Fail-safe 2 — local GPU inference on psicopompo (idle windows only, VRAM released after each job)"
