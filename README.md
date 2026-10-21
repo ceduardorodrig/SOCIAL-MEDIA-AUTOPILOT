@@ -21,6 +21,27 @@ horoscopo-diario ──────┴──►   [2] triage   (LLM chain)      
                               [6] learn    → writes back into the persona pack
 ```
 
+## Deployment model — engine vs tenant
+
+This repository is the **engine**. A **tenant** owns the persona packs, the
+account identities, the engagement policy and the state (`var/`). The engine
+contains no handle and no secret, so the same binary serves one homelab account
+or many customers:
+
+```
+ENGINE (this repo)                 TENANT (private, per customer)
+  crates/ …                           personas/<slug>.yaml
+  examples/                           config/engage/<slug>.yaml
+  docs/tenancy.md                     config/providers.yaml
+  var/ (gitignored)                   var/  (journals, cards, metrics, state)
+```
+
+A persona pack declares the **identity** (`handle`) and the **names** of the
+environment variables that hold the secrets (`app_password_env`, `x_env`) —
+never the values. The publisher logs in as that handle and refuses a session
+that belongs to another account. See [`docs/tenancy.md`](docs/tenancy.md) and
+the template in [`examples/`](examples/).
+
 ## LLM provider chain (fail-safe)
 
 Cloud first, local as the last resort. The chain is **data**, resolved at run time by probing
@@ -237,6 +258,13 @@ live credentials (HB-026) that let the X path run for real.
   convention, municipality services follow `hl-`, hosts carry Tupi-Guarani names.
 - **No plaintext secrets** in this repo — SOPS store only.
 - Rust-first: no Python; errors are handled with `?`/`match`, never `unwrap()`/`expect()`.
+
+## License
+
+The engine is licensed under the **GNU Affero General Public License v3.0**
+(`AGPL-3.0-only`, see [`LICENSE`](LICENSE)). A **commercial license** is
+available for organizations that cannot comply with the AGPL — see
+[`COMMERCIAL.md`](COMMERCIAL.md).
 
 <div align="center">
 

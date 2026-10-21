@@ -1,7 +1,9 @@
 //! X (Twitter) publisher — X API v2 `POST /2/tweets` with OAuth 1.0a User Context.
 //!
-//! Credentials come from the environment (never from the repository):
-//! `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN` and `X_ACCESS_TOKEN_SECRET`.
+//! Credentials come from the environment (never from the repository). A pack
+//! may declare its own four variable names (`x_env`); without that block the
+//! legacy `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN` and
+//! `X_ACCESS_TOKEN_SECRET` are used.
 //!
 //! The OAuth 1.0a request signing (HMAC-SHA1 over the RFC 5849 signature base
 //! string) is implemented here in pure Rust and is unit-tested against the
@@ -11,6 +13,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use autopilot_core::Channel;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
@@ -45,7 +48,22 @@ pub struct XCredentials {
 }
 
 impl XCredentials {
-    /// Read the four OAuth 1.0a variables from the environment.
+    /// Read the four OAuth 1.0a variables for one persona channel.
+    ///
+    /// The pack declares the **names** (`x_env`), so two channels in the same
+    /// process can use different accounts; without the block the legacy global
+    /// names are used.
+    pub fn from_channel(channel: &Channel) -> Result<Self> {
+        let names = channel.x_env_names();
+        Ok(Self {
+            api_key: crate::env_var(&names.api_key)?,
+            api_secret: crate::env_var(&names.api_secret)?,
+            access_token: crate::env_var(&names.access_token)?,
+            access_token_secret: crate::env_var(&names.access_token_secret)?,
+        })
+    }
+
+    /// Read the four legacy global OAuth 1.0a variables from the environment.
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             api_key: crate::env_var("X_API_KEY")?,
@@ -67,6 +85,24 @@ pub fn missing_env_vars() -> Vec<&'static str> {
                 .unwrap_or(true)
         })
         .collect()
+}
+
+/// Names of the variables a specific channel declares that are missing or empty.
+pub fn missing_env_vars_for(channel: &Channel) -> Vec<String> {
+    let names = channel.x_env_names();
+    [
+        names.api_key,
+        names.api_secret,
+        names.access_token,
+        names.access_token_secret,
+    ]
+    .into_iter()
+    .filter(|name| {
+        std::env::var(name)
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+    })
+    .collect()
 }
 
 /// Percent-encode a string per RFC 5849 §3.6 / RFC 3986 §2.3.
@@ -528,6 +564,35 @@ mod tests {
         assert_eq!(
             post_endpoint("https://api.x.com/"),
             "https://api.x.com/2/tweets"
+        );
+    }
+
+    #[test]
+    fn a_channel_declares_its_own_x_variable_names() {
+        let channel = Channel {
+            platform: autopilot_core::Platform::X,
+            handle: "example".into(),
+            app_password_env: None,
+            x_env: Some(autopilot_core::XCredentialEnv {
+                api_key: "AUTOPILOT_TEST_X_KEY".into(),
+                api_secret: "AUTOPILOT_TEST_X_SECRET".into(),
+                access_token: "AUTOPILOT_TEST_X_TOKEN".into(),
+                access_token_secret: "AUTOPILOT_TEST_X_TOKEN_SECRET".into(),
+            }),
+            enabled: true,
+            posts_per_day: 1,
+            windows: vec![],
+        };
+        let missing = missing_env_vars_for(&channel);
+        let names: Vec<&str> = missing.iter().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            vec![
+                "AUTOPILOT_TEST_X_KEY",
+                "AUTOPILOT_TEST_X_SECRET",
+                "AUTOPILOT_TEST_X_TOKEN",
+                "AUTOPILOT_TEST_X_TOKEN_SECRET",
+            ]
         );
     }
 }

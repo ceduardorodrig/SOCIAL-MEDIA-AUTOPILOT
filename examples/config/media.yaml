@@ -1,0 +1,19 @@
+# Example short-video media configuration — copy it to your tenant.
+#
+# Every value has a safe default, so text and card posts need no media config at
+# all. The video format is gated by the persona policy
+# (`publishing.formats.video`, default 0) and the warming ramp.
+
+piper:
+  # The `piper-tts` console script. A bare name is resolved through PATH; use an
+  # absolute path to avoid the libratbag `/usr/bin/piper` collision.
+  binary: piper
+  # Voice model (`.onnx`); Piper finds the matching `.json` next to it.
+  model: ""
+
+# Still-image motion per scene: static | kenburns.
+motion: static
+
+# Directory holding one PNG per scene, named `<scene_index>.png`. Without real
+# stills a live render aborts and the slot degrades to text.
+# scene_images: var/media/scenes

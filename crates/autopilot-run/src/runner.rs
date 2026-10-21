@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use autopilot_core::{
-    Format, FormatAvailability, FormatBudgets, PersonaPack, Platform, PublishingPolicy,
-    SelectionRule, load_persona, now_unix, utc_day,
+    Format, FormatAvailability, FormatBudgets, PersonaPack, Platform, SelectionRule, load_persona,
+    now_unix, utc_day,
 };
 use autopilot_guardrail::{Verdict, evaluate};
 use autopilot_harvest::{
@@ -31,12 +31,12 @@ use autopilot_pipeline::{
 };
 use autopilot_providers::{JobKind, complete_with_chain, load_config};
 use autopilot_publish::{
-    BlueskyCredentials, CARD_HEIGHT, CARD_MIME_TYPE, CARD_WIDTH, CardIdentity, CardSpec,
-    CardTemplate, DEFAULT_BLUESKY_BASE_URL, DEFAULT_RSVG_BINARY, DEFAULT_VIDEO_BASE_URL,
+    CARD_HEIGHT, CARD_MIME_TYPE, CARD_WIDTH, CardIdentity, CardSpec, CardTemplate,
+    DEFAULT_BLUESKY_BASE_URL, DEFAULT_RSVG_BINARY, DEFAULT_VIDEO_BASE_URL,
     DEFAULT_VIDEO_POLL_INTERVAL, PostImage, PostVideo, Session, VIDEO_MIME_TYPE, alt_text,
     await_video_job, build_image_embed, build_post_record_with_embed, build_video_embed,
-    create_post, create_session, now_rfc3339_millis, post_url, render_png_with, resolve_pool,
-    template_for_identity_in_pool, upload_blob, upload_video, validate_video,
+    create_post, create_session_for_channel, now_rfc3339_millis, post_url, render_png_with,
+    resolve_pool, template_for_identity_in_pool, upload_blob, upload_video, validate_video,
 };
 
 use crate::journal::{Journal, PublishedEntry, read_published};
@@ -966,10 +966,10 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         &mut report,
         &journal,
         &options,
-        &persona.publishing,
         &topic_title,
         &approved,
         &SlotState {
+            persona: &persona,
             published: &published,
             age_days,
             media: &media,
@@ -1695,6 +1695,8 @@ async fn stage_grounding<'a>(
 /// is resolved once for the run and consumed only when the policy releases the
 /// video format.
 struct SlotState<'a> {
+    /// The persona being published (its channels carry the identities).
+    persona: &'a PersonaPack,
     /// The posts already published (the journal, read once before the gates).
     published: &'a [PublishedEntry],
     /// The account's age in days, or `None` for a mature account (ramp inert).
@@ -1715,11 +1717,11 @@ async fn stage_publish(
     report: &mut RunReport,
     journal: &Journal,
     options: &RunOptions,
-    policy: &PublishingPolicy,
     topic: &str,
     approved: &[(Platform, &Variant)],
     slot: &SlotState<'_>,
 ) -> Result<()> {
+    let policy = &slot.persona.publishing;
     let mut session: Option<Session> = None;
     let mut handle = String::new();
     let run_id = report.run_id.clone();
@@ -1823,7 +1825,7 @@ async fn stage_publish(
         }
 
         if session.is_none() {
-            match open_bluesky_session().await {
+            match open_bluesky_session(slot.persona).await {
                 Ok(created) => {
                     handle = created.handle.clone();
                     session = Some(created);
@@ -2188,10 +2190,15 @@ fn video_alt(variant: &Variant) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-/// Authenticate against Bluesky using the credentials in the environment.
-async fn open_bluesky_session() -> Result<Session> {
-    let credentials = BlueskyCredentials::from_env()?;
-    create_session(DEFAULT_BLUESKY_BASE_URL, &credentials, PUBLISH_TIMEOUT).await
+/// Authenticate against Bluesky for the persona's enabled Bluesky channel.
+///
+/// The channel carries the identity (handle) and the name of the app-password
+/// variable; the session is rejected if it belongs to another account.
+async fn open_bluesky_session(persona: &PersonaPack) -> Result<Session> {
+    let channel = persona
+        .enabled_channel(Platform::Bluesky)
+        .context("the persona has no enabled bluesky channel")?;
+    create_session_for_channel(DEFAULT_BLUESKY_BASE_URL, channel, PUBLISH_TIMEOUT).await
 }
 
 /// Append one decision to both the journal and the in-memory report.
@@ -2274,6 +2281,8 @@ mod tests {
                 Channel {
                     platform: Platform::Bluesky,
                     handle: String::new(),
+                    app_password_env: None,
+                    x_env: None,
                     enabled: true,
                     posts_per_day: 1,
                     windows: vec![],
@@ -2281,6 +2290,8 @@ mod tests {
                 Channel {
                     platform: Platform::X,
                     handle: String::new(),
+                    app_password_env: None,
+                    x_env: None,
                     enabled: true,
                     posts_per_day: 1,
                     windows: vec![],
@@ -2288,6 +2299,8 @@ mod tests {
                 Channel {
                     platform: Platform::Instagram,
                     handle: String::new(),
+                    app_password_env: None,
+                    x_env: None,
                     enabled: false,
                     posts_per_day: 1,
                     windows: vec![],

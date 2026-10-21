@@ -1,0 +1,52 @@
+# Example engagement configuration — copy it to your tenant.
+#
+# The stage behaves like a person, not a bot: its own schedule, sporadic actions,
+# conservative caps and a kill switch. There is no secret here — only the NAME of
+# the kill-switch variable.
+
+kill_switch_env: AUTOPILOT_ENGAGE_KILL_SWITCH
+
+# Separate execution windows (24h clock), on the LOCAL clock.
+windows: ["09:30", "13:30", "20:30"]
+window_minutes: 45
+
+caps:
+  replies_per_day: 4
+  likes_per_day: 6
+  follows_per_day: 1
+  follows_per_week: 3
+  max_actions_per_run: 6
+
+pacing:
+  run_skip_probability: 0.35
+  delay_min_secs: 45
+  delay_max_secs: 240
+  follow_delay_min_secs: 600
+  follow_delay_max_secs: 1800
+
+interests:
+  # A finite, curated list — never discovered autonomously. Replace it with the
+  # accounts your persona actually follows.
+  accounts:
+    - "rust-lang.org"
+    - "python.org"
+    - "gnome.org"
+    - "kde.org"
+    - "opensource.org"
+
+proactive:
+  enabled: true
+  accounts_per_run: 3
+  posts_per_account: 3
+  max_post_age_hours: 36
+  candidates_per_account_per_run: 1
+  replies_per_day: 2
+  replies_per_account_per_week: 1
+  min_gap_hours: 72
+  min_chars: 40
+  min_words: 8
+
+notification_reasons: ["mention", "reply"]
+notification_limit: 50
+own_posts_to_scan: 5
+thread_depth: 2

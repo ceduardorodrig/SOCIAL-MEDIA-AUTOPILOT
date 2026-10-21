@@ -33,6 +33,8 @@ pub(crate) fn sample_persona() -> PersonaPack {
         channels: vec![Channel {
             platform: Platform::Bluesky,
             handle: "x".into(),
+            app_password_env: None,
+            x_env: None,
             enabled: true,
             posts_per_day: 1,
             windows: vec![],

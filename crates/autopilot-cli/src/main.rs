@@ -32,8 +32,8 @@ use autopilot_providers::{
 use autopilot_publish::x::create_post as create_x_post;
 use autopilot_publish::{
     BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, DEFAULT_X_API_BASE_URL, X_ENV_VARS, XCredentials,
-    build_post_record, build_tweet_body, create_post, create_session, missing_env_vars,
-    now_rfc3339_millis, post_endpoint, post_url,
+    build_post_record, build_tweet_body, create_post, create_session, create_session_for_channel,
+    missing_env_vars, missing_env_vars_for, now_rfc3339_millis, post_endpoint, post_url,
 };
 use autopilot_run::{CardAttachment, RunOptions, RunReport, StageOutcome};
 use clap::{Args, Parser, Subcommand};
@@ -342,6 +342,9 @@ enum PublishCommand {
         /// Base URL of the platform API (defaults to the platform's entry point).
         #[arg(long)]
         base_url: Option<String>,
+        /// Persona slug or pack path; resolves the channel identity and env names.
+        #[arg(long, value_parser = parse_persona)]
+        persona: Option<PathBuf>,
     },
     /// Publish a guardrail-approved draft to Bluesky.
     Bluesky {
@@ -1203,24 +1206,59 @@ async fn run_create(command: CreateCommand) -> Result<ExitCode> {
 
 async fn run_publish(command: PublishCommand) -> Result<ExitCode> {
     match command {
-        PublishCommand::Auth { platform, base_url } => match platform {
+        PublishCommand::Auth {
+            platform,
+            base_url,
+            persona,
+        } => match platform {
             Platform::Bluesky => {
                 let base_url = base_url.unwrap_or_else(|| DEFAULT_BLUESKY_BASE_URL.to_string());
-                let credentials = BlueskyCredentials::from_env()?;
-                let session = create_session(&base_url, &credentials, PUBLISH_TIMEOUT).await?;
+                let session = match &persona {
+                    Some(path) => {
+                        let pack = load_persona(path).await?;
+                        let channel = pack
+                            .enabled_channel(Platform::Bluesky)
+                            .context("the persona has no enabled bluesky channel")?;
+                        create_session_for_channel(&base_url, channel, PUBLISH_TIMEOUT).await?
+                    }
+                    None => {
+                        let credentials = BlueskyCredentials::from_env()?;
+                        create_session(&base_url, &credentials, PUBLISH_TIMEOUT).await?
+                    }
+                };
                 println!("authenticated : {}", session.handle);
                 println!("did           : {}", session.did);
                 Ok(ExitCode::SUCCESS)
             }
             Platform::X => {
-                let missing = missing_env_vars();
+                let (names, missing) = match &persona {
+                    Some(path) => {
+                        let pack = load_persona(path).await?;
+                        let channel = pack
+                            .enabled_channel(Platform::X)
+                            .context("the persona has no enabled x channel")?;
+                        let env = channel.x_env_names();
+                        let names = vec![
+                            env.api_key,
+                            env.api_secret,
+                            env.access_token,
+                            env.access_token_secret,
+                        ];
+                        let missing = missing_env_vars_for(channel);
+                        (names, missing)
+                    }
+                    None => (
+                        X_ENV_VARS.iter().map(|name| name.to_string()).collect(),
+                        missing_env_vars().into_iter().map(String::from).collect(),
+                    ),
+                };
                 if !missing.is_empty() {
                     eprintln!("missing X credential variable(s): {}", missing.join(", "));
                     return Ok(ExitCode::FAILURE);
                 }
                 println!("platform      : x");
                 println!("credentials   : present (OAuth 1.0a user context)");
-                for name in X_ENV_VARS {
+                for name in &names {
                     println!("  {name}: set");
                 }
                 println!(
@@ -1259,8 +1297,10 @@ async fn run_publish(command: PublishCommand) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
 
-            let credentials = BlueskyCredentials::from_env()?;
-            let session = create_session(&base_url, &credentials, PUBLISH_TIMEOUT).await?;
+            let channel = pack
+                .enabled_channel(Platform::Bluesky)
+                .context("the persona has no enabled bluesky channel")?;
+            let session = create_session_for_channel(&base_url, channel, PUBLISH_TIMEOUT).await?;
             let uri = create_post(&base_url, &session, &record, PUBLISH_TIMEOUT).await?;
             println!("published : {}", post_url(&session.handle, &uri));
             Ok(ExitCode::SUCCESS)
@@ -1292,7 +1332,10 @@ async fn run_publish(command: PublishCommand) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
 
-            let credentials = XCredentials::from_env()?;
+            let channel = pack
+                .enabled_channel(Platform::X)
+                .context("the persona has no enabled x channel")?;
+            let credentials = XCredentials::from_channel(channel)?;
             let post = create_x_post(&base_url, &credentials, &text, PUBLISH_TIMEOUT).await?;
             println!("published : {}", post.url);
             Ok(ExitCode::SUCCESS)

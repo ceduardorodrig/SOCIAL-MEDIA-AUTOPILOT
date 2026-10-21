@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use autopilot_core::{PersonaPack, load_persona, local_minute_of_day, now_unix};
+use autopilot_core::{PersonaPack, Platform, load_persona, local_minute_of_day, now_unix};
 use autopilot_providers::{JobKind, ProvidersConfig, complete_with_chain, load_config};
-use autopilot_publish::{BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, Session, create_session};
+use autopilot_publish::{DEFAULT_BLUESKY_BASE_URL, Session, create_session_for_channel};
 use serde::Deserialize;
 
 use crate::bluesky::{
@@ -194,23 +194,22 @@ pub async fn run(options: EngageOptions) -> Result<EngageReport> {
         return Ok(report);
     }
 
-    let credentials = BlueskyCredentials::from_env()?;
-    let session = match create_session(
-        DEFAULT_BLUESKY_BASE_URL,
-        &credentials,
-        DEFAULT_ENGAGE_TIMEOUT,
-    )
-    .await
-    {
-        Ok(session) => session,
-        Err(err) => {
-            report.failed = true;
-            report
-                .notes
-                .push(format!("bluesky authentication failed: {err:#}"));
-            return Ok(report);
-        }
-    };
+    let channel = persona
+        .enabled_channel(Platform::Bluesky)
+        .context("engage needs an enabled bluesky channel")?;
+    let session =
+        match create_session_for_channel(DEFAULT_BLUESKY_BASE_URL, channel, DEFAULT_ENGAGE_TIMEOUT)
+            .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                report.failed = true;
+                report
+                    .notes
+                    .push(format!("bluesky authentication failed: {err:#}"));
+                return Ok(report);
+            }
+        };
 
     let (candidates, follows) =
         gather_live(&config, &session, &state, now, &mut report.notes).await?;

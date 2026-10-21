@@ -363,11 +363,44 @@ pub struct Criterion {
     pub description: String,
 }
 
+/// Environment-variable names for the X (OAuth 1.0a) user-context credentials.
+///
+/// The pack declares **names**, never values: it is portable across tenants and
+/// deployments, and each tenant exports its own secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XCredentialEnv {
+    pub api_key: String,
+    pub api_secret: String,
+    pub access_token: String,
+    pub access_token_secret: String,
+}
+
+impl XCredentialEnv {
+    /// The legacy global names, used when a pack does not declare `x_env`.
+    pub fn legacy() -> Self {
+        Self {
+            api_key: "X_API_KEY".into(),
+            api_secret: "X_API_SECRET".into(),
+            access_token: "X_ACCESS_TOKEN".into(),
+            access_token_secret: "X_ACCESS_TOKEN_SECRET".into(),
+        }
+    }
+}
+
 /// A platform channel bound to this persona.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
     pub platform: Platform,
+    /// The account identity on this platform. The login uses this handle; it is
+    /// never read from a global environment variable.
     pub handle: String,
+    /// Environment variable that holds this channel's app password (Bluesky).
+    /// The secret is named, never stored.
+    #[serde(default)]
+    pub app_password_env: Option<String>,
+    /// Environment-variable names for the X (OAuth 1.0a) credentials.
+    #[serde(default)]
+    pub x_env: Option<XCredentialEnv>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_cadence")]
@@ -375,6 +408,25 @@ pub struct Channel {
     /// Fixed execution windows (24h clock) chosen for predictability.
     #[serde(default)]
     pub windows: Vec<String>,
+}
+
+/// Legacy app-password variable, used when a pack does not declare one.
+pub const DEFAULT_BLUESKY_APP_PASSWORD_ENV: &str = "BLUESKY_APP_PASSWORD";
+
+impl Channel {
+    /// The environment variable that holds this channel's app password.
+    pub fn app_password_env_name(&self) -> &str {
+        self.app_password_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(DEFAULT_BLUESKY_APP_PASSWORD_ENV)
+    }
+
+    /// The environment-variable names for the X credentials.
+    pub fn x_env_names(&self) -> XCredentialEnv {
+        self.x_env.clone().unwrap_or_else(XCredentialEnv::legacy)
+    }
 }
 
 fn default_cadence() -> u8 {
@@ -466,6 +518,20 @@ impl PersonaPack {
             .unwrap_or_default()
     }
 
+    /// The first channel for a platform, enabled or not.
+    pub fn channel(&self, platform: Platform) -> Option<&Channel> {
+        self.channels
+            .iter()
+            .find(|channel| channel.platform == platform)
+    }
+
+    /// The enabled channel for a platform.
+    pub fn enabled_channel(&self, platform: Platform) -> Option<&Channel> {
+        self.channels
+            .iter()
+            .find(|channel| channel.platform == platform && channel.enabled)
+    }
+
     /// Validate invariants the engine relies on before running any persona.
     pub fn validate(&self) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
@@ -549,13 +615,37 @@ impl PersonaPack {
                 }
             }
         }
-        if self.active {
-            for channel in &self.channels {
-                if channel.enabled && channel.handle.trim().is_empty() {
-                    issues.push(ValidationIssue {
-                        field: format!("channels[{}].handle", channel.platform.as_str()),
-                        problem: "an active pack requires a handle on every enabled channel".into(),
-                    });
+        for channel in &self.channels {
+            let platform = channel.platform.as_str();
+            if self.active && channel.enabled && channel.handle.trim().is_empty() {
+                issues.push(ValidationIssue {
+                    field: format!("channels[{platform}].handle"),
+                    problem: "an active pack requires a handle on every enabled channel".into(),
+                });
+            }
+            // Identity is data, secrets are named. A blank name is always a
+            // mistake, even on a draft: it would resolve to an empty env var.
+            if let Some(name) = &channel.app_password_env
+                && name.trim().is_empty()
+            {
+                issues.push(ValidationIssue {
+                    field: format!("channels[{platform}].app_password_env"),
+                    problem: "the environment-variable name must not be blank".into(),
+                });
+            }
+            if let Some(env) = &channel.x_env {
+                for (field, value) in [
+                    ("api_key", env.api_key.as_str()),
+                    ("api_secret", env.api_secret.as_str()),
+                    ("access_token", env.access_token.as_str()),
+                    ("access_token_secret", env.access_token_secret.as_str()),
+                ] {
+                    if value.trim().is_empty() {
+                        issues.push(ValidationIssue {
+                            field: format!("channels[{platform}].x_env.{field}"),
+                            problem: "the environment-variable name must not be blank".into(),
+                        });
+                    }
                 }
             }
         }
@@ -706,6 +796,8 @@ mod tests {
             channels: vec![Channel {
                 platform: Platform::Bluesky,
                 handle: "demo.bsky.social".into(),
+                app_password_env: None,
+                x_env: None,
                 enabled: true,
                 posts_per_day: 1,
                 windows: vec![],
@@ -1040,5 +1132,42 @@ mod tests {
             Some("2026-10-13")
         );
         assert!(pack.validate().is_empty(), "{:?}", pack.validate());
+    }
+
+    #[test]
+    fn credential_names_are_pack_data_not_globals() {
+        let yaml = "persona: demo\nniche: science\nvoice:\n  tone: curious\n  audience: adults\nblocklist:\n  - forbidden\nrubric:\n  min_score: 0.75\nchannels:\n  - platform: bluesky\n    handle: demo.bsky.social\n    app_password_env: BSKY_TECH_PASSWORD\n    enabled: true\n  - platform: x\n    handle: demo\n    enabled: true\n    x_env:\n      api_key: X_TECH_KEY\n      api_secret: X_TECH_SECRET\n      access_token: X_TECH_TOKEN\n      access_token_secret: X_TECH_TOKEN_SECRET\n";
+        let pack: PersonaPack = serde_yaml_ng::from_str(yaml).expect("parses");
+        let bluesky = pack.enabled_channel(Platform::Bluesky).expect("bluesky");
+        assert_eq!(bluesky.app_password_env_name(), "BSKY_TECH_PASSWORD");
+        let x = pack.enabled_channel(Platform::X).expect("x");
+        let names = x.x_env_names();
+        assert_eq!(names.api_key, "X_TECH_KEY");
+        assert_eq!(names.access_token_secret, "X_TECH_TOKEN_SECRET");
+        assert!(pack.validate().is_empty(), "{:?}", pack.validate());
+    }
+
+    #[test]
+    fn a_channel_without_credential_names_falls_back_to_the_legacy_globals() {
+        let pack = base_pack();
+        let channel = pack.enabled_channel(Platform::Bluesky).expect("bluesky");
+        assert_eq!(
+            channel.app_password_env_name(),
+            DEFAULT_BLUESKY_APP_PASSWORD_ENV
+        );
+        assert_eq!(channel.x_env_names(), XCredentialEnv::legacy());
+    }
+
+    #[test]
+    fn blank_credential_names_are_validation_issues() {
+        let mut pack = base_pack();
+        pack.channels[0].app_password_env = Some("  ".into());
+        let issues = pack.validate();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.field == "channels[bluesky].app_password_env"),
+            "{issues:?}"
+        );
     }
 }

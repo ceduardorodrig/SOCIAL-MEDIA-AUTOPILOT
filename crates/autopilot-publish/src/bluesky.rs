@@ -1,8 +1,10 @@
 //! Bluesky (AT Protocol) publisher.
 //!
-//! Credentials come from the environment (never from the repository):
-//! `BLUESKY_HANDLE` and `BLUESKY_APP_PASSWORD` (an app password, not the account
-//! password).
+//! Credentials come from the environment (never from the repository). The
+//! **handle is the persona channel's identity**; the app password is read from
+//! the environment variable the pack names (`app_password_env`, default
+//! `BLUESKY_APP_PASSWORD`). The legacy global `BLUESKY_HANDLE` is kept only for
+//! `publish auth` without a persona.
 //!
 //! Text-only posts and image posts share the same `app.bsky.feed.post` record:
 //! an image is first uploaded as a blob with `com.atproto.repo.uploadBlob` and
@@ -12,6 +14,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use autopilot_core::Channel;
 use serde::{Deserialize, Serialize};
 
 /// Hosted Bluesky entry point.
@@ -43,7 +46,26 @@ pub struct BlueskyCredentials {
 }
 
 impl BlueskyCredentials {
-    /// Read `BLUESKY_HANDLE` / `BLUESKY_APP_PASSWORD` from the environment.
+    /// Read the credentials for one persona channel.
+    ///
+    /// The **handle is the identity** declared in the pack; the app password is
+    /// read from the environment variable the pack names. A handle mismatch at
+    /// login is rejected by [`create_session_for_channel`].
+    pub fn from_channel(channel: &Channel) -> Result<Self> {
+        let handle = channel.handle.trim();
+        if handle.is_empty() {
+            bail!("channel [bluesky] has no handle — the handle is the account identity");
+        }
+        Ok(Self {
+            handle: handle.to_string(),
+            app_password: crate::env_var(channel.app_password_env_name())?,
+        })
+    }
+
+    /// Legacy global credentials (`BLUESKY_HANDLE` / `BLUESKY_APP_PASSWORD`).
+    ///
+    /// Kept for `publish auth` without a persona; the pipeline resolves
+    /// credentials per channel with [`Self::from_channel`].
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             handle: crate::env_var("BLUESKY_HANDLE")?,
@@ -239,6 +261,31 @@ pub async fn create_session(
     }
 
     serde_json::from_value(payload).context("unexpected bluesky session payload")
+}
+
+/// Authenticate for one persona channel, refusing a session for another account.
+pub async fn create_session_for_channel(
+    base_url: &str,
+    channel: &Channel,
+    timeout: Duration,
+) -> Result<Session> {
+    let credentials = BlueskyCredentials::from_channel(channel)?;
+    let session = create_session(base_url, &credentials, timeout).await?;
+    validate_session_handle(&session, channel)?;
+    Ok(session)
+}
+
+/// Reject a session whose account is not the one the pack declares.
+pub fn validate_session_handle(session: &Session, channel: &Channel) -> Result<()> {
+    if !session.handle.eq_ignore_ascii_case(channel.handle.trim()) {
+        bail!(
+            "the authenticated account is `{}`, but the persona channel declares `{}` — \
+             refusing to publish from the wrong account",
+            session.handle,
+            channel.handle
+        );
+    }
+    Ok(())
 }
 
 /// Upload an image blob, returning the reference to embed in a post record.
@@ -479,5 +526,56 @@ mod tests {
         assert_eq!(blob.mime_type, "image/png");
         assert_eq!(blob.size, 760898);
         assert!(blob.reference.link.starts_with("bafkrei"));
+    }
+
+    fn channel(handle: &str, app_password_env: Option<&str>) -> Channel {
+        Channel {
+            platform: autopilot_core::Platform::Bluesky,
+            handle: handle.into(),
+            app_password_env: app_password_env.map(str::to_string),
+            x_env: None,
+            enabled: true,
+            posts_per_day: 1,
+            windows: vec![],
+        }
+    }
+
+    #[test]
+    fn a_session_for_another_account_is_rejected() {
+        let session = Session {
+            did: "did:plc:our".into(),
+            handle: "other.bsky.social".into(),
+            access_jwt: "jwt".into(),
+        };
+        let error = validate_session_handle(&session, &channel("example.bsky.social", None))
+            .expect_err("mismatch must fail");
+        assert!(format!("{error:#}").contains("other.bsky.social"));
+    }
+
+    #[test]
+    fn a_session_for_the_same_account_is_accepted_case_insensitively() {
+        let session = Session {
+            did: "did:plc:our".into(),
+            handle: "Example.Bsky.Social".into(),
+            access_jwt: "jwt".into(),
+        };
+        assert!(validate_session_handle(&session, &channel("example.bsky.social", None)).is_ok());
+    }
+
+    #[test]
+    fn a_channel_without_a_handle_cannot_build_credentials() {
+        let error = BlueskyCredentials::from_channel(&channel("  ", None))
+            .expect_err("empty handle must fail");
+        assert!(format!("{error:#}").contains("handle"));
+    }
+
+    #[test]
+    fn from_channel_reads_the_variable_the_pack_names() {
+        let error = BlueskyCredentials::from_channel(&channel(
+            "example.bsky.social",
+            Some("AUTOPILOT_TEST_UNSET_BSKY_PASSWORD"),
+        ))
+        .expect_err("unset variable must fail");
+        assert!(format!("{error:#}").contains("AUTOPILOT_TEST_UNSET_BSKY_PASSWORD"));
     }
 }

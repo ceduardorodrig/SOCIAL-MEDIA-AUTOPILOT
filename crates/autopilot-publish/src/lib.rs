@@ -15,7 +15,8 @@ pub use bluesky::{
     BlobLink, BlobRef, BlueskyCredentials, DEFAULT_BLUESKY_BASE_URL, MAX_IMAGE_BYTES,
     MAX_IMAGES_PER_POST, PostImage, Session, build_image_embed, build_post_record,
     build_post_record_with_embed, build_post_record_with_images, create_post, create_record,
-    create_session, now_rfc3339_millis, post_url, upload_blob, validate_alt, validate_image,
+    create_session, create_session_for_channel, now_rfc3339_millis, post_url, upload_blob,
+    validate_alt, validate_image, validate_session_handle,
 };
 pub use card::{
     CARD_HEIGHT, CARD_MIME_TYPE, CARD_TEMPLATE_VERSION, CARD_TEMPLATES, CARD_WIDTH, CardIdentity,
@@ -33,7 +34,7 @@ pub use video::{
 };
 pub use x::{
     DEFAULT_X_API_BASE_URL, PublishedPost, X_ENV_VARS, XCredentials, authorization_header,
-    build_tweet_body, missing_env_vars, post_endpoint,
+    build_tweet_body, missing_env_vars, missing_env_vars_for, post_endpoint,
 };
 
 /// Read a required, non-empty environment variable.

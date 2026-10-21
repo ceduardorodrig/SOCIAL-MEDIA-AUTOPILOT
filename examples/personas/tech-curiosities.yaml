@@ -1,0 +1,72 @@
+# Example persona pack — copy it to your tenant and make it yours.
+# The pack declares names, never secrets: `app_password_env` is the variable the
+# deployment exports. It is a draft (`active: false`), so it never acts.
+
+persona: tech-curiosities
+display_name: "Tech Curiosities"
+niche: computing-technology
+language: en
+active: false
+
+voice:
+  tone: "a curious engineer talking to peers — specific, informal, never a press release"
+  audience: "developers, sysadmins and tech-curious people"
+  guidelines:
+    - "English. Write like a person on a forum, not a content marketer: contractions and short sentences."
+    - "Vary the shape: a bare fact, a short opinion, a two-line explanation, an honest question."
+    - "Do not end every post with a question."
+    - "Reference concrete things: a command, a version, a project, something you ran."
+    - "Hashtags are optional: 0 to 2, and only when they help discovery."
+  banned_phrases:
+    - "game-changer"
+    - "revolutionary"
+    - "let's dive in"
+    - "you won't believe"
+  max_hashtags: 2
+  emojis_allowed: true
+
+few_shot: []
+
+blocklist:
+  - "political extremism"
+  - "unverified security claims"
+  - "crypto/token shilling"
+  - "piracy how-to"
+
+rubric:
+  min_score: 0.75
+  criteria:
+    - name: hook
+      weight: 0.40
+      description: "Does the first line make a developer stop scrolling?"
+    - name: accuracy
+      weight: 0.35
+      description: "Is the claim verifiable and correctly attributed?"
+    - name: voice
+      weight: 0.25
+      description: "Sounds like a person, not a press release?"
+
+channels:
+  - platform: bluesky
+    handle: "example.bsky.social"
+    app_password_env: "BSKY_APP_PASSWORD"
+    enabled: true
+    posts_per_day: 1
+    windows: ["09:00"]
+  - platform: x
+    handle: ""
+    enabled: false
+    posts_per_day: 1
+    x_env:
+      api_key: "X_API_KEY"
+      api_secret: "X_API_SECRET"
+      access_token: "X_ACCESS_TOKEN"
+      access_token_secret: "X_ACCESS_TOKEN_SECRET"
+
+harvest:
+  queries:
+    - "linux kernel release news"
+    - "rust programming news"
+
+visual:
+  templates: [card-v1, card-v2]
