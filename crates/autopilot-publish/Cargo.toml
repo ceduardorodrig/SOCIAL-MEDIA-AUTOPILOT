@@ -10,7 +10,7 @@ autopilot-core = { path = "../autopilot-core" }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap.workspace = true
-getrandom = "0.2"
+getrandom = "0.4"
 hmac = "0.12"
 reqwest.workspace = true
 serde.workspace = true
