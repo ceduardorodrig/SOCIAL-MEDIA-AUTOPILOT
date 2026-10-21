@@ -11,7 +11,7 @@ jobs:
     name: Build & Test (Rust)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -31,7 +31,7 @@ jobs:
     name: Governance Audit (Rust Native)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: StenioSentinel — audit repository
         uses: ceduardorodrig/STENIO-SENTINEL/.github/actions/stenio-check@v1
