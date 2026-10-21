@@ -38,7 +38,8 @@ This repository is part of the **Mnemocine** homelab ecosystem and is governed b
 ## Architecture Rules
 
 - **One engine, many personas.** The harness is stateless; behaviour is configured by
-  **persona packs** (`personas/*.yaml`). Never hardcode persona-specific logic in the
+  **persona packs** (a tenant's `personas/*.yaml`; the repo ships `examples/personas/`).
+  Never hardcode persona-specific logic in the
   engine.
 - **LLM providers are data.** The chain (`opencode` → `gemini` → `ollama`) lives in
   `config/providers.yaml`. Swapping a model is a config edit, never a code change.

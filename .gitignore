@@ -7,3 +7,6 @@
 secrets/
 *.secret
 *.pem
+
+# The real persona packs live in a tenant (see docs/tenancy.md); the repo ships examples/.
+/personas/

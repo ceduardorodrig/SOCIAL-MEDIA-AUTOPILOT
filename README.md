@@ -1,8 +1,25 @@
-# SUMAENIMA-SOCIALMEDIA-AUTOPILOT
+# SUMAENIMA Social Media Autopilot
 
-> **Private repository.** Autonomous social-media engine: it detects trends, writes
-> content, publishes across channels and learns from performance — in a loop, with no
-> manual step. Phase 0 (harness foundation) is implemented here.
+[![ci](https://github.com/ceduardorodrig/sumaenima-socialmedia-autopilot/actions/workflows/ci.yml/badge.svg)](https://github.com/ceduardorodrig/sumaenima-socialmedia-autopilot/actions/workflows/ci.yml)
+[![Rust 2024](https://img.shields.io/badge/rust-edition%202024-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
+[![Governance](https://img.shields.io/badge/governance-StenioSentinel-brightgreen?style=flat-square)](https://github.com/ceduardorodrig/STENIO-SENTINEL)
+
+> **One harness, many personas.** Autonomous social-media engine: it detects trends, writes
+> content, publishes across channels and learns from performance — in a loop, with no manual
+> step. The repository is the **engine**; the persona packs, identities and state live in a
+> **tenant** (see [Deployment model](#deployment-model--engine-vs-tenant)).
+
+## 📑 Table of Contents
+
+- [What this is](#what-this-is)
+- [Deployment model — engine vs tenant](#deployment-model--engine-vs-tenant)
+- [LLM provider chain (fail-safe)](#llm-provider-chain-fail-safe)
+- [Layout](#layout)
+- [Usage](#usage)
+- [Status](#status)
+- [Governance](#governance)
+- [License](#license)
 
 ## What this is
 
@@ -12,8 +29,8 @@ adapting the master content per channel — the voice stays the same, the format
 
 ```
 PERSONA PACKS (YAML)              HARNESS ENGINE                 CHANNELS
-ciencia-curiosidades ──┐      [1] harvest trends                bluesky · x (phase 1)
-horoscopo-diario ──────┴──►   [2] triage   (LLM chain)          instagram · linkedin
+persona-a ─────────────┐      [1] harvest trends                bluesky · x (phase 1)
+persona-b ─────────────┴──►   [2] triage   (LLM chain)          instagram · linkedin
                               [3] create   (LLM chain)          tiktok (phase 2)
                               [3.5] guardrail (deterministic)   kwai (phase 3, experimental)
                               [4] publish  (per-channel adapter)
@@ -75,10 +92,14 @@ crates/
   autopilot-learn/      stage [6] — pure A/B scoring + persona memory proposal
   autopilot-run/        `autopilot run` — chains the stages for one persona
   autopilot-cli/        `autopilot` binary
+examples/personas/      template persona pack (draft, `example.bsky.social`)
+examples/config/        provider/engage/media templates
 config/providers.yaml   LLM chain (data, no secrets — env var names only)
-personas/*.yaml         persona packs
 var/                    local stores (gitignored): run journals, metrics JSONL, memory proposals
 ```
+
+> The real persona packs live in a **tenant** directory (see
+> [`docs/tenancy.md`](docs/tenancy.md)); this repository ships only `examples/`.
 
 ## Usage
 
@@ -89,8 +110,9 @@ cargo build --release
 autopilot personas list
 autopilot personas validate
 
-# `--persona` takes a slug or a path, in every subcommand (HB-031):
-#   --persona space-oddities   ==   --persona personas/space-oddities.yaml
+# `--persona` takes a slug or a path, in every subcommand (HB-031). A bare slug
+# resolves under `personas/` (the CLI default); a path is used verbatim. The
+# example pack lives in `examples/`, so pass its path (or copy it to `personas/`).
 #
 # A pack may declare its own harvest subjects, walked in rotation (HB-033) so
 # different personas harvest different sources. Without the block, the engine
@@ -101,12 +123,15 @@ autopilot personas validate
 #       - "space mission anomalies"
 #       - "strange telescope observations"
 
+# The example pack is a draft (`active: false`): `--dry-run` rehearses it, and a
+# live run skips it until you copy it to a tenant and set `active: true`.
+#
 # One full run for a persona: harvest → triage → create → guardrail → publish.
 # --dry-run describes every stage with no LLM call, no GPU work, no network and
 # no publish. A live run needs the publishing credentials in the environment and
 # respects the hl-infer batch windows; metrics/learning are scheduled separately.
-autopilot run --persona personas/ciencia-curiosidades.yaml --dry-run
-autopilot run --persona personas/ciencia-curiosidades.yaml --platform bluesky
+autopilot run --persona examples/personas/tech-curiosities.yaml --dry-run
+autopilot run --persona examples/personas/tech-curiosities.yaml --platform bluesky
 # Every run appends an auditable JSONL journal under var/runs/ (gitignored).
 
 # Provider availability (all three layers must answer)
@@ -130,30 +155,30 @@ autopilot quota check \
 
 # Deterministic pre-publish validation (no LLM)
 autopilot guardrail check \
-  --persona personas/ciencia-curiosidades.yaml \
+  --persona examples/personas/tech-curiosities.yaml \
   --platform bluesky \
   --text "Draft to validate #tag"
 
 # Stage [2] — triage: harvest and score topics (--dry-run prints the prompt only)
-autopilot triage run --persona personas/ciencia-curiosidades.yaml --query "descobertas científicas 2026" --limit 5
+autopilot triage run --persona examples/personas/tech-curiosities.yaml --query "descobertas científicas 2026" --limit 5
 
 # Stage [3] — creation: A/B variants for a platform, validated by the guardrail
 autopilot create run \
-  --persona personas/ciencia-curiosidades.yaml \
+  --persona examples/personas/tech-curiosities.yaml \
   --platform bluesky \
   --topic "O cérebro gasta ~20% da energia do corpo em repouso" \
   --guard
 
 # Stage [4] — publish to Bluesky (the guardrail runs first and may refuse)
 autopilot publish auth                                         # verify Bluesky credentials
-autopilot publish bluesky --persona personas/ciencia-curiosidades.yaml \
+autopilot publish bluesky --persona examples/personas/tech-curiosities.yaml \
   --text "Draft" --dry-run                                    # print the record only
 
 # Stage [4] — attach a generated post card to Bluesky posts. `off` (default) keeps
 # text-only posting; `prompted` attaches a card only when the variant carries an
 # image prompt; `always` attaches one to every post. The card is an SVG template
 # rasterised by rsvg-convert — no GPU and no image-generation model.
-autopilot run --persona personas/tech-curiosities.yaml --attach-card prompted
+autopilot run --persona examples/personas/tech-curiosities.yaml --attach-card prompted
 
 # Generate a card offline (no network, no model): prints the dimensions and the
 # alt text; `--dry-run` prints the filled SVG and writes nothing.
@@ -166,7 +191,8 @@ cargo run -p autopilot-publish --bin card -- render \
 # unit-tested against the published reference vectors; `--dry-run` prints the
 # request with no API call and needs no credentials.
 autopilot publish auth --platform x                            # check the X credentials (offline)
-autopilot publish x --persona personas/ciencia-curiosidades.yaml \
+# The pack must have an enabled X channel; `x_env` names the four variables.
+autopilot publish x --persona examples/personas/tech-curiosities.yaml \
   --text "Draft" --dry-run                                     # print the request only
 
 # Stage [5] — metrics: collect engagement for published posts into a JSONL store.
@@ -189,7 +215,7 @@ autopilot metrics collect \
 # the weekly per-format budget by at most one post a week, normalised against the
 # persona's own median. `autopilot run` consumes that proposal.
 autopilot learn run \
-  --persona personas/ciencia-curiosidades.yaml \
+  --persona examples/personas/tech-curiosities.yaml \
   --platform bluesky \
   --metrics var/metrics.jsonl \
   --min-samples 2 \
