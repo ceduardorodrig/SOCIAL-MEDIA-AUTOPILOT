@@ -286,7 +286,12 @@ mod tests {
         let first = entry(1, ActionKind::Follow, "did:plc:abc");
         append_entry(&path, &first).await.expect("append");
         let loaded = ActionLog::load(&path).await.expect("load");
-        assert_eq!(loaded.entries(), std::slice::from_ref(&first));
+        assert_eq!(
+            loaded.entries(),
+            std::slice::from_ref(&first),
+            "state file {}",
+            path.display()
+        );
 
         tokio::fs::remove_dir_all(&dir).await.expect("cleanup");
     }

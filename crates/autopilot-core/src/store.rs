@@ -30,7 +30,14 @@ pub async fn append_line<T: Serialize>(path: &Path, value: &T, label: &str) -> R
         .with_context(|| format!("opening {label} {}", path.display()))?;
     file.write_all(line.as_bytes())
         .await
-        .with_context(|| format!("writing {label} entry"))
+        .with_context(|| format!("writing {label} entry"))?;
+    // The state log is the source of truth for the daily/weekly caps: a line
+    // that is not durable before the next action could duplicate it after a
+    // crash. It also makes the write visible to a reader that runs right after
+    // the append (the CI flake on 2026-10-21/22 was a read-after-append miss).
+    file.sync_all()
+        .await
+        .with_context(|| format!("syncing {label} {}", path.display()))
 }
 
 /// Write a whole document, creating the parent directory when needed.
