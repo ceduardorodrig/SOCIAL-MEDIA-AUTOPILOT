@@ -2,7 +2,7 @@
 tags: [meta, agents, governance]
 ---
 
-# AGENTS.md — Rules for AI Agents (SUMAENIMA-SOCIALMEDIA-AUTOPILOT)
+# AGENTS.md — Rules for AI Agents (SOCIAL-MEDIA-AUTOPILOT)
 
 **Language tier:** A (English) — docs, logs and CLI strings in English; see
 `governance/language-policy.md` in the vault. The machine-readable half of this configuration lives in

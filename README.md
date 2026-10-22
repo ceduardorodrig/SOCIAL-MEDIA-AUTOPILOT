@@ -1,6 +1,6 @@
-# SUMAENIMA Social Media Autopilot
+# Social Media Autopilot
 
-[![ci](https://github.com/ceduardorodrig/SUMAENIMA-SOCIALMEDIA-AUTOPILOT/actions/workflows/ci.yml/badge.svg)](https://github.com/ceduardorodrig/SUMAENIMA-SOCIALMEDIA-AUTOPILOT/actions/workflows/ci.yml)
+[![ci](https://github.com/ceduardorodrig/SOCIAL-MEDIA-AUTOPILOT/actions/workflows/ci.yml/badge.svg)](https://github.com/ceduardorodrig/SOCIAL-MEDIA-AUTOPILOT/actions/workflows/ci.yml)
 [![Rust 2024](https://img.shields.io/badge/rust-edition%202024-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 [![Governance](https://img.shields.io/badge/governance-StenioSentinel-brightgreen?style=flat-square)](https://github.com/ceduardorodrig/STENIO-SENTINEL)
@@ -280,8 +280,8 @@ live credentials (HB-026) that let the X path run for real.
 
 ## Governance
 
-- Part of the **Mnemocine** homelab ecosystem; product naming follows the SUMÆNIMÁ (`sae-` / brand)
-  convention, municipality services follow `hl-`, hosts carry Tupi-Guarani names.
+- Born in the **Mnemocine** homelab; the engine is **tenant-neutral**, and the **Sumænimá**
+  deployment is its first tenant.
 - **No plaintext secrets** in this repo — SOPS store only.
 - Rust-first: no Python; errors are handled with `?`/`match`, never `unwrap()`/`expect()`.
 
