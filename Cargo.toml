@@ -19,7 +19,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
-repository = "https://github.com/ceduardorodrig/sumaenima-socialmedia-autopilot"
+repository = "https://github.com/ceduardorodrig/SUMAENIMA-SOCIALMEDIA-AUTOPILOT"
 authors = ["Carlos Eduardo Rodrigues <ceduardorodrig@gmail.com>"]
 
 [workspace.dependencies]

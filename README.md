@@ -1,6 +1,6 @@
 # SUMAENIMA Social Media Autopilot
 
-[![ci](https://github.com/ceduardorodrig/sumaenima-socialmedia-autopilot/actions/workflows/ci.yml/badge.svg)](https://github.com/ceduardorodrig/sumaenima-socialmedia-autopilot/actions/workflows/ci.yml)
+[![ci](https://github.com/ceduardorodrig/SUMAENIMA-SOCIALMEDIA-AUTOPILOT/actions/workflows/ci.yml/badge.svg)](https://github.com/ceduardorodrig/SUMAENIMA-SOCIALMEDIA-AUTOPILOT/actions/workflows/ci.yml)
 [![Rust 2024](https://img.shields.io/badge/rust-edition%202024-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 [![Governance](https://img.shields.io/badge/governance-StenioSentinel-brightgreen?style=flat-square)](https://github.com/ceduardorodrig/STENIO-SENTINEL)
