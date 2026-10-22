@@ -198,12 +198,23 @@ mod tests {
     }
 
     /// A unique temporary directory per test process and run.
+    ///
+    /// The nanosecond stamp alone is not enough: two tests can start in the
+    /// same clock tick on a fast runner, get the same directory and delete each
+    /// other's `state.jsonl` (the CI flake fixed on 2026-10-21). The atomic
+    /// sequence makes the directory unique even when the stamp collides.
     fn temp_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("autopilot-engage-{}-{stamp}", std::process::id()))
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "autopilot-engage-{}-{stamp}-{seq}",
+            std::process::id()
+        ))
     }
 
     #[test]

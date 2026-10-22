@@ -781,12 +781,15 @@ mod tests {
     use super::*;
 
     fn fixture_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or(0);
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "autopilot-engage-fixture-{}-{stamp}",
+            "autopilot-engage-fixture-{}-{stamp}-{seq}",
             std::process::id()
         ))
     }
