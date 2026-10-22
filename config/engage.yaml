@@ -1,23 +1,12 @@
-# Social Media Autopilot — engagement stage configuration
+# Example engagement configuration — copy it to your tenant.
 #
-# This stage behaves like a person, not a bot: it runs on its own schedule
-# (separate from publishing), acts sporadically over time and never bursts.
-# All values are data; there is no secret here (only the NAME of the kill-switch
-# environment variable).
-#
-# Hard caps chosen conservatively for a public "curiosities" account:
-#   - a handful of replies a day (answers to people who talked to us);
-#   - likes ONLY on the posts we reply to (never a timeline sweep);
-#   - at most one follow a day and three a week (a person grows slowly).
-# There is deliberately no mass follow/unfollow, no mass likes and no auto-DM.
+# The stage behaves like a person, not a bot: its own schedule, sporadic actions,
+# conservative caps and a kill switch. There is no secret here — only the NAME of
+# the kill-switch variable.
 
-# Truthy value ("1", "true", "yes", "on") stops the stage immediately.
 kill_switch_env: AUTOPILOT_ENGAGE_KILL_SWITCH
 
-# Separate execution windows (24h clock) — never the publishing windows.
-# LOCAL time (the server timezone, same clock as the systemd timer's
-# `OnCalendar=09,13,20:35`). Never UTC — the engine compares these windows on
-# the local clock (HB-058).
+# Separate execution windows (24h clock), on the LOCAL clock.
 windows: ["09:30", "13:30", "20:30"]
 window_minutes: 45
 
@@ -26,83 +15,38 @@ caps:
   likes_per_day: 6
   follows_per_day: 1
   follows_per_week: 3
-  # Total writes (reply + like + follow) in a single run.
   max_actions_per_run: 6
 
 pacing:
-  # A scheduled run sometimes does nothing at all (sporadic behaviour).
   run_skip_probability: 0.35
   delay_min_secs: 45
   delay_max_secs: 240
-  # Follows are spaced much further apart than replies: never a burst.
   follow_delay_min_secs: 600
   follow_delay_max_secs: 1800
 
 interests:
-  # Curated by the owner — never discovered autonomously (that would be exactly
-  # the mass-follow behaviour this stage forbids). Every handle below was
-  # resolved against the public API before being added: a wrong handle is a
-  # follow that silently fails and, worse, an invented specific in a reply.
-  #
-  # The list is FINITE on purpose. With `caps.follows_per_week` at 3 the account
-  # reaches the end of it in a few weeks and then stops following — growth is
-  # bounded by the list, not by time. That is the answer to "follows grow
-  # forever": they cannot, because the source is a curated set, not a discovery
-  # engine.
+  # A finite, curated list — never discovered autonomously. Replace it with the
+  # accounts your persona actually follows.
   accounts:
-    - "kde.org"              # KDE
-    - "gnome.org"            # GNOME
-    - "linux.org"            # Linux.org
-    - "linuxfoundation.org"  # The Linux Foundation
-    - "linuxmint.com"        # Linux Mint
-    - "omgubuntu.co.uk"      # omg! ubuntu
-    - "nixos.org"            # NixOS Foundation
-    - "thunderbird.net"      # Thunderbird
-    - "blender.org"          # Blender
-    - "godotengine.org"      # Godot Engine
-    - "mozilla.org"          # Mozilla
-    - "rust-lang.org"        # Rust
-    - "python.org"           # Python
-    - "golang.org"           # Go
-    - "opensource.org"       # Open Source Initiative
-    - "eff.org"              # EFF
-    - "anthropic.com"        # Anthropic
-    - "simonwillison.net"    # Simon Willison
-    - "swyx.io"              # swyx
-    - "arstechnica.com"      # Ars Technica
-    - "theregister.com"      # The Register
+    - "rust-lang.org"
+    - "python.org"
+    - "gnome.org"
+    - "kde.org"
+    - "opensource.org"
 
-# Proactive commenting — joining the conversation on the curated accounts above.
-# This is how the account earns followers: a substantive reply to a relevant,
-# famous account. It is also the easiest way to look like a bot, so every knob
-# below is deliberately conservative. A proactive reply is held to the quality
-# bar in `quality.rs`: it must add a fact, a correction, an experience or a real
-# question, and it must NEVER link out, name our account or pitch anything.
 proactive:
-  # Master switch. `false` disables the whole proactive source, keeping mentions,
-  # replies-to-us, contextual likes and sporadic follows untouched.
   enabled: true
-  # How many curated accounts to probe per run, and how many of their recent
-  # posts to read each. Keep these small: this is a conversation, not a sweep.
-  accounts_per_run: 5
-  posts_per_account: 5
-  # Skip posts older than this — a cold thread is worse than no reply.
+  accounts_per_run: 3
+  posts_per_account: 3
   max_post_age_hours: 36
-  # Candidates kept per account in a single gather (never a wall of posts).
   candidates_per_account_per_run: 1
-  # Proactive replies per day, on top of the global `caps.replies_per_day`.
   replies_per_day: 2
-  # Hard weekly ceiling per account: never become that account's reply-guy.
   replies_per_account_per_week: 1
-  # Minimum hours before replying to the same account again.
   min_gap_hours: 72
-  # Quality bar for a proactive reply (deterministic, see `quality.rs`).
   min_chars: 40
   min_words: 8
 
-# Notification reasons treated as "someone talked to us".
 notification_reasons: ["mention", "reply"]
 notification_limit: 50
-# How many of our own recent posts to scan for comments.
 own_posts_to_scan: 5
 thread_depth: 2

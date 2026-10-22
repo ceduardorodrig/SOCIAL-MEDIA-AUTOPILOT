@@ -1,12 +1,11 @@
-# Social Media Autopilot — LLM provider registry
+# Example LLM provider registry — copy it to your tenant.
 #
 # The fallback chain is resolved by `priority` (lower = earlier) among the
-# providers that answer their availability probe at run time.
-# Model ids are DATA, never code: the OpenCode catalogue changes often, so
-# swapping a model is a one-line edit here.
+# providers that answer their availability probe at run time. Model ids are
+# DATA: swapping a model is a one-line edit here.
 #
-# Secrets: API keys are referenced by ENV VAR NAME only. The key itself is
-# never stored in this file (homelab rule: no plaintext secrets in the repo).
+# Secrets: API keys are referenced by ENV VAR NAME only. The key itself is never
+# stored in this file (no plaintext secrets in the repository).
 
 providers:
   - id: opencode
@@ -14,7 +13,7 @@ providers:
     model: opencode/mimo-v2.6-flash-free
     priority: 100
     timeout_ms: 60000
-    role: "Primary — cloud, free tier, already paid via the OpenCode subscription"
+    role: "Primary — cloud, free tier"
 
   - id: gemini
     kind: gemini
@@ -23,12 +22,12 @@ providers:
     api_key_env: GEMINI_API_KEY
     priority: 200
     timeout_ms: 15000
-    role: "Fail-safe 1 — Gemini Developer API (note: the project must have free-tier access or credits; a depleted prepay balance answers 402)"
+    role: "Fail-safe 1 — Gemini Developer API free tier"
 
   - id: ollama
     kind: ollama
     model: gemma4:e2b
-    endpoint: http://psicopompo:11434
+    endpoint: http://127.0.0.1:11434
     priority: 300
     timeout_ms: 15000
-    role: "Fail-safe 2 — local GPU inference on psicopompo (idle windows only, VRAM released after each job)"
+    role: "Fail-safe 2 — local Ollama"
