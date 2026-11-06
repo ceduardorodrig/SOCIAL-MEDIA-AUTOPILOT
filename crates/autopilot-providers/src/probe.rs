@@ -73,12 +73,13 @@ async fn probe_opencode(cfg: &ProviderConfig) -> Result<String> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(format!("cli ok ({})", truncate(stdout.trim(), 80)))
     } else {
+        // Same failure logic as the pipeline path: the CLI puts the real reason
+        // in a stdout `{"type":"error"}` event and leaves stderr empty, so the
+        // probe must read it the same way (a quota cap is not a crash).
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "opencode exited with {}: {}",
-            output.status,
-            truncate(stderr.trim(), 160)
-        )
+        let failure = crate::complete::opencode_failure(cfg, &output.status, &stdout, &stderr);
+        bail!("{failure}")
     }
 }
 

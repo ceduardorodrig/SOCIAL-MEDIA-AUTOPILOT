@@ -383,7 +383,7 @@ fn json_status(value: &serde_json::Value) -> Option<u16> {
 ///
 /// stdout is consulted first because that is where the CLI puts the error
 /// event; stderr is usually empty, which is why the old message said nothing.
-fn opencode_failure(
+pub(crate) fn opencode_failure(
     cfg: &ProviderConfig,
     exit: &std::process::ExitStatus,
     stdout: &str,
