@@ -29,7 +29,7 @@ use autopilot_pipeline::{
     parse_editor_response, parse_grounding, parse_shortlist, parse_variants, review_or_keep,
     supported_labels,
 };
-use autopilot_providers::{JobKind, complete_with_chain, load_config};
+use autopilot_providers::{JobKind, complete_with_chain, complete_with_contract, load_config};
 use autopilot_publish::{
     CARD_HEIGHT, CARD_MIME_TYPE, CARD_WIDTH, CardIdentity, CardSpec, CardTemplate,
     DEFAULT_BLUESKY_BASE_URL, DEFAULT_RSVG_BINARY, DEFAULT_VIDEO_BASE_URL,
@@ -1165,27 +1165,20 @@ async fn stage_triage(
     }
 
     let prompt = build_triage_prompt(persona, topics);
-    let completion =
-        match complete_with_chain(registry, &prompt, JobKind::Triage, COMPLETION_TIMEOUT).await {
-            Ok(completion) => completion,
-            Err(err) => {
-                report.failed = true;
-                record(
-                    report,
-                    journal,
-                    StageOutcome::new(
-                        "triage",
-                        StageStatus::Error,
-                        format!("provider chain failed: {err:#}"),
-                    ),
-                )
-                .await?;
-                return Ok(None);
-            }
-        };
-
-    let shortlist = match parse_shortlist(&completion.text) {
-        Ok(shortlist) => shortlist,
+    // HB-126: the parse runs *inside* the chain, so an off-contract answer is
+    // re-asked once and then handed to the next provider instead of ending the run.
+    let (completion, shortlist) = match complete_with_contract(
+        registry,
+        &prompt,
+        JobKind::Triage,
+        COMPLETION_TIMEOUT,
+        |completion| {
+            parse_shortlist(&completion.text).context("the shortlist answer is off-contract")
+        },
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(err) => {
             report.failed = true;
             record(
@@ -1194,7 +1187,7 @@ async fn stage_triage(
                 StageOutcome::new(
                     "triage",
                     StageStatus::Error,
-                    format!("could not parse the shortlist: {err:#}"),
+                    format!("provider chain failed: {err:#}"),
                 ),
             )
             .await?;
@@ -1348,42 +1341,36 @@ async fn stage_create(
             input.avoid,
             &availability,
         );
-        match complete_with_chain(registry, &prompt, JobKind::Create, COMPLETION_TIMEOUT).await {
-            Ok(completion) => match parse_variants(&completion.text) {
-                Ok(variants) => {
-                    record(
-                        report,
-                        journal,
-                        StageOutcome::new(
-                            "create",
-                            StageStatus::Ok,
-                            format!(
-                                "{} variant(s) via {} ({})",
-                                variants.len(),
-                                completion.provider_id,
-                                completion.model
-                            ),
-                        )
-                        .with_platform(*platform),
-                    )
-                    .await?;
-                    drafts.push((*platform, variants));
-                }
-                Err(err) => {
-                    report.failed = true;
-                    record(
-                        report,
-                        journal,
-                        StageOutcome::new(
-                            "create",
-                            StageStatus::Error,
-                            format!("could not parse the variants: {err:#}"),
-                        )
-                        .with_platform(*platform),
-                    )
-                    .await?;
-                }
+        match complete_with_contract(
+            registry,
+            &prompt,
+            JobKind::Create,
+            COMPLETION_TIMEOUT,
+            |completion| {
+                parse_variants(&completion.text).context("the creation answer is off-contract")
             },
+        )
+        .await
+        {
+            Ok((completion, variants)) => {
+                record(
+                    report,
+                    journal,
+                    StageOutcome::new(
+                        "create",
+                        StageStatus::Ok,
+                        format!(
+                            "{} variant(s) via {} ({})",
+                            variants.len(),
+                            completion.provider_id,
+                            completion.model
+                        ),
+                    )
+                    .with_platform(*platform),
+                )
+                .await?;
+                drafts.push((*platform, variants));
+            }
             Err(err) => {
                 report.failed = true;
                 record(
@@ -1603,17 +1590,19 @@ async fn stage_grounding<'a>(
             .collect();
 
         let prompt = build_grounding_prompt(source, &variants);
-        let reviewed = match complete_with_chain(
+        // HB-126: a mis-shaped review is re-asked once and then handed to the next
+        // provider — fail-closed stays, but only after the chain is exhausted.
+        let reviewed = complete_with_contract(
             registry,
             &prompt,
             JobKind::Other,
             COMPLETION_TIMEOUT,
+            |completion| {
+                parse_grounding(&completion.text).context("the grounding answer is off-contract")
+            },
         )
         .await
-        {
-            Ok(completion) => parse_grounding(&completion.text),
-            Err(err) => Err(anyhow::anyhow!("{err:#}")),
-        };
+        .map(|(_completion, verdicts)| verdicts);
 
         let verdicts = match reviewed {
             Ok(verdicts) => verdicts,

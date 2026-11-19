@@ -12,7 +12,9 @@ pub mod probe;
 pub mod quota;
 
 pub use chain::resolve_chain;
-pub use complete::{Completion, complete, complete_with_chain, extract_opencode_text};
+pub use complete::{
+    Completion, complete, complete_with_chain, complete_with_contract, extract_opencode_text,
+};
 pub use config::{ProviderConfig, ProviderKind, ProvidersConfig, load_config};
 pub use gateway::{
     DEFAULT_GATEWAY_URL, GATEWAY_URL_ENV, GatewayClient, Job, JobKind, Lease,

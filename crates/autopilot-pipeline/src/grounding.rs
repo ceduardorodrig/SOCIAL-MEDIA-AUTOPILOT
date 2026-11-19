@@ -18,11 +18,11 @@
 //! costs one slot; a fabrication costs credibility. It is also *generic* — it
 //! judges the claim, not the wording, so no word list can go stale.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::create::Variant;
-use crate::json::extract_json;
+use crate::json::{self, extract_json};
 
 /// The harvested source a post must be grounded in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,13 +47,15 @@ pub struct GroundingVerdict {
 struct RawVerdict {
     label: String,
     supported: bool,
+    /// Absent on an approval, and `null` when the model has nothing to say.
     #[serde(default)]
-    reason: String,
+    reason: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct Wrapper {
-    verdicts: Vec<RawVerdict>,
+impl json::LabelSlot for RawVerdict {
+    fn label_slot(&mut self) -> &mut String {
+        &mut self.label
+    }
 }
 
 /// Build the prompt for the grounding reviewer.
@@ -99,14 +101,18 @@ pub fn build_grounding_prompt(source: Source<'_>, variants: &[Variant]) -> Strin
 }
 
 /// Parse the reviewer's answer into per-draft verdicts.
+///
+/// The shapes are resolved by [`json::list_members`]: a bare array, the
+/// `{"verdicts": […]}` envelope, an accidental one-element wrapper, or a map
+/// keyed by label — a review that answers `{"A": {…}, "B": {…}}` is a shape, not
+/// a failure. The error keeps the historical wording so the journal stays
+/// greppable, and now carries the shape that actually arrived.
 pub fn parse_grounding(raw: &str) -> Result<Vec<GroundingVerdict>> {
-    let json = extract_json(raw)?;
-    let raw_verdicts: Vec<RawVerdict> = match serde_json::from_str(json) {
-        Ok(verdicts) => verdicts,
-        Err(_) => serde_json::from_str::<Wrapper>(json)
-            .map(|wrapper| wrapper.verdicts)
-            .map_err(|_| anyhow::anyhow!("no grounding verdicts in the answer"))?,
-    };
+    let value = serde_json::from_str::<serde_json::Value>(extract_json(raw)?)
+        .context("the grounding answer is not JSON")?;
+    let members = json::list_members::<RawVerdict>(value, "verdicts")
+        .map_err(|err| anyhow::anyhow!("no grounding verdicts in the answer: {err:#}"))?;
+    let raw_verdicts = json::adopt_labels(members)?;
 
     if raw_verdicts.is_empty() {
         bail!("the reviewer returned no verdicts");
@@ -114,7 +120,7 @@ pub fn parse_grounding(raw: &str) -> Result<Vec<GroundingVerdict>> {
 
     let mut verdicts = Vec::new();
     for raw_verdict in raw_verdicts {
-        let reason = raw_verdict.reason.trim().to_string();
+        let reason = raw_verdict.reason.unwrap_or_default().trim().to_string();
         if !raw_verdict.supported && reason.is_empty() {
             bail!("a rejection must carry a reason");
         }

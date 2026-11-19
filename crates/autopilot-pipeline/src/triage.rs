@@ -5,7 +5,7 @@ use autopilot_core::PersonaPack;
 use autopilot_harvest::Topic;
 use serde::{Deserialize, Serialize};
 
-use crate::json::extract_json;
+use crate::json::{self, extract_json};
 
 /// A trend candidate scored against the persona.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -16,11 +16,6 @@ pub struct TopicScore {
     pub score: f32,
     #[serde(default)]
     pub reason: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Wrapper {
-    topics: Vec<TopicScore>,
 }
 
 /// Build the triage prompt for the persona and a batch of topics.
@@ -59,16 +54,19 @@ pub fn build_triage_prompt(persona: &PersonaPack, topics: &[Topic]) -> String {
 }
 
 /// Parse the model response into a shortlist sorted by score.
+///
+/// Shapes come from [`json::list_members`]. A topic carries no label of its own,
+/// so a map key is a position and is dropped rather than adopted: the shortlist
+/// is ordered by score below, never by the model's key order.
 pub fn parse_shortlist(raw: &str) -> Result<Vec<TopicScore>> {
-    let json = extract_json(raw)?;
-    let mut scores: Vec<TopicScore> = match serde_json::from_str(json) {
-        Ok(scores) => scores,
-        Err(_) => {
-            let wrapper: Wrapper = serde_json::from_str(json)
-                .context("invalid shortlist JSON (expected an array or {\"topics\": [...]})")?;
-            wrapper.topics
-        }
-    };
+    let value = serde_json::from_str::<serde_json::Value>(extract_json(raw)?)
+        .context("the shortlist answer is not JSON")?;
+    let members = json::list_members::<TopicScore>(value, "topics")
+        .context("invalid shortlist JSON (expected an array, an envelope, or a map of topics)")?;
+    let mut scores = members
+        .into_iter()
+        .map(|(_position, score)| score)
+        .collect::<Vec<_>>();
 
     for score in &scores {
         if !(0.0..=1.0).contains(&score.score) {

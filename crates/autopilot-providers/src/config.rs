@@ -44,6 +44,13 @@ pub struct ProviderConfig {
     /// Human-readable note about the provider role.
     #[serde(default)]
     pub role: String,
+    /// Path to the provider's own CLI when it is not the one on `PATH`.
+    ///
+    /// Only the `opencode` transport spawns a binary today. A host that installs
+    /// it outside `PATH`, or a test that must not reach the network, names it here
+    /// instead of mutating the environment of every other thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
 }
 
 /// Kind of backend probed for availability.

@@ -6,7 +6,7 @@ use autopilot_media::VideoPlan;
 use serde::{Deserialize, Serialize};
 
 use crate::grounding::Source;
-use crate::json::extract_json;
+use crate::json::{self, extract_json};
 use crate::prompt::{platform_limit, render_banned_phrases, render_guidelines};
 
 /// The information a post's card carries.
@@ -50,9 +50,10 @@ pub struct Variant {
     pub video_plan: Option<VideoPlan>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Wrapper {
-    variants: Vec<Variant>,
+impl json::LabelSlot for Variant {
+    fn label_slot(&mut self) -> &mut String {
+        &mut self.label
+    }
 }
 
 /// The availability a pack declares on its own, before any weekly accounting.
@@ -250,16 +251,18 @@ fn render_format_policy(availability: FormatAvailability) -> String {
 }
 
 /// Parse the model response into variants.
+///
+/// The accepted shapes live in [`json::list_members`] — an array, the
+/// `{"variants": […]}` envelope, an accidental one-element wrapper, or the A/B
+/// map keyed by label. Trying two *positions* instead is what cost the
+/// 2026-11-19 18:15 window (HB-126).
 pub fn parse_variants(raw: &str) -> Result<Vec<Variant>> {
-    let json = extract_json(raw)?;
-    let mut variants: Vec<Variant> = match serde_json::from_str(json) {
-        Ok(variants) => variants,
-        Err(_) => {
-            let wrapper: Wrapper = serde_json::from_str(json)
-                .context("invalid variants JSON (expected an array or {\"variants\": [...]})")?;
-            wrapper.variants
-        }
-    };
+    let value = serde_json::from_str::<serde_json::Value>(extract_json(raw)?)
+        .context("the creation answer is not JSON")?;
+    let members = json::list_members::<Variant>(value, "variants").context(
+        "invalid variants JSON (expected an array, an envelope, or a map keyed by label)",
+    )?;
+    let mut variants = json::adopt_labels(members)?;
 
     if variants.is_empty() {
         anyhow::bail!("the model returned no variants");

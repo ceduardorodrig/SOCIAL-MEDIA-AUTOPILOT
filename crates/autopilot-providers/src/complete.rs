@@ -34,8 +34,29 @@ const SERVER_ERROR_BACKOFF: Duration = Duration::from_millis(250);
 /// Total attempts for a 5xx-classified failure (the first call plus one retry).
 const SERVER_ERROR_MAX_ATTEMPTS: u32 = 2;
 
+/// Total attempts for an **off-contract** answer (the first answer plus one
+/// re-ask of the same provider). See [`complete_with_contract`].
+const CONTRACT_MAX_ATTEMPTS: u32 = 2;
+
 /// Error-event text is operator detail, never a payload: keep it readable.
 const ERROR_MESSAGE_LIMIT: usize = 300;
+
+/// How much of an off-contract answer the aggregate failure keeps.
+///
+/// The raw answer is persisted nowhere else, so a contract breach that names only
+/// the validator's complaint leaves the operator with nothing to act on (HB-126,
+/// 2026-11-19: four occurrences of one breach read as four different bugs).
+const ANSWER_PREVIEW_LIMIT: usize = 200;
+
+/// The first [`ANSWER_PREVIEW_LIMIT`] characters of `text`, whitespace-collapsed.
+fn answer_preview(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= ANSWER_PREVIEW_LIMIT {
+        return collapsed;
+    }
+    let head: String = collapsed.chars().take(ANSWER_PREVIEW_LIMIT).collect();
+    format!("{head}…")
+}
 
 /// How a provider call failed, at the granularity the fallback chain needs.
 ///
@@ -248,20 +269,66 @@ pub async fn complete_with_chain(
     kind: JobKind,
     timeout: Duration,
 ) -> Result<Completion> {
+    let (completion, ()) =
+        complete_with_contract(registry, prompt, kind, timeout, |_| Ok(())).await?;
+    Ok(completion)
+}
+
+/// Complete through the chain and return only an answer the stage accepts.
+///
+/// THE REASON THIS EXISTS (HB-126, 2026-11-19): every stage called
+/// [`complete_with_chain`] and parsed the answer *afterwards*, so a provider that
+/// answered at the transport level and an **off-contract shape** ended the run —
+/// no retry, and the local fail-safe never saw it, because the chain had already
+/// returned `Ok`. That is how one malformed creation answer cost the whole 18:15
+/// publishing window.
+///
+/// A contract breach is now a first-class chain outcome: the same provider is
+/// re-asked once (the second attempt is cheap compared with losing the slot), and
+/// if it breaches again the chain advances to the next provider. `validate`
+/// returns the parsed value, so the stage never parses outside the chain, and its
+/// error — which carries a bounded preview of the answer — is what the aggregate
+/// failure names.
+pub async fn complete_with_contract<T>(
+    registry: &ProvidersConfig,
+    prompt: &str,
+    kind: JobKind,
+    timeout: Duration,
+    validate: impl Fn(&Completion) -> Result<T>,
+) -> Result<(Completion, T)> {
     let mut providers = registry.providers.clone();
     providers.sort_by_key(|provider| provider.priority);
 
     let mut failures: Vec<String> = Vec::new();
     for provider in providers {
         let mut attempt: u32 = 1;
+        let mut contract_attempt: u32 = 1;
         loop {
             match complete_detailed(&provider, prompt, kind, timeout).await {
                 Ok(text) => {
-                    return Ok(Completion {
-                        provider_id: provider.id,
-                        model: provider.model,
+                    let completion = Completion {
+                        provider_id: provider.id.clone(),
+                        model: provider.model.clone(),
                         text,
-                    });
+                    };
+                    match validate(&completion) {
+                        Ok(value) => return Ok((completion, value)),
+                        Err(err) => {
+                            if contract_attempt < CONTRACT_MAX_ATTEMPTS {
+                                contract_attempt += 1;
+                                attempt = 1;
+                                tokio::time::sleep(SERVER_ERROR_BACKOFF).await;
+                                continue;
+                            }
+                            failures.push(format!(
+                                "{} ({}): off-contract answer: {err:#} [contract: re-asked once, then advanced; answer: {}]",
+                                completion.provider_id,
+                                completion.model,
+                                answer_preview(&completion.text)
+                            ));
+                            break;
+                        }
+                    }
                 }
                 Err(failure) => {
                     if attempt < SERVER_ERROR_MAX_ATTEMPTS
@@ -430,7 +497,10 @@ async fn complete_opencode(
     cfg: &ProviderConfig,
     prompt: &str,
 ) -> std::result::Result<String, ProviderFailure> {
-    run_opencode("opencode", cfg, prompt).await
+    // Operators can pin the CLI per provider (`binary:` in `providers.yaml`);
+    // unset means "whatever `opencode` is on PATH".
+    let bin = cfg.binary.as_deref().unwrap_or("opencode");
+    run_opencode(bin, cfg, prompt).await
 }
 
 /// Spawn the CLI and turn its output into either text or a classified failure.
@@ -687,6 +757,7 @@ mod tests {
             api_key_env: None,
             timeout_ms: 1_000,
             role: String::new(),
+            binary: None,
         }
     }
 
@@ -948,6 +1019,117 @@ mod tests {
             .await
             .expect("the happy path is unchanged");
             assert_eq!(text, "hello world");
+        }
+
+        // ---- HB-126: an off-contract answer is a chain outcome, not the end ----
+
+        /// A stub that counts its own invocations in a file next to the script.
+        fn counting_stub(name: &str, text: &str) -> StubCli {
+            let line =
+                serde_json::json!({"type":"text","part":{"type":"text","text":text}}).to_string();
+            StubCli::new(
+                name,
+                &format!("echo hit >> \"$0.hits\"\nprintf '%s\\n' '{line}'\nexit 0"),
+            )
+        }
+
+        fn counter_path(stub: &StubCli) -> std::ffi::OsString {
+            let mut path = stub.path().into_os_string();
+            path.push(".hits");
+            path
+        }
+
+        fn hits(stub: &StubCli) -> usize {
+            std::fs::read_to_string(counter_path(stub))
+                .map(|body| body.lines().count())
+                .unwrap_or(0)
+        }
+
+        /// Exec the stub once so a fork-time `ETXTBSY` cannot masquerade as a
+        /// provider failure, then wipe the counter.
+        fn warm(stub: &StubCli) {
+            for _ in 0..20 {
+                match std::process::Command::new(stub.path()).output() {
+                    Ok(_) => break,
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            let _ = std::fs::remove_file(counter_path(stub));
+        }
+
+        fn pinned(stub: &StubCli, id: &str, priority: u32) -> ProviderConfig {
+            ProviderConfig {
+                priority,
+                binary: Some(stub.path().to_string_lossy().to_string()),
+                ..provider(ProviderKind::Opencode, id)
+            }
+        }
+
+        fn as_json(completion: &Completion) -> anyhow::Result<serde_json::Value> {
+            serde_json::from_str::<serde_json::Value>(&completion.text).map_err(anyhow::Error::from)
+        }
+
+        #[tokio::test]
+        async fn an_off_contract_answer_is_reasked_once_then_the_chain_advances() {
+            // The exact 2026-11-19 shape: the provider answers at the transport
+            // level, the stage contract refuses it. Nothing here may end the run
+            // while a provider that answers on-contract is still in the chain.
+            let prose = counting_stub("prose", "Sure! Here are your variants: A and B.");
+            let valid = counting_stub("valid", r#"{"label":"A","text":"t"}"#);
+            warm(&prose);
+            warm(&valid);
+            let registry = ProvidersConfig {
+                providers: vec![
+                    pinned(&prose, "opencode-prose", 10),
+                    pinned(&valid, "opencode-valid", 20),
+                ],
+            };
+
+            let (completion, value) = complete_with_contract(
+                &registry,
+                "hi",
+                JobKind::Create,
+                Duration::from_secs(5),
+                as_json,
+            )
+            .await
+            .expect("the chain advances to the provider that answers on-contract");
+
+            assert_eq!(completion.provider_id, "opencode-valid");
+            assert!(
+                value.is_object(),
+                "the parsed value comes from the contract"
+            );
+            assert_eq!(hits(&prose), 2, "the breach is re-asked exactly once");
+            assert_eq!(hits(&valid), 1, "the fallback is asked once");
+        }
+
+        #[tokio::test]
+        async fn an_off_contract_chain_names_the_shape_and_quotes_the_answer() {
+            let prose = counting_stub("prose-only", "Sure! A and B, no JSON here.");
+            warm(&prose);
+            let registry = ProvidersConfig {
+                providers: vec![pinned(&prose, "opencode-prose", 10)],
+            };
+
+            let err = complete_with_contract(
+                &registry,
+                "hi",
+                JobKind::Create,
+                Duration::from_secs(5),
+                as_json,
+            )
+            .await
+            .expect_err("no provider answered on-contract");
+
+            let detail = format!("{err:#}");
+            assert!(detail.contains("opencode-prose"), "{detail}");
+            assert!(detail.contains("off-contract answer"), "{detail}");
+            assert!(
+                detail.contains("Sure! A and B, no JSON here."),
+                "the answer must be quoted for the operator: {detail}"
+            );
+            assert!(detail.contains("re-asked once"), "{detail}");
         }
     }
 }

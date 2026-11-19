@@ -21,7 +21,7 @@ use autopilot_core::{PersonaPack, Platform};
 use serde::{Deserialize, Serialize};
 
 use crate::create::Variant;
-use crate::json::extract_json;
+use crate::json::{self, extract_json};
 use crate::prompt::{platform_limit, render_banned_phrases, render_guidelines};
 
 /// One per-variant review as returned by the editor.
@@ -47,9 +47,10 @@ impl EditedVariant {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct Wrapper {
-    edits: Vec<EditedVariant>,
+impl json::LabelSlot for EditedVariant {
+    fn label_slot(&mut self) -> &mut String {
+        &mut self.label
+    }
 }
 
 /// The review outcome for one original draft.
@@ -180,15 +181,11 @@ pub fn build_editor_prompt(
 /// more likely a truncated answer, and the caller then degrades to the original
 /// drafts instead of dropping every post.
 pub fn parse_editor_response(raw: &str) -> Result<Vec<EditedVariant>> {
-    let json = extract_json(raw)?;
-    let edits: Vec<EditedVariant> = match serde_json::from_str(json) {
-        Ok(edits) => edits,
-        Err(_) => {
-            let wrapper: Wrapper = serde_json::from_str(json)
-                .context("invalid editor JSON (expected an array or {\"edits\": [...]})")?;
-            wrapper.edits
-        }
-    };
+    let value = serde_json::from_str::<serde_json::Value>(extract_json(raw)?)
+        .context("the editor answer is not JSON")?;
+    let members = json::list_members::<EditedVariant>(value, "edits")
+        .context("invalid editor JSON (expected an array, an envelope, or a map keyed by label)")?;
+    let edits = json::adopt_labels(members)?;
 
     if edits.is_empty() {
         anyhow::bail!("the editor returned no edits");
