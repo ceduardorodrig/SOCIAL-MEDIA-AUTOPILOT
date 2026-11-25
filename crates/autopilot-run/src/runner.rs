@@ -420,6 +420,15 @@ pub fn detected_start_day(published: &[PublishedEntry]) -> Option<i64> {
         .min()
 }
 
+/// First publication day for a specific `persona` (multi-persona isolation).
+pub fn detected_start_day_for(published: &[PublishedEntry], persona: &str) -> Option<i64> {
+    published
+        .iter()
+        .filter(|entry| entry.persona == persona)
+        .map(|entry| utc_day(entry.published_at_unix))
+        .min()
+}
+
 /// Whether a format may be released this week: the warming ramp has opened it
 /// **and** its weekly budget is not spent.
 ///
@@ -783,7 +792,7 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         age_days = persona
             .publishing
             .warming
-            .resolve_start_day(detected_start_day(&published))
+            .resolve_start_day(detected_start_day_for(&published, &persona.persona))
             .map(|start| day - start);
 
         if !day_has_room(&persona, &channels, &published, day, age_days) {

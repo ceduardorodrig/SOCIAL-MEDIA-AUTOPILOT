@@ -607,16 +607,17 @@ const OPENING_WORDS: usize = 3;
 /// n-gram size used for the structure signature.
 const SIGNATURE_GRAM: usize = 3;
 
-/// Nouns that mark an English listicle headline.
-const LISTICLE_NOUNS: [&str; 8] = [
-    "things", "ways", "tips", "reasons", "facts", "lessons", "tricks", "steps",
+/// Nouns that mark a listicle headline (EN, PT-BR, ES).
+const LISTICLE_NOUNS: [&str; 17] = [
+    "things", "ways", "tips", "reasons", "facts", "lessons", "tricks", "steps", "coisas",
+    "formas", "dicas", "razoes", "razões", "licoes", "lições", "passos", "cosas",
 ];
 
-/// Templated openers that mark machine-written copy. These overlap with the
-/// persona packs' `banned_phrases` but are enforced here as a *score* penalty so
-/// the learning stage never promotes such a post as a few-shot model, even when
-/// the guardrail verdict is not available to the caller.
-const TEMPLATED_OPENERS: [&str; 14] = [
+/// Templated openers that mark machine-written copy (EN, PT-BR, ES). These overlap
+/// with the persona packs' `banned_phrases` but are enforced here as a *score*
+/// penalty so the learning stage never promotes such a post as a few-shot model,
+/// even when the guardrail verdict is not available to the caller.
+const TEMPLATED_OPENERS: [&str; 24] = [
     "did you know",
     "the trick is",
     "here's the kicker",
@@ -631,6 +632,16 @@ const TEMPLATED_OPENERS: [&str; 14] = [
     "hot take",
     "fun fact",
     "believe it or not",
+    "você sabia",
+    "voce sabia",
+    "o segredo",
+    "vamos mergulhar",
+    "opinião impopular",
+    "opiniao impopular",
+    "fato curioso",
+    "acredite se quiser",
+    "sabías que",
+    "opinión impopular",
 ];
 
 /// Lowercased alphanumeric word tokens (accents preserved).

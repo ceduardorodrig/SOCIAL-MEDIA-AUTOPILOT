@@ -104,8 +104,14 @@ impl ActionLog {
     /// Whether an action of `kind` was already taken on `target` (for `Reply`,
     /// a previously `Rejected` attempt also counts as handled so we don't loop).
     pub fn has(&self, kind: ActionKind, target: &str) -> bool {
+        self.has_for("", kind, target)
+    }
+
+    /// Persona-scoped version of [`Self::has`] (empty `persona` matches all).
+    pub fn has_for(&self, persona: &str, kind: ActionKind, target: &str) -> bool {
         self.entries.iter().any(|entry| {
-            entry.target == target
+            (persona.is_empty() || entry.persona == persona)
+                && entry.target == target
                 && (entry.action == kind
                     || (kind == ActionKind::Reply && entry.action == ActionKind::Rejected))
         })
@@ -113,28 +119,58 @@ impl ActionLog {
 
     /// Number of `kind` actions recorded at or after `since_unix`.
     pub fn count_since(&self, kind: ActionKind, since_unix: u64) -> u32 {
+        self.count_since_for("", kind, since_unix)
+    }
+
+    /// Persona-scoped version of [`Self::count_since`] (empty `persona` matches all).
+    pub fn count_since_for(&self, persona: &str, kind: ActionKind, since_unix: u64) -> u32 {
         self.entries
             .iter()
-            .filter(|entry| entry.action == kind && entry.at_unix >= since_unix)
+            .filter(|entry| {
+                (persona.is_empty() || entry.persona == persona)
+                    && entry.action == kind
+                    && entry.at_unix >= since_unix
+            })
             .count() as u32
     }
 
     /// Number of `kind` actions recorded today (UTC).
     pub fn count_today(&self, kind: ActionKind, now_unix: u64) -> u32 {
-        self.count_since(kind, day_start_unix(now_unix))
+        self.count_today_for("", kind, now_unix)
+    }
+
+    /// Persona-scoped version of [`Self::count_today`].
+    pub fn count_today_for(&self, persona: &str, kind: ActionKind, now_unix: u64) -> u32 {
+        self.count_since_for(persona, kind, day_start_unix(now_unix))
     }
 
     /// Number of `kind` actions recorded this week (UTC, fixed 7-day bucket).
     pub fn count_this_week(&self, kind: ActionKind, now_unix: u64) -> u32 {
-        self.count_since(kind, week_start_unix(now_unix))
+        self.count_this_week_for("", kind, now_unix)
+    }
+
+    /// Persona-scoped version of [`Self::count_this_week`].
+    pub fn count_this_week_for(&self, persona: &str, kind: ActionKind, now_unix: u64) -> u32 {
+        self.count_since_for(persona, kind, week_start_unix(now_unix))
     }
 
     /// Number of replies recorded to `author_did` at or after `since_unix`.
     pub fn count_replies_to_author_since(&self, author_did: &str, since_unix: u64) -> u32 {
+        self.count_replies_to_author_since_for("", author_did, since_unix)
+    }
+
+    /// Persona-scoped version of [`Self::count_replies_to_author_since`].
+    pub fn count_replies_to_author_since_for(
+        &self,
+        persona: &str,
+        author_did: &str,
+        since_unix: u64,
+    ) -> u32 {
         self.entries
             .iter()
             .filter(|entry| {
-                entry.action == ActionKind::Reply
+                (persona.is_empty() || entry.persona == persona)
+                    && entry.action == ActionKind::Reply
                     && entry.author_did == author_did
                     && entry.at_unix >= since_unix
             })
@@ -143,19 +179,37 @@ impl ActionLog {
 
     /// When we last replied to `author_did`, if ever.
     pub fn last_reply_to_author(&self, author_did: &str) -> Option<u64> {
+        self.last_reply_to_author_for("", author_did)
+    }
+
+    /// Persona-scoped version of [`Self::last_reply_to_author`].
+    pub fn last_reply_to_author_for(&self, persona: &str, author_did: &str) -> Option<u64> {
         self.entries
             .iter()
-            .filter(|entry| entry.action == ActionKind::Reply && entry.author_did == author_did)
+            .filter(|entry| {
+                (persona.is_empty() || entry.persona == persona)
+                    && entry.action == ActionKind::Reply
+                    && entry.author_did == author_did
+            })
             .map(|entry| entry.at_unix)
             .max()
     }
 
     /// Number of actions of any kind recorded today whose `source` matches.
     pub fn count_source_today(&self, source: &str, now_unix: u64) -> u32 {
+        self.count_source_today_for("", source, now_unix)
+    }
+
+    /// Persona-scoped version of [`Self::count_source_today`].
+    pub fn count_source_today_for(&self, persona: &str, source: &str, now_unix: u64) -> u32 {
         let since = day_start_unix(now_unix);
         self.entries
             .iter()
-            .filter(|entry| entry.source == source && entry.at_unix >= since)
+            .filter(|entry| {
+                (persona.is_empty() || entry.persona == persona)
+                    && entry.source == source
+                    && entry.at_unix >= since
+            })
             .count() as u32
     }
 }

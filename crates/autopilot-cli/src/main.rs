@@ -531,6 +531,9 @@ enum EngageCommand {
 
 #[derive(Args)]
 struct StatusArgs {
+    /// Filter summary to a single persona slug (default: all personas).
+    #[arg(long)]
+    persona: Option<String>,
     /// Directory containing run journal JSONL files.
     #[arg(long, default_value = "var/runs")]
     runs_dir: PathBuf,
@@ -602,9 +605,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
+fn resolve_searxng_endpoint(arg: String) -> String {
+    if arg == DEFAULT_SEARXNG_ENDPOINT
+        && let Ok(env_url) = std::env::var("AUTOPILOT_SEARXNG_URL")
+        && !env_url.trim().is_empty()
+    {
+        return env_url;
+    }
+    arg
+}
+
 async fn run_status(args: StatusArgs) -> Result<ExitCode> {
     let now = now_unix();
     let cutoff = now.saturating_sub(args.days * 86_400);
+    let persona_filter = args.persona.as_deref();
 
     let mut run_files = 0usize;
     let mut published_card = 0usize;
@@ -634,6 +648,11 @@ async fn run_status(args: StatusArgs) -> Result<ExitCode> {
                 };
                 let at = ev.get("at_unix").and_then(|v| v.as_u64()).unwrap_or(0);
                 if at < cutoff {
+                    continue;
+                }
+                if let Some(target_persona) = persona_filter
+                    && ev.get("persona").and_then(|v| v.as_str()) != Some(target_persona)
+                {
                     continue;
                 }
                 file_in_window = true;
@@ -673,6 +692,11 @@ async fn run_status(args: StatusArgs) -> Result<ExitCode> {
         if entry.at_unix < cutoff {
             continue;
         }
+        if let Some(target_persona) = persona_filter
+            && entry.persona != target_persona
+        {
+            continue;
+        }
         match entry.action {
             autopilot_engage::ActionKind::Reply => eng_reply += 1,
             autopilot_engage::ActionKind::Like => eng_like += 1,
@@ -684,6 +708,11 @@ async fn run_status(args: StatusArgs) -> Result<ExitCode> {
     let metrics_rows = read_metrics(&args.metrics).await.unwrap_or_default();
     let mut dedup: HashMap<String, MetricsRecord> = HashMap::new();
     for rec in metrics_rows {
+        if let Some(target_persona) = persona_filter
+            && rec.persona != target_persona
+        {
+            continue;
+        }
         let replace = dedup
             .get(&rec.uri)
             .is_none_or(|prev| rec.captured_at_unix >= prev.captured_at_unix);
@@ -814,7 +843,10 @@ async fn run_personas(command: PersonasCommand) -> Result<ExitCode> {
         PersonasCommand::Validate { dir } => {
             let packs = load_dir(&dir).await?;
             let mut issues: Vec<(String, ValidationIssue)> = Vec::new();
+            let mut seen_slugs: HashMap<String, usize> = HashMap::new();
+            let mut seen_handles: HashMap<(&'static str, String), String> = HashMap::new();
             for p in &packs {
+                *seen_slugs.entry(p.persona.clone()).or_insert(0) += 1;
                 for issue in p.validate() {
                     issues.push((p.persona.clone(), issue));
                 }
@@ -827,6 +859,46 @@ async fn run_personas(command: PersonasCommand) -> Result<ExitCode> {
                         ValidationIssue {
                             field: "visual.templates".into(),
                             problem: err.to_string(),
+                        },
+                    ));
+                }
+                for ch in &p.channels {
+                    if !ch.enabled {
+                        continue;
+                    }
+                    if ch.platform != Platform::Bluesky && ch.platform != Platform::X {
+                        eprintln!(
+                            "warn {} :: channels[{}] — no live publisher adapter implemented yet",
+                            p.persona,
+                            ch.platform.as_str()
+                        );
+                    }
+                    let handle = ch.handle.trim().to_ascii_lowercase();
+                    if !handle.is_empty() {
+                        if let Some(prev) = seen_handles
+                            .insert((ch.platform.as_str(), handle.clone()), p.persona.clone())
+                            && prev != p.persona
+                        {
+                            issues.push((
+                                p.persona.clone(),
+                                ValidationIssue {
+                                    field: format!("channels[{}].handle", ch.platform.as_str()),
+                                    problem: format!(
+                                        "handle `{handle}` is already used by persona `{prev}`"
+                                    ),
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            for (slug, count) in seen_slugs {
+                if count > 1 {
+                    issues.push((
+                        slug.clone(),
+                        ValidationIssue {
+                            field: "persona".into(),
+                            problem: format!("duplicate persona slug `{slug}` ({count} packs)"),
                         },
                     ));
                 }
@@ -1004,7 +1076,7 @@ async fn run_autopilot(args: RunArgs) -> Result<ExitCode> {
         persona_path: args.persona,
         query: args.query,
         limit: args.limit,
-        endpoint: args.endpoint,
+        endpoint: resolve_searxng_endpoint(args.endpoint),
         platform: args.platform,
         config_path: args.config,
         journal_path: args.journal,

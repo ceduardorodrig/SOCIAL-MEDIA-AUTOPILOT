@@ -615,8 +615,31 @@ impl PersonaPack {
                 }
             }
         }
+        let mut seen_platforms: Vec<Platform> = Vec::new();
         for channel in &self.channels {
             let platform = channel.platform.as_str();
+            if seen_platforms.contains(&channel.platform) {
+                issues.push(ValidationIssue {
+                    field: format!("channels[{platform}]"),
+                    problem: format!("duplicate channel entry for `{platform}`"),
+                });
+            } else {
+                seen_platforms.push(channel.platform);
+            }
+            if channel.enabled && channel.posts_per_day == 0 {
+                issues.push(ValidationIssue {
+                    field: format!("channels[{platform}].posts_per_day"),
+                    problem: "an enabled channel must allow at least 1 post per day".into(),
+                });
+            }
+            for window in &channel.windows {
+                if parse_hhmm(window).is_none() {
+                    issues.push(ValidationIssue {
+                        field: format!("channels[{platform}].windows"),
+                        problem: format!("`{window}` is not a valid HH:MM (00:00..23:59) window"),
+                    });
+                }
+            }
             if self.active && channel.enabled && channel.handle.trim().is_empty() {
                 issues.push(ValidationIssue {
                     field: format!("channels[{platform}].handle"),
@@ -651,6 +674,20 @@ impl PersonaPack {
         }
 
         issues
+    }
+}
+
+fn parse_hhmm(raw: &str) -> Option<(u32, u32)> {
+    let (h, m) = raw.trim().split_once(':')?;
+    if h.len() != 2 || m.len() != 2 {
+        return None;
+    }
+    let hour: u32 = h.parse().ok()?;
+    let minute: u32 = m.parse().ok()?;
+    if hour < 24 && minute < 60 {
+        Some((hour, minute))
+    } else {
+        None
     }
 }
 

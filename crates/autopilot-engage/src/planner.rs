@@ -76,6 +76,11 @@ pub struct Plan {
 
 /// Choose the actions for one run under the caps, budget and jitter.
 pub fn plan(input: &PlanInput, rng: &mut Rng) -> Plan {
+    plan_for_persona("", input, rng)
+}
+
+/// Choose the actions for one run, scoped to `persona` in the shared [`ActionLog`].
+pub fn plan_for_persona(persona: &str, input: &PlanInput, rng: &mut Rng) -> Plan {
     if rng.fraction() < input.config.pacing.run_skip_probability {
         return Plan {
             actions: Vec::new(),
@@ -89,21 +94,27 @@ pub fn plan(input: &PlanInput, rng: &mut Rng) -> Plan {
 
     let reply_room = remaining(
         input.config.caps.replies_per_day,
-        input.state.count_today(ActionKind::Reply, input.now_unix),
+        input
+            .state
+            .count_today_for(persona, ActionKind::Reply, input.now_unix),
     );
     let like_room = remaining(
         input.config.caps.likes_per_day,
-        input.state.count_today(ActionKind::Like, input.now_unix),
+        input
+            .state
+            .count_today_for(persona, ActionKind::Like, input.now_unix),
     );
     let follow_day_room = remaining(
         input.config.caps.follows_per_day,
-        input.state.count_today(ActionKind::Follow, input.now_unix),
+        input
+            .state
+            .count_today_for(persona, ActionKind::Follow, input.now_unix),
     );
     let follow_week_room = remaining(
         input.config.caps.follows_per_week,
         input
             .state
-            .count_this_week(ActionKind::Follow, input.now_unix),
+            .count_this_week_for(persona, ActionKind::Follow, input.now_unix),
     );
 
     // Proactive replies have their own tight budget and per-account caps on top
@@ -111,7 +122,9 @@ pub fn plan(input: &PlanInput, rng: &mut Rng) -> Plan {
     let proactive = &input.config.proactive;
     let proactive_day_room = remaining(
         proactive.replies_per_day,
-        input.state.count_source_today("proactive", input.now_unix),
+        input
+            .state
+            .count_source_today_for(persona, "proactive", input.now_unix),
     );
     let mut proactive_replies = 0usize;
 
@@ -129,14 +142,17 @@ pub fn plan(input: &PlanInput, rng: &mut Rng) -> Plan {
         if replies >= reply_room || actions.len() >= budget {
             break;
         }
-        if input.state.has(ActionKind::Reply, &candidate.parent.uri) {
+        if input
+            .state
+            .has_for(persona, ActionKind::Reply, &candidate.parent.uri)
+        {
             continue;
         }
         if candidate.kind == CandidateKind::Proactive {
             if !proactive.enabled || proactive_replies >= proactive_day_room {
                 continue;
             }
-            if !proactive_account_has_room(input, candidate, &actions) {
+            if !proactive_account_has_room(persona, input, candidate, &actions) {
                 continue;
             }
             proactive_replies += 1;
@@ -147,7 +163,9 @@ pub fn plan(input: &PlanInput, rng: &mut Rng) -> Plan {
         // Contextual like: only ever the post we are answering.
         if likes < like_room
             && actions.len() < budget
-            && !input.state.has(ActionKind::Like, &candidate.parent.uri)
+            && !input
+                .state
+                .has_for(persona, ActionKind::Like, &candidate.parent.uri)
         {
             actions.push(Action::Like(candidate.parent.clone()));
             likes += 1;
@@ -162,7 +180,10 @@ pub fn plan(input: &PlanInput, rng: &mut Rng) -> Plan {
         if follows >= follow_day_room || follows >= follow_week_room {
             break;
         }
-        if input.state.has(ActionKind::Follow, &target.did) {
+        if input
+            .state
+            .has_for(persona, ActionKind::Follow, &target.did)
+        {
             continue;
         }
         if actions
@@ -201,18 +222,23 @@ fn remaining(cap: u32, used: u32) -> usize {
 /// the last reply to that account, and a single-reply-per-account rule inside
 /// the run being planned.
 fn proactive_account_has_room(
+    persona: &str,
     input: &PlanInput,
     candidate: &Candidate,
     planned: &[Action],
 ) -> bool {
     let proactive = &input.config.proactive;
-    let weekly = input
-        .state
-        .count_replies_to_author_since(&candidate.author_did, week_start_unix(input.now_unix));
+    let weekly = input.state.count_replies_to_author_since_for(
+        persona,
+        &candidate.author_did,
+        week_start_unix(input.now_unix),
+    );
     if weekly >= proactive.replies_per_account_per_week {
         return false;
     }
-    if let Some(last) = input.state.last_reply_to_author(&candidate.author_did)
+    if let Some(last) = input
+        .state
+        .last_reply_to_author_for(persona, &candidate.author_did)
         && input.now_unix < last.saturating_add(proactive.min_gap_secs())
     {
         return false;

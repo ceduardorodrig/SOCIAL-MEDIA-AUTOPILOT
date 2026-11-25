@@ -25,7 +25,7 @@ use crate::candidates::{
 };
 use crate::config::EngageConfig;
 use crate::jitter::{Rng, jitter_secs};
-use crate::planner::{Action, Plan, PlanInput, plan};
+use crate::planner::{Action, Plan, PlanInput, plan_for_persona};
 use crate::prompt::{build_reply_prompt, parse_reply, screen_reply};
 use crate::quality::screen_proactive_reply;
 use crate::records::StrongRef;
@@ -221,7 +221,8 @@ pub async fn run(options: EngageOptions) -> Result<EngageReport> {
         gather_live(&config, &session, &state, cache_dir, now, &mut report.notes).await?;
 
     let mut rng = Rng::from_clock();
-    let chosen = plan(
+    let chosen = plan_for_persona(
+        &persona.persona,
         &PlanInput {
             candidates: &candidates,
             follows: &follows,
@@ -318,7 +319,8 @@ async fn dry_run(
     };
 
     let mut rng = Rng::from_clock();
-    let chosen = plan(
+    let chosen = plan_for_persona(
+        &report.persona,
         &PlanInput {
             candidates: &candidates,
             follows: &follows,
@@ -740,9 +742,9 @@ impl Execution<'_> {
             self.record(
                 ActionKind::Rejected,
                 &candidate.parent.uri,
-                &detail,
                 &candidate.author_did,
                 candidate.kind.as_str(),
+                &detail,
             )
             .await?;
             return Ok(ExecutedAction::rejected(
@@ -763,9 +765,9 @@ impl Execution<'_> {
                     self.record(
                         ActionKind::Rejected,
                         &candidate.parent.uri,
-                        &detail,
                         &candidate.author_did,
                         candidate.kind.as_str(),
+                        &detail,
                     )
                     .await?;
                     return Ok(ExecutedAction::rejected(
