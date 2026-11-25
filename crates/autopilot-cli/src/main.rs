@@ -105,6 +105,8 @@ enum Command {
         #[command(subcommand)]
         command: EngageCommand,
     },
+    /// Unified status dashboard across runs, token usage, engagement and metrics.
+    Status(StatusArgs),
 }
 
 #[derive(Subcommand)]
@@ -528,6 +530,22 @@ enum EngageCommand {
 }
 
 #[derive(Args)]
+struct StatusArgs {
+    /// Directory containing run journal JSONL files.
+    #[arg(long, default_value = "var/runs")]
+    runs_dir: PathBuf,
+    /// Engagement state JSONL file.
+    #[arg(long, default_value = "var/engage/state.jsonl")]
+    state: PathBuf,
+    /// Metrics JSONL file.
+    #[arg(long, default_value = "var/metrics.jsonl")]
+    metrics: PathBuf,
+    /// Trailing window in days to summarize.
+    #[arg(long, default_value_t = 7)]
+    days: u64,
+}
+
+#[derive(Args)]
 struct EngageRunArgs {
     /// Persona slug (`space-oddities`) or pack path to engage as.
     #[arg(long, value_parser = parse_persona)]
@@ -580,7 +598,137 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Metrics { command } => run_metrics(command).await,
         Command::Learn { command } => run_learn(command).await,
         Command::Engage { command } => run_engage(command).await,
+        Command::Status(args) => run_status(args).await,
     }
+}
+
+async fn run_status(args: StatusArgs) -> Result<ExitCode> {
+    let now = now_unix();
+    let cutoff = now.saturating_sub(args.days * 86_400);
+
+    let mut run_files = 0usize;
+    let mut published_card = 0usize;
+    let mut published_text = 0usize;
+    let mut published_other = 0usize;
+    let mut grounding_rejected = 0usize;
+    let mut stage_errors = 0usize;
+    let mut in_tok = 0u64;
+    let mut out_tok = 0u64;
+    let mut reason_tok = 0u64;
+    let mut cache_read_tok = 0u64;
+    let mut cache_write_tok = 0u64;
+
+    if let Ok(mut dir) = tokio::fs::read_dir(&args.runs_dir).await {
+        while let Some(item) = dir.next_entry().await? {
+            let path = item.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(raw) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
+            let mut file_in_window = false;
+            for line in raw.lines() {
+                let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let at = ev.get("at_unix").and_then(|v| v.as_u64()).unwrap_or(0);
+                if at < cutoff {
+                    continue;
+                }
+                file_in_window = true;
+                let stage = ev.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+                let status = ev.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                if stage == "publish" && status == "published" {
+                    match ev.get("format").and_then(|v| v.as_str()) {
+                        Some("card") => published_card += 1,
+                        Some("text") => published_text += 1,
+                        _ => published_other += 1,
+                    }
+                } else if stage == "grounding" && status == "rejected" {
+                    grounding_rejected += 1;
+                } else if status == "error" {
+                    stage_errors += 1;
+                }
+                if let Some(u) = ev.get("usage") {
+                    in_tok += u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    out_tok += u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    reason_tok += u.get("reasoning_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    cache_read_tok += u.get("cache_read_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    cache_write_tok += u.get("cache_write_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                }
+            }
+            if file_in_window {
+                run_files += 1;
+            }
+        }
+    }
+
+    let state_log = autopilot_engage::ActionLog::load(&args.state).await?;
+    let mut eng_reply = 0usize;
+    let mut eng_like = 0usize;
+    let mut eng_follow = 0usize;
+    let mut eng_rejected = 0usize;
+    for entry in state_log.entries() {
+        if entry.at_unix < cutoff {
+            continue;
+        }
+        match entry.action {
+            autopilot_engage::ActionKind::Reply => eng_reply += 1,
+            autopilot_engage::ActionKind::Like => eng_like += 1,
+            autopilot_engage::ActionKind::Follow => eng_follow += 1,
+            autopilot_engage::ActionKind::Rejected => eng_rejected += 1,
+        }
+    }
+
+    let metrics_rows = read_metrics(&args.metrics).await.unwrap_or_default();
+    let mut dedup: HashMap<String, MetricsRecord> = HashMap::new();
+    for rec in metrics_rows {
+        let replace = dedup
+            .get(&rec.uri)
+            .is_none_or(|prev| rec.captured_at_unix >= prev.captured_at_unix);
+        if replace {
+            dedup.insert(rec.uri.clone(), rec);
+        }
+    }
+    let total_likes: u64 = dedup.values().map(|r| r.likes).sum();
+    let total_replies: u64 = dedup.values().map(|r| r.replies).sum();
+    let total_reposts: u64 = dedup.values().map(|r| r.reposts).sum();
+    let total_quotes: u64 = dedup.values().map(|r| r.quotes).sum();
+
+    println!("=== Autopilot Status (last {} day(s)) ===", args.days);
+    println!(
+        "Runs     : {} file(s) | published: {} (card={}, text={}, other={}) | grounding_rejected={} | errors={}",
+        run_files,
+        published_card + published_text + published_other,
+        published_card,
+        published_text,
+        published_other,
+        grounding_rejected,
+        stage_errors
+    );
+    println!(
+        "Tokens   : input={} output={} reasoning={} cache_read={} cache_write={} total={}",
+        in_tok,
+        out_tok,
+        reason_tok,
+        cache_read_tok,
+        cache_write_tok,
+        in_tok + out_tok + reason_tok + cache_read_tok + cache_write_tok
+    );
+    println!(
+        "Engage   : reply={} like={} follow={} rejected={}",
+        eng_reply, eng_like, eng_follow, eng_rejected
+    );
+    println!(
+        "Metrics  : {} unique post(s) | likes={} replies={} reposts={} quotes={}",
+        dedup.len(),
+        total_likes,
+        total_replies,
+        total_reposts,
+        total_quotes
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn probe_all(config: &Path) -> Result<Vec<ProbeOutcome>> {

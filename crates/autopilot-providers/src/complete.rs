@@ -17,12 +17,38 @@ use crate::config::{
 };
 use crate::gateway::{DEFAULT_GATEWAY_TIMEOUT, GatewayClient, JobKind, estimate_required_bytes};
 
+/// Per-call token usage reported by a provider, when available.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Total tokens accounted for in this call.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            + self.output_tokens
+            + self.reasoning_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+    }
+
+    fn is_zero(&self) -> bool {
+        self.total_tokens() == 0
+    }
+}
+
 /// A successful completion, tagged with the provider that produced it.
 #[derive(Debug, Clone)]
 pub struct Completion {
     pub provider_id: String,
     pub model: String,
     pub text: String,
+    pub usage: Option<TokenUsage>,
 }
 
 /// Short, bounded pause before re-calling a provider that answered 5xx.
@@ -228,6 +254,7 @@ pub async fn complete(
 ) -> Result<String> {
     complete_detailed(cfg, prompt, kind, timeout)
         .await
+        .map(|(text, _usage)| text)
         .map_err(anyhow::Error::new)
 }
 
@@ -237,7 +264,7 @@ async fn complete_detailed(
     prompt: &str,
     kind: JobKind,
     timeout: Duration,
-) -> std::result::Result<String, ProviderFailure> {
+) -> std::result::Result<(String, Option<TokenUsage>), ProviderFailure> {
     match tokio::time::timeout(timeout, complete_inner(cfg, prompt, kind)).await {
         Ok(result) => result,
         Err(_elapsed) => Err(ProviderFailure::timeout(cfg, timeout)),
@@ -248,7 +275,7 @@ async fn complete_inner(
     cfg: &ProviderConfig,
     prompt: &str,
     kind: JobKind,
-) -> std::result::Result<String, ProviderFailure> {
+) -> std::result::Result<(String, Option<TokenUsage>), ProviderFailure> {
     match cfg.kind {
         ProviderKind::Opencode => complete_opencode(cfg, prompt).await,
         ProviderKind::Gemini => complete_gemini(cfg, prompt).await,
@@ -305,11 +332,12 @@ pub async fn complete_with_contract<T>(
         let mut contract_attempt: u32 = 1;
         loop {
             match complete_detailed(&provider, prompt, kind, timeout).await {
-                Ok(text) => {
+                Ok((text, usage)) => {
                     let completion = Completion {
                         provider_id: provider.id.clone(),
                         model: provider.model.clone(),
                         text,
+                        usage,
                     };
                     match validate(&completion) {
                         Ok(value) => return Ok((completion, value)),
@@ -346,6 +374,49 @@ pub async fn complete_with_contract<T>(
     }
 
     bail!("every provider failed -> {}", failures.join(" | "))
+}
+
+/// Extract per-call token usage from `step_finish` events emitted by `opencode run --format json`.
+pub fn extract_opencode_usage(raw: &str) -> Option<TokenUsage> {
+    let mut usage = TokenUsage::default();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("step_finish") {
+            continue;
+        }
+        let Some(tokens) = event.get("part").and_then(|part| part.get("tokens")) else {
+            continue;
+        };
+        usage.input_tokens += tokens
+            .get("input")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        usage.output_tokens += tokens
+            .get("output")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        usage.reasoning_tokens += tokens
+            .get("reasoning")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if let Some(cache) = tokens.get("cache") {
+            usage.cache_read_tokens += cache
+                .get("read")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            usage.cache_write_tokens += cache
+                .get("write")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+        }
+    }
+    if usage.is_zero() { None } else { Some(usage) }
 }
 
 /// Extract the assistant text from the event stream emitted by `opencode run`.
@@ -496,7 +567,7 @@ pub(crate) fn opencode_failure(
 async fn complete_opencode(
     cfg: &ProviderConfig,
     prompt: &str,
-) -> std::result::Result<String, ProviderFailure> {
+) -> std::result::Result<(String, Option<TokenUsage>), ProviderFailure> {
     // Operators can pin the CLI per provider (`binary:` in `providers.yaml`);
     // unset means "whatever `opencode` is on PATH".
     let bin = cfg.binary.as_deref().unwrap_or("opencode");
@@ -511,7 +582,7 @@ async fn run_opencode(
     bin: &str,
     cfg: &ProviderConfig,
     prompt: &str,
-) -> std::result::Result<String, ProviderFailure> {
+) -> std::result::Result<(String, Option<TokenUsage>), ProviderFailure> {
     let output = Command::new(bin)
         .args(["run", "--format", "json", "-m", &cfg.model, prompt])
         .stdin(Stdio::null())
@@ -544,13 +615,14 @@ async fn run_opencode(
             "returned no text".to_string(),
         ));
     }
-    Ok(text)
+    let usage = extract_opencode_usage(&stdout);
+    Ok((text, usage))
 }
 
 async fn complete_gemini(
     cfg: &ProviderConfig,
     prompt: &str,
-) -> std::result::Result<String, ProviderFailure> {
+) -> std::result::Result<(String, Option<TokenUsage>), ProviderFailure> {
     let key_env = cfg.api_key_env.as_deref().unwrap_or("GEMINI_API_KEY");
     let key = std::env::var(key_env).map_err(|err| {
         ProviderFailure::new(
@@ -565,9 +637,12 @@ async fn complete_gemini(
         cfg.model
     );
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "contents": [{ "parts": [{ "text": prompt }] }]
     });
+    if let Some(max_tokens) = cfg.max_tokens {
+        body["generationConfig"] = serde_json::json!({ "maxOutputTokens": max_tokens });
+    }
 
     let response = reqwest::Client::new()
         .post(&url)
@@ -617,7 +692,29 @@ async fn complete_gemini(
             "returned no text".to_string(),
         ));
     }
-    Ok(text)
+    let usage = payload.get("usageMetadata").and_then(|meta| {
+        let u = TokenUsage {
+            input_tokens: meta
+                .get("promptTokenCount")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            output_tokens: meta
+                .get("candidatesTokenCount")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            reasoning_tokens: meta
+                .get("thoughtsTokenCount")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            cache_read_tokens: meta
+                .get("cachedContentTokenCount")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            cache_write_tokens: 0,
+        };
+        if u.is_zero() { None } else { Some(u) }
+    });
+    Ok((text, usage))
 }
 
 /// Local GPU completion, gated by a VRAM lease from the `hl-infer` gateway.
@@ -629,7 +726,7 @@ async fn complete_ollama(
     cfg: &ProviderConfig,
     prompt: &str,
     kind: JobKind,
-) -> std::result::Result<String, ProviderFailure> {
+) -> std::result::Result<(String, Option<TokenUsage>), ProviderFailure> {
     let gateway = GatewayClient::from_env(DEFAULT_GATEWAY_TIMEOUT);
     let required_bytes = estimate_required_bytes(&cfg.model);
     let label = format!("ollama:{}", cfg.model);
@@ -667,17 +764,20 @@ async fn complete_ollama(
 async fn generate_ollama(
     cfg: &ProviderConfig,
     prompt: &str,
-) -> std::result::Result<String, ProviderFailure> {
+) -> std::result::Result<(String, Option<TokenUsage>), ProviderFailure> {
     let endpoint = cfg.endpoint_or_default(DEFAULT_OLLAMA_ENDPOINT);
     let url = format!("{endpoint}/api/generate");
 
     // keep_alive=0 releases the GPU as soon as the job finishes (VRAM is scarce).
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": cfg.model,
         "prompt": prompt,
         "stream": false,
         "keep_alive": 0
     });
+    if let Some(max_tokens) = cfg.max_tokens {
+        body["options"] = serde_json::json!({ "num_predict": max_tokens });
+    }
 
     let response = reqwest::Client::new()
         .post(&url)
@@ -721,7 +821,24 @@ async fn generate_ollama(
             "returned no text".to_string(),
         ));
     }
-    Ok(text)
+    let input_tokens = payload
+        .get("prompt_eval_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = payload
+        .get("eval_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let usage = if input_tokens == 0 && output_tokens == 0 {
+        None
+    } else {
+        Some(TokenUsage {
+            input_tokens,
+            output_tokens,
+            ..TokenUsage::default()
+        })
+    };
+    Ok((text, usage))
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -758,6 +875,7 @@ mod tests {
             timeout_ms: 1_000,
             role: String::new(),
             binary: None,
+            max_tokens: None,
         }
     }
 
@@ -908,7 +1026,7 @@ mod tests {
                     Err(failure) if failure.message.contains("Text file busy") && attempt < 20 => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    other => return other,
+                    other => return other.map(|(text, _usage)| text),
                 }
             }
         }
@@ -1047,11 +1165,11 @@ mod tests {
 
         /// Exec the stub once so a fork-time `ETXTBSY` cannot masquerade as a
         /// provider failure, then wipe the counter.
-        fn warm(stub: &StubCli) {
+        async fn warm(stub: &StubCli) {
             for _ in 0..20 {
                 match std::process::Command::new(stub.path()).output() {
                     Ok(_) => break,
-                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
                 }
             }
             let _ = std::fs::remove_file(counter_path(stub));
@@ -1076,8 +1194,8 @@ mod tests {
             // while a provider that answers on-contract is still in the chain.
             let prose = counting_stub("prose", "Sure! Here are your variants: A and B.");
             let valid = counting_stub("valid", r#"{"label":"A","text":"t"}"#);
-            warm(&prose);
-            warm(&valid);
+            warm(&prose).await;
+            warm(&valid).await;
             let registry = ProvidersConfig {
                 providers: vec![
                     pinned(&prose, "opencode-prose", 10),
@@ -1107,7 +1225,7 @@ mod tests {
         #[tokio::test]
         async fn an_off_contract_chain_names_the_shape_and_quotes_the_answer() {
             let prose = counting_stub("prose-only", "Sure! A and B, no JSON here.");
-            warm(&prose);
+            warm(&prose).await;
             let registry = ProvidersConfig {
                 providers: vec![pinned(&prose, "opencode-prose", 10)],
             };
@@ -1130,6 +1248,22 @@ mod tests {
                 "the answer must be quoted for the operator: {detail}"
             );
             assert!(detail.contains("re-asked once"), "{detail}");
+        }
+
+        #[test]
+        fn extracts_usage_from_opencode_step_finish() {
+            let raw = concat!(
+                r#"{"type":"text","part":{"type":"text","text":"ok"}}"#,
+                "\n",
+                r#"{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":150,"input":100,"output":20,"reasoning":10,"cache":{"read":15,"write":5}}}}"#
+            );
+            let usage = extract_opencode_usage(raw).expect("step_finish usage should be parsed");
+            assert_eq!(usage.input_tokens, 100);
+            assert_eq!(usage.output_tokens, 20);
+            assert_eq!(usage.reasoning_tokens, 10);
+            assert_eq!(usage.cache_read_tokens, 15);
+            assert_eq!(usage.cache_write_tokens, 5);
+            assert_eq!(usage.total_tokens(), 150);
         }
     }
 }

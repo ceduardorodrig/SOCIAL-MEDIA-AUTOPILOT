@@ -10,13 +10,16 @@ use anyhow::{Context, Result};
 use autopilot_core::store::append_line;
 use serde::{Deserialize, Serialize};
 
-/// The three action types the stage may take.
+/// The action types the stage may record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ActionKind {
     Reply,
     Like,
     Follow,
+    /// A reply that was rejected by guardrail/grounding — recorded so the
+    /// planner does not re-pick and waste tokens on the same post next run.
+    Rejected,
 }
 
 impl ActionKind {
@@ -26,6 +29,7 @@ impl ActionKind {
             ActionKind::Reply => "reply",
             ActionKind::Like => "like",
             ActionKind::Follow => "follow",
+            ActionKind::Rejected => "rejected",
         }
     }
 }
@@ -97,11 +101,14 @@ impl ActionLog {
         &self.entries
     }
 
-    /// Whether an action of `kind` was already taken on `target`.
+    /// Whether an action of `kind` was already taken on `target` (for `Reply`,
+    /// a previously `Rejected` attempt also counts as handled so we don't loop).
     pub fn has(&self, kind: ActionKind, target: &str) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| entry.action == kind && entry.target == target)
+        self.entries.iter().any(|entry| {
+            entry.target == target
+                && (entry.action == kind
+                    || (kind == ActionKind::Reply && entry.action == ActionKind::Rejected))
+        })
     }
 
     /// Number of `kind` actions recorded at or after `since_unix`.

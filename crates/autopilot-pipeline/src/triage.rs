@@ -40,10 +40,10 @@ pub fn build_triage_prompt(persona: &PersonaPack, topics: &[Topic]) -> String {
          Forbidden topics (reject any candidate touching them): {blocklist}\n\n\
          Score each candidate for how well it fits this persona and how likely it is to\n\
          perform on social media right now. Use a score between 0.0 and 1.0.\n\n\
-         Candidates:\n{candidates}\n\
          Reply with ONLY a JSON array (no prose, no markdown) of objects with the keys\n\
          \"title\", \"url\", \"score\" and \"reason\". Sort by score descending and keep at\n\
-         most {max} entries.\n",
+         most {max} entries.\n\n\
+         Candidates:\n{candidates}",
         niche = persona.niche,
         audience = persona.voice.audience,
         tone = persona.voice.tone,

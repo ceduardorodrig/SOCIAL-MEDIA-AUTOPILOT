@@ -13,7 +13,8 @@ pub mod quota;
 
 pub use chain::resolve_chain;
 pub use complete::{
-    Completion, complete, complete_with_chain, complete_with_contract, extract_opencode_text,
+    Completion, TokenUsage, complete, complete_with_chain, complete_with_contract,
+    extract_opencode_text,
 };
 pub use config::{ProviderConfig, ProviderKind, ProvidersConfig, load_config};
 pub use gateway::{

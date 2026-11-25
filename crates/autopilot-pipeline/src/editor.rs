@@ -138,8 +138,6 @@ pub fn build_editor_prompt(
          Voice rules to preserve:\n{guidelines}\n\
          Never use these phrases: {banned}\n\
          Never touch these topics: {blocklist}\n\n\
-         Source topic: {topic}\n\n\
-         Drafts to review:\n{drafts}\n\n\
          Hunt every AI tell and rewrite it away:\n\
          - templated openings (\"Did you know...\", \"Here's the trick...\", \"Let's dive in\")\n\
          - uniform sentence length: vary the rhythm, mix short and long sentences\n\
@@ -158,7 +156,9 @@ pub fn build_editor_prompt(
          Reply with ONLY a JSON array (no prose, no markdown) of objects with the keys\n\
          \"label\" (matching the draft), \"text\" (the rewritten caption, empty when rejected),\n\
          \"changes\" (short array of what you changed) and \"rejected_reason\" (one line, empty\n\
-         when the draft was rewritten).\n",
+         when the draft was rewritten).\n\n\
+         Source topic: {topic}\n\n\
+         Drafts to review:\n{drafts}",
         display_name = persona.display_name,
         niche = persona.niche,
         language = persona.language,

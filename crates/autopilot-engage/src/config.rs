@@ -145,6 +145,10 @@ pub struct Pacing {
     pub follow_delay_min_secs: u64,
     #[serde(default = "default_follow_delay_max")]
     pub follow_delay_max_secs: u64,
+    /// Hard wall-clock budget for a single engage run (HB-127: stays below systemd
+    /// `TimeoutStartSec=30min`, leaving margin for `cargo build` and other packs).
+    #[serde(default = "default_max_runtime_secs")]
+    pub max_runtime_secs: u64,
 }
 
 fn default_skip_probability() -> f64 {
@@ -167,6 +171,10 @@ fn default_follow_delay_max() -> u64 {
     1800
 }
 
+fn default_max_runtime_secs() -> u64 {
+    1200
+}
+
 impl Default for Pacing {
     fn default() -> Self {
         Self {
@@ -175,6 +183,7 @@ impl Default for Pacing {
             delay_max_secs: default_delay_max(),
             follow_delay_min_secs: default_follow_delay_min(),
             follow_delay_max_secs: default_follow_delay_max(),
+            max_runtime_secs: default_max_runtime_secs(),
         }
     }
 }

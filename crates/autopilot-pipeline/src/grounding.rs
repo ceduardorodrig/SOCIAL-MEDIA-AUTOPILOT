@@ -82,8 +82,6 @@ pub fn build_grounding_prompt(source: Source<'_>, variants: &[Variant]) -> Strin
         "You are the fact-checking layer of an autonomous social-media engine. You are NOT\n\
          the writer and NOT a copy-editor: your only job is to decide, for each draft below,\n\
          whether every claim it makes is SUPPORTED by the source.\n\n\
-         The ONLY admissible source (url: {url}):\n\"{content}\"\n\n\
-         The drafts:\n{drafts}\n\n\
          A draft is NOT supported if it asserts anything the source does not contain: a\n\
          number, a date, a version, a name, a price, a quote, a comparison, or a causal\n\
          claim. General knowledge is NOT admissible evidence — if the source does not say\n\
@@ -93,7 +91,9 @@ pub fn build_grounding_prompt(source: Source<'_>, variants: &[Variant]) -> Strin
          published inside the image, so judge it exactly as strictly as the caption.\n\
          When in doubt, mark it NOT supported: silence costs\n\
          one slot, a fabrication costs credibility.\n\n\
-         Answer with JSON only: [{{\"label\": \"A\", \"supported\": true|false, \"reason\": \"<one line>\"}}]",
+         Answer with JSON only: [{{\"label\": \"A\", \"supported\": true|false, \"reason\": \"<one line>\"}}]\n\n\
+         The ONLY admissible source (url: {url}):\n\"{content}\"\n\n\
+         The drafts:\n{drafts}",
         url = source.url,
         content = source.content,
         drafts = drafts,
@@ -105,30 +105,83 @@ pub fn build_grounding_prompt(source: Source<'_>, variants: &[Variant]) -> Strin
 /// The shapes are resolved by [`json::list_members`]: a bare array, the
 /// `{"verdicts": […]}` envelope, an accidental one-element wrapper, or a map
 /// keyed by label — a review that answers `{"A": {…}, "B": {…}}` is a shape, not
-/// a failure. The error keeps the historical wording so the journal stays
-/// greppable, and now carries the shape that actually arrived.
+/// a failure. Individual item errors (malformed item or rejection without reason)
+/// fail-closed for that item alone instead of discarding valid siblings (HB-126).
 pub fn parse_grounding(raw: &str) -> Result<Vec<GroundingVerdict>> {
     let value = serde_json::from_str::<serde_json::Value>(extract_json(raw)?)
         .context("the grounding answer is not JSON")?;
-    let members = json::list_members::<RawVerdict>(value, "verdicts")
+    let members = json::list_members::<serde_json::Value>(value, "verdicts")
         .map_err(|err| anyhow::anyhow!("no grounding verdicts in the answer: {err:#}"))?;
-    let raw_verdicts = json::adopt_labels(members)?;
 
-    if raw_verdicts.is_empty() {
+    if members.is_empty() {
         bail!("the reviewer returned no verdicts");
     }
 
     let mut verdicts = Vec::new();
-    for raw_verdict in raw_verdicts {
-        let reason = raw_verdict.reason.unwrap_or_default().trim().to_string();
-        if !raw_verdict.supported && reason.is_empty() {
+    let mut valid_count = 0usize;
+    let mut saw_empty_rejection = false;
+    for (key, item_value) in members {
+        match serde_json::from_value::<RawVerdict>(item_value.clone()) {
+            Ok(raw_verdict) => {
+                let raw_label = raw_verdict.label.trim().to_string();
+                let label = match key {
+                    Some(k) if raw_label.is_empty() => k.trim().to_string(),
+                    Some(k) if !raw_label.eq_ignore_ascii_case(k.trim()) => {
+                        verdicts.push(GroundingVerdict {
+                            label: k.trim().to_string(),
+                            supported: false,
+                            reason: format!(
+                                "conflicting verdict label `{raw_label}` under key `{}`",
+                                k.trim()
+                            ),
+                        });
+                        continue;
+                    }
+                    _ => raw_label,
+                };
+                if label.is_empty() {
+                    continue;
+                }
+                let reason = raw_verdict.reason.unwrap_or_default().trim().to_string();
+                let reason = if !raw_verdict.supported && reason.is_empty() {
+                    saw_empty_rejection = true;
+                    "rejected by reviewer without explanation".to_string()
+                } else {
+                    valid_count += 1;
+                    reason
+                };
+                verdicts.push(GroundingVerdict {
+                    label,
+                    supported: raw_verdict.supported,
+                    reason,
+                });
+            }
+            Err(err) => {
+                let fallback_label = key
+                    .or_else(|| {
+                        item_value
+                            .get("label")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if !fallback_label.is_empty() {
+                    verdicts.push(GroundingVerdict {
+                        label: fallback_label,
+                        supported: false,
+                        reason: format!("malformed verdict item: {err}"),
+                    });
+                }
+            }
+        }
+    }
+
+    if valid_count == 0 {
+        if saw_empty_rejection {
             bail!("a rejection must carry a reason");
         }
-        verdicts.push(GroundingVerdict {
-            label: raw_verdict.label.trim().to_string(),
-            supported: raw_verdict.supported,
-            reason,
-        });
+        bail!("the reviewer returned no usable verdicts");
     }
     Ok(verdicts)
 }
@@ -230,5 +283,18 @@ mod tests {
     fn an_empty_or_chatty_answer_is_an_error() {
         assert!(parse_grounding("[]").is_err());
         assert!(parse_grounding("looks fine to me").is_err());
+    }
+
+    #[test]
+    fn isolates_bad_sibling_in_multi_variant_batch() {
+        let raw = r#"[
+            {"label":"A","supported":true,"reason":"ok"},
+            {"label":"B","supported":false}
+        ]"#;
+        let verdicts = parse_grounding(raw).expect("valid sibling A must survive");
+        assert_eq!(supported_labels(&verdicts), vec!["A"]);
+        assert_eq!(verdicts.len(), 2);
+        assert!(!verdicts[1].supported);
+        assert!(!verdicts[1].reason.is_empty());
     }
 }

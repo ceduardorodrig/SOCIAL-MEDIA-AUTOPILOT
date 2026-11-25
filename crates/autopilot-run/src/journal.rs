@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use autopilot_core::now_unix;
 use autopilot_core::store::append_line;
+use autopilot_providers::TokenUsage;
 use serde::{Deserialize, Serialize};
 
 use crate::runner::StageOutcome;
@@ -45,6 +46,13 @@ pub struct JournalEvent<'a> {
     /// can read the *claim* rather than parse a sentence (HB-046).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'a str>,
+    /// Source article URL for `source`/`publish` events so harvest can deduplicate
+    /// recently processed URLs across runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<&'a str>,
+    /// Per-stage token usage reported by the LLM provider, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<&'a TokenUsage>,
 }
 
 /// One published post as recorded in a run journal.
@@ -93,6 +101,8 @@ struct JournalLine {
     format: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
 }
 
 /// Every parsable journal line under `runs_dir`.
@@ -184,6 +194,29 @@ pub async fn read_grounding_rejections(runs_dir: &Path) -> Result<Vec<GroundingR
     Ok(rejections)
 }
 
+/// Source URLs recently fetched or published for `persona`, within `max_age_secs`.
+pub async fn read_recent_source_urls(
+    runs_dir: &Path,
+    persona: &str,
+    now_unix_secs: u64,
+    max_age_secs: u64,
+) -> Result<Vec<String>> {
+    let cutoff = now_unix_secs.saturating_sub(max_age_secs);
+    let mut urls = Vec::new();
+    for event in read_lines(runs_dir).await? {
+        if event.persona != persona || event.at_unix < cutoff {
+            continue;
+        }
+        if let Some(url) = event.source_url {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() && !urls.iter().any(|seen| seen == trimmed) {
+                urls.push(trimmed.to_string());
+            }
+        }
+    }
+    Ok(urls)
+}
+
 /// Append-only writer bound to one run.
 #[derive(Debug, Clone)]
 pub struct Journal {
@@ -226,6 +259,8 @@ impl Journal {
             uri: outcome.uri.as_deref(),
             format: outcome.format.as_deref(),
             reason: outcome.reason.as_deref(),
+            source_url: outcome.source_url.as_deref(),
+            usage: outcome.usage.as_ref(),
         };
         append_line(&self.path, &event, "journal").await
     }

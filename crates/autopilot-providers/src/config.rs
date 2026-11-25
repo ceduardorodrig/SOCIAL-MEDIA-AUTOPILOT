@@ -51,6 +51,9 @@ pub struct ProviderConfig {
     /// instead of mutating the environment of every other thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
+    /// Optional output token cap (`num_predict` for Ollama, `maxOutputTokens` for Gemini).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 /// Kind of backend probed for availability.

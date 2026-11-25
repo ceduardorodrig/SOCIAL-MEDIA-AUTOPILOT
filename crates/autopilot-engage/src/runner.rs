@@ -4,6 +4,7 @@
 //! runs on purpose, and space every action with jitter. A `--dry-run` performs
 //! no network call and no write: it prints exactly what the run would do.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use anyhow::{Context, Result};
 use autopilot_core::{PersonaPack, Platform, load_persona, local_minute_of_day, now_unix};
 use autopilot_providers::{JobKind, ProvidersConfig, complete_with_chain, load_config};
 use autopilot_publish::{DEFAULT_BLUESKY_BASE_URL, Session, create_session_for_channel};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::bluesky::{
     DEFAULT_BLUESKY_READ_URL, DEFAULT_ENGAGE_TIMEOUT, create_follow, create_like, create_reply,
@@ -137,6 +138,7 @@ fn rotated_window(accounts: &[String], size: usize, offset: usize) -> Vec<&Strin
 }
 
 pub async fn run(options: EngageOptions) -> Result<EngageReport> {
+    let run_started = tokio::time::Instant::now();
     let config = EngageConfig::load(&options.config_path).await?;
     config.validate()?;
     let persona = load_persona(&options.persona_path).await?;
@@ -211,8 +213,12 @@ pub async fn run(options: EngageOptions) -> Result<EngageReport> {
             }
         };
 
+    let cache_dir = options
+        .state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("var/engage"));
     let (candidates, follows) =
-        gather_live(&config, &session, &state, now, &mut report.notes).await?;
+        gather_live(&config, &session, &state, cache_dir, now, &mut report.notes).await?;
 
     let mut rng = Rng::from_clock();
     let chosen = plan(
@@ -235,6 +241,7 @@ pub async fn run(options: EngageOptions) -> Result<EngageReport> {
 
     let registry = load_config(&options.providers_path).await?;
     let our_tokens = our_account_tokens(&persona, &session);
+    let deadline = run_started + Duration::from_secs(config.pacing.max_runtime_secs);
     let mut execution = Execution {
         persona: &persona,
         session: &session,
@@ -243,8 +250,9 @@ pub async fn run(options: EngageOptions) -> Result<EngageReport> {
         state_path: &options.state_path,
         our_tokens: &our_tokens,
         rng: &mut rng,
+        deadline,
     };
-    report.executed = execution.perform_all(&chosen).await;
+    report.executed = execution.perform_all(&chosen, &mut report.notes).await;
     Ok(report)
 }
 
@@ -429,11 +437,42 @@ async fn gather_offline(
     Ok((candidates, follows))
 }
 
+/// 7-day TTL for cached Bluesky handle -> DID profile resolutions.
+const PROFILE_CACHE_TTL_SECS: u64 = 7 * 86_400;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedProfile {
+    did: String,
+    handle: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    followers_count: u64,
+    cached_at_unix: u64,
+}
+
+async fn load_profile_cache(path: &Path) -> HashMap<String, CachedProfile> {
+    let Ok(raw) = tokio::fs::read_to_string(path).await else {
+        return HashMap::new();
+    };
+    serde_json::from_str::<HashMap<String, CachedProfile>>(&raw).unwrap_or_default()
+}
+
+async fn save_profile_cache(path: &Path, cache: &HashMap<String, CachedProfile>) {
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    if let Ok(json) = serde_json::to_string_pretty(cache) {
+        let _ = tokio::fs::write(path, json).await;
+    }
+}
+
 /// Read candidates from the live AppView.
 async fn gather_live(
     config: &EngageConfig,
     session: &Session,
     state: &ActionLog,
+    cache_dir: &Path,
     now_unix: u64,
     notes: &mut Vec<String>,
 ) -> Result<(Vec<Candidate>, Vec<FollowTarget>)> {
@@ -488,12 +527,42 @@ async fn gather_live(
         follow_probe
     };
     let mut interests = Vec::new();
+    let cache_path = cache_dir.join("profiles_cache.json");
+    let mut profile_cache = load_profile_cache(&cache_path).await;
+    let mut cache_dirty = false;
     let rotation = now_unix as usize % config.interests.accounts.len().max(1);
     for handle in rotated_window(&config.interests.accounts, probe, rotation) {
+        if let Some(cached) = profile_cache.get(handle)
+            && now_unix.saturating_sub(cached.cached_at_unix) < PROFILE_CACHE_TTL_SECS
+        {
+            interests.push(Profile {
+                did: cached.did.clone(),
+                handle: cached.handle.clone(),
+                description: cached.description.clone(),
+                followers_count: cached.followers_count,
+            });
+            continue;
+        }
         match get_profile(DEFAULT_BLUESKY_READ_URL, handle, DEFAULT_ENGAGE_TIMEOUT).await {
-            Ok(profile) => interests.push(profile),
+            Ok(profile) => {
+                profile_cache.insert(
+                    handle.clone(),
+                    CachedProfile {
+                        did: profile.did.clone(),
+                        handle: profile.handle.clone(),
+                        description: profile.description.clone(),
+                        followers_count: profile.followers_count,
+                        cached_at_unix: now_unix,
+                    },
+                );
+                cache_dirty = true;
+                interests.push(profile);
+            }
             Err(err) => notes.push(format!("could not resolve interest `{handle}`: {err:#}")),
         }
+    }
+    if cache_dirty {
+        save_profile_cache(&cache_path, &profile_cache).await;
     }
     let follows = follow_candidates(&interactions, &interests, &session.did);
 
@@ -541,16 +610,60 @@ struct Execution<'a> {
     /// Our handles/DID/name: a proactive reply must never name any of them.
     our_tokens: &'a [String],
     rng: &'a mut Rng,
+    deadline: tokio::time::Instant,
 }
 
 impl Execution<'_> {
-    /// Perform every planned action, jittered and state-recorded.
-    async fn perform_all(&mut self, chosen: &Plan) -> Vec<ExecutedAction> {
+    /// Perform every planned action, jittered and state-recorded, stopping cleanly
+    /// before the runtime budget expires (HB-127).
+    async fn perform_all(
+        &mut self,
+        chosen: &Plan,
+        notes: &mut Vec<String>,
+    ) -> Vec<ExecutedAction> {
         let mut executed = Vec::new();
         for (index, action) in chosen.actions.iter().enumerate() {
+            let action_margin = match action {
+                Action::Reply(_) => Duration::from_secs(180),
+                Action::Like(_) | Action::Follow(_) => Duration::from_secs(60),
+            };
             if index > 0 {
                 let delay = delay_for(self.config, action, self.rng);
+                let remaining = self
+                    .deadline
+                    .saturating_duration_since(tokio::time::Instant::now());
+                if Duration::from_secs(delay).saturating_add(action_margin) > remaining {
+                    let msg = format!(
+                        "deferred {} remaining action(s) starting at {}: delay {delay}s + margin {}s exceeds remaining budget {}s",
+                        chosen.actions.len() - index,
+                        action.kind().as_str(),
+                        action_margin.as_secs(),
+                        remaining.as_secs()
+                    );
+                    eprintln!("engage: {msg}");
+                    notes.push(msg);
+                    break;
+                }
+                eprintln!(
+                    "engage: waiting {delay}s before next {} action",
+                    action.kind().as_str()
+                );
                 tokio::time::sleep(Duration::from_secs(delay)).await;
+            } else {
+                let remaining = self
+                    .deadline
+                    .saturating_duration_since(tokio::time::Instant::now());
+                if action_margin > remaining {
+                    let msg = format!(
+                        "deferred {} action(s): remaining budget {}s below minimum margin {}s",
+                        chosen.actions.len(),
+                        remaining.as_secs(),
+                        action_margin.as_secs()
+                    );
+                    eprintln!("engage: {msg}");
+                    notes.push(msg);
+                    break;
+                }
             }
             match self.perform(action).await {
                 Ok(outcome) => executed.push(outcome),
@@ -623,10 +736,19 @@ impl Execution<'_> {
                 .map(|issue| format!("{}: {}", issue.rule, issue.detail))
                 .collect::<Vec<_>>()
                 .join("; ");
+            let detail = format!("guardrail refused the reply — {issues}");
+            self.record(
+                ActionKind::Rejected,
+                &candidate.parent.uri,
+                &detail,
+                &candidate.author_did,
+                candidate.kind.as_str(),
+            )
+            .await?;
             return Ok(ExecutedAction::rejected(
                 "reply",
                 &candidate.parent.uri,
-                format!("guardrail refused the reply — {issues}"),
+                detail,
             ));
         }
 
@@ -637,10 +759,19 @@ impl Execution<'_> {
             match self.review_grounding(candidate, &text).await {
                 Ok(outcome) if outcome.approved => {}
                 Ok(outcome) => {
+                    let detail = format!("grounding review refused the reply — {}", outcome.reason);
+                    self.record(
+                        ActionKind::Rejected,
+                        &candidate.parent.uri,
+                        &detail,
+                        &candidate.author_did,
+                        candidate.kind.as_str(),
+                    )
+                    .await?;
                     return Ok(ExecutedAction::rejected(
                         "reply",
                         &candidate.parent.uri,
-                        format!("grounding review refused the reply — {}", outcome.reason),
+                        detail,
                     ));
                 }
                 Err(err) => {

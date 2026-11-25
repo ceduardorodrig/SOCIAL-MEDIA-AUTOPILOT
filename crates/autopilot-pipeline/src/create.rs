@@ -186,9 +186,6 @@ pub fn build_creation_prompt_with_policy(
          Style rules:\n{guidelines}\n\
          Never use these phrases: {banned}\n\
          Never touch these topics: {blocklist}\n\n\
-         Topic to write about: {topic}\n\n\
-         {grounding}\n\
-         {avoid_block}\n\
          Produce exactly 2 alternative variants (A and B) that could be A/B tested.\n\
          Each caption must respect the platform limit of {limit} characters and use at most\n\
          {max_tags} hashtags. Also propose a short image prompt for each variant that should\n\
@@ -200,7 +197,10 @@ pub fn build_creation_prompt_with_policy(
          {policy_block}\
          {video_block}Reply with ONLY a JSON array (no prose, no markdown) of objects with the keys\n\
          \"label\" (\"A\" or \"B\"), \"text\", \"hashtags\" (array of strings), \"image_prompt\",\n\
-         and \"card\" (an object with \"title\" and \"body\").\n",
+         and \"card\" (an object with \"title\" and \"body\").\n\n\
+         Topic to write about: {topic}\n\n\
+         {grounding}\n\
+         {avoid_block}",
         language = persona.language,
         platform = platform.as_str(),
         display_name = persona.display_name,

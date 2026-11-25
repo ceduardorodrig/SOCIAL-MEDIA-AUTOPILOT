@@ -29,7 +29,9 @@ use autopilot_pipeline::{
     parse_editor_response, parse_grounding, parse_shortlist, parse_variants, review_or_keep,
     supported_labels,
 };
-use autopilot_providers::{JobKind, complete_with_chain, complete_with_contract, load_config};
+use autopilot_providers::{
+    JobKind, TokenUsage, complete_with_chain, complete_with_contract, load_config,
+};
 use autopilot_publish::{
     CARD_HEIGHT, CARD_MIME_TYPE, CARD_WIDTH, CardIdentity, CardSpec, CardTemplate,
     DEFAULT_BLUESKY_BASE_URL, DEFAULT_RSVG_BINARY, DEFAULT_VIDEO_BASE_URL,
@@ -39,7 +41,7 @@ use autopilot_publish::{
     resolve_pool, template_for_identity_in_pool, upload_blob, upload_video, validate_video,
 };
 
-use crate::journal::{Journal, PublishedEntry, read_published};
+use crate::journal::{Journal, PublishedEntry, read_published, read_recent_source_urls};
 
 /// How long to wait for one LLM completion.
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -183,6 +185,8 @@ pub struct StageOutcome {
     /// `text`, `card` or `video`. Recorded so the weekly per-format budget is
     /// counted back from the journal (HB-034).
     pub format: Option<String>,
+    pub source_url: Option<String>,
+    pub usage: Option<TokenUsage>,
 }
 
 impl StageOutcome {
@@ -197,6 +201,8 @@ impl StageOutcome {
             uri: None,
             reason: None,
             format: None,
+            source_url: None,
+            usage: None,
         }
     }
 
@@ -227,6 +233,16 @@ impl StageOutcome {
 
     fn with_format(mut self, format: Format) -> Self {
         self.format = Some(format.as_str().to_string());
+        self
+    }
+
+    fn with_source_url(mut self, url: impl Into<String>) -> Self {
+        self.source_url = Some(url.into());
+        self
+    }
+
+    fn with_usage(mut self, usage: Option<TokenUsage>) -> Self {
+        self.usage = usage;
         self
     }
 }
@@ -814,13 +830,41 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
         }
     };
 
-    let topics = stage_harvest(&mut report, &journal, &options, &query).await?;
+    let mut topics = stage_harvest(&mut report, &journal, &options, &query).await?;
 
     // A dry run never calls an LLM, the GPU, the network or a publisher: it only
     // describes the decisions the live run would take.
     if options.dry_run {
         stage_dry_run_plan(&mut report, &journal, &persona, &channels, options.card).await?;
         return Ok(report);
+    }
+
+    let runs_dir = report
+        .journal
+        .parent()
+        .unwrap_or_else(|| Path::new("var/runs"));
+    let recent_urls = read_recent_source_urls(runs_dir, &persona.persona, now_unix(), 7 * 86_400)
+        .await
+        .unwrap_or_default();
+    if !recent_urls.is_empty() && !topics.is_empty() {
+        let before = topics.len();
+        topics.retain(|topic| !recent_urls.iter().any(|seen| seen == topic.url.trim()));
+        let skipped_dups = before - topics.len();
+        if skipped_dups > 0 {
+            record(
+                &mut report,
+                &journal,
+                StageOutcome::new(
+                    "harvest",
+                    StageStatus::Ok,
+                    format!(
+                        "filtered {skipped_dups} recently processed URL(s); {} fresh topic(s) remain",
+                        topics.len()
+                    ),
+                ),
+            )
+            .await?;
+        }
     }
 
     let registry = load_config(&options.config_path).await?;
@@ -856,7 +900,8 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
                                 candidate.url,
                                 candidate.content.chars().count()
                             ),
-                        ),
+                        )
+                        .with_source_url(&candidate.url),
                     )
                     .await?;
                     article
@@ -1224,7 +1269,8 @@ async fn stage_triage(
                 "selected \"{}\" (score {:.2}) via {} ({})",
                 selected.title, selected.score, completion.provider_id, completion.model
             ),
-        ),
+        )
+        .with_usage(completion.usage.clone()),
     )
     .await?;
     Ok(Some(selected))
@@ -1366,7 +1412,8 @@ async fn stage_create(
                             completion.model
                         ),
                     )
-                    .with_platform(*platform),
+                    .with_platform(*platform)
+                    .with_usage(completion.usage.clone()),
                 )
                 .await?;
                 drafts.push((*platform, variants));
@@ -1408,7 +1455,7 @@ async fn stage_editor(
     let mut polished = Vec::new();
     for (platform, variants) in drafts {
         let prompt = build_editor_prompt(persona, *platform, topic, variants);
-        let (edits, via) = match complete_with_chain(
+        let (edits, via, editor_usage) = match complete_with_chain(
             registry,
             &prompt,
             JobKind::Other,
@@ -1420,6 +1467,7 @@ async fn stage_editor(
                 Ok(edits) => (
                     Some(edits),
                     format!(" via {} ({})", completion.provider_id, completion.model),
+                    completion.usage,
                 ),
                 Err(err) => {
                     record(
@@ -1430,10 +1478,11 @@ async fn stage_editor(
                             StageStatus::Skipped,
                             format!("skipped (unparseable response: {err:#})"),
                         )
-                        .with_platform(*platform),
+                        .with_platform(*platform)
+                        .with_usage(completion.usage),
                     )
                     .await?;
-                    (None, String::new())
+                    (None, String::new(), None)
                 }
             },
             Err(err) => {
@@ -1448,11 +1497,12 @@ async fn stage_editor(
                     .with_platform(*platform),
                 )
                 .await?;
-                (None, String::new())
+                (None, String::new(), None)
             }
         };
 
         let outcomes = review_or_keep(variants, edits.as_deref());
+        let mut usage_to_attach = editor_usage;
         for outcome in &outcomes {
             let outcome = match outcome {
                 EditorOutcome::Polished { changes, .. } => StageOutcome::new(
@@ -1481,7 +1531,8 @@ async fn stage_editor(
                     ),
                 )
                 .with_variant(outcome.label()),
-            };
+            }
+            .with_usage(usage_to_attach.take());
             record(report, journal, outcome.with_platform(*platform)).await?;
         }
 
@@ -1591,8 +1642,10 @@ async fn stage_grounding<'a>(
 
         let prompt = build_grounding_prompt(source, &variants);
         // HB-126: a mis-shaped review is re-asked once and then handed to the next
-        // provider — fail-closed stays, but only after the chain is exhausted.
-        let reviewed = complete_with_contract(
+        // provider — fail-closed stays, but if a multi-variant batch still fails we
+        // isolate by reviewing each variant individually so one bad draft cannot
+        // take down its sibling.
+        let batch_reviewed = complete_with_contract(
             registry,
             &prompt,
             JobKind::Other,
@@ -1601,11 +1654,74 @@ async fn stage_grounding<'a>(
                 parse_grounding(&completion.text).context("the grounding answer is off-contract")
             },
         )
-        .await
-        .map(|(_completion, verdicts)| verdicts);
+        .await;
 
-        let verdicts = match reviewed {
-            Ok(verdicts) => verdicts,
+        let (verdicts, total_usage, any_reviewed) = match batch_reviewed {
+            Ok((completion, verdicts)) => (verdicts, completion.usage, true),
+            Err(batch_err) if variants.len() > 1 => {
+                let mut isolated_verdicts = Vec::new();
+                let mut agg_usage = TokenUsage::default();
+                let mut has_usage = false;
+                let mut reviewed_any = false;
+                for variant in &variants {
+                    let single_prompt =
+                        build_grounding_prompt(source, std::slice::from_ref(variant));
+                    match complete_with_contract(
+                        registry,
+                        &single_prompt,
+                        JobKind::Other,
+                        COMPLETION_TIMEOUT,
+                        |completion| {
+                            parse_grounding(&completion.text)
+                                .context("the grounding answer is off-contract")
+                        },
+                    )
+                    .await
+                    {
+                        Ok((completion, mut v)) => {
+                            reviewed_any = true;
+                            if let Some(u) = completion.usage {
+                                has_usage = true;
+                                agg_usage.input_tokens += u.input_tokens;
+                                agg_usage.output_tokens += u.output_tokens;
+                                agg_usage.reasoning_tokens += u.reasoning_tokens;
+                                agg_usage.cache_read_tokens += u.cache_read_tokens;
+                                agg_usage.cache_write_tokens += u.cache_write_tokens;
+                            }
+                            isolated_verdicts.append(&mut v);
+                        }
+                        Err(err) => {
+                            isolated_verdicts.push(autopilot_pipeline::GroundingVerdict {
+                                label: variant.label.clone(),
+                                supported: false,
+                                reason: format!("grounding review failed for variant: {err:#}"),
+                            });
+                        }
+                    }
+                }
+                if !reviewed_any {
+                    report.failed = true;
+                    record(
+                        report,
+                        journal,
+                        StageOutcome::new(
+                            "grounding",
+                            StageStatus::Error,
+                            format!(
+                                "grounding review unavailable — every draft withheld: {batch_err:#}"
+                            ),
+                        )
+                        .with_platform(platform),
+                    )
+                    .await?;
+                    continue;
+                }
+                (
+                    isolated_verdicts,
+                    if has_usage { Some(agg_usage) } else { None },
+                    true,
+                )
+            }
             Err(err) => {
                 // Fail-closed: a review that cannot run publishes nothing.
                 report.failed = true;
@@ -1623,19 +1739,26 @@ async fn stage_grounding<'a>(
                 continue;
             }
         };
+        let _ = any_reviewed;
 
         let supported = supported_labels(&verdicts);
+        let mut platform_kept = 0usize;
+        let platform_total = variants.len();
         for (candidate, variant) in approved
             .iter()
             .filter(|(candidate, _)| *candidate == platform)
         {
-            if supported.contains(&variant.label.as_str()) {
+            if supported
+                .iter()
+                .any(|label| label.trim().eq_ignore_ascii_case(&variant.label))
+            {
                 kept.push((*candidate, *variant));
+                platform_kept += 1;
                 continue;
             }
             let reason = verdicts
                 .iter()
-                .find(|verdict| verdict.label == variant.label)
+                .find(|verdict| verdict.label.trim().eq_ignore_ascii_case(&variant.label))
                 .map(|verdict| verdict.reason.clone())
                 .unwrap_or_else(|| "the reviewer did not vouch for this draft".to_string());
             record(
@@ -1662,13 +1785,10 @@ async fn stage_grounding<'a>(
             StageOutcome::new(
                 "grounding",
                 StageStatus::Ok,
-                format!(
-                    "{} of {} draft(s) grounded in the source",
-                    kept.len(),
-                    approved.len()
-                ),
+                format!("{platform_kept} of {platform_total} draft(s) grounded in the source"),
             )
-            .with_platform(platform),
+            .with_platform(platform)
+            .with_usage(total_usage),
         )
         .await?;
     }

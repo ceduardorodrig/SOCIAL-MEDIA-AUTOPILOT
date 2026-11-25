@@ -35,11 +35,13 @@ pub fn build_reply_prompt(persona: &PersonaPack, candidate: &Candidate) -> Strin
         CandidateKind::Proactive => {
             "\n\
              You are joining a stranger's conversation to CONTRIBUTE, never to advertise.\n\
-             Reply only if you can add something specific about the post above.\n\
+             Reply only if you can add something specific about the post below.\n\
              Anchor the reply to what the post actually says, so it reads as a reply and not\n\
              as a fragment: do not open with a bare assertion about the topic.\n\
-             Never state a specific you cannot ground in the post or in general knowledge you\n\
-             are certain of. A wrong detail costs more than a plainer sentence.\n\
+             Never introduce external dates, versions, laws, court cases, benchmarks, or\n\
+             numbers that are not explicitly in the post below — the fact-checker rejects any\n\
+             unverified external claim. Stay strictly within what the post says or share a\n\
+             brief observation or question about it.\n\
              Write plain text only: no code, no markdown.\n"
         }
         _ => "",
@@ -53,14 +55,14 @@ pub fn build_reply_prompt(persona: &PersonaPack, candidate: &Candidate) -> Strin
          Style rules:\n{guidelines}\n\
          Never use these phrases: {banned}\n\
          Never touch these topics: {blocklist}\n\n\
-         {author} wrote ({kind}):\n\"{parent}\"\n\n\
-         Reply to THAT specific post: engage with its actual point and add something\n\
-         (a fact, a correction, a concrete experience or a real question), staying in context.\n\
+         Reply to the specific post below: engage with its actual point and add something\n\
+         (a concrete observation, a nuance from the post, or a real question), staying in context.\n\
          Quality bar: never send a generic acknowledgement (\"Thanks!\", \"Great post!\"),\n\
          never agree without adding anything, and never turn the reply into a plug.\n\
          Never include a link, never name or mention our own account ({display_name}),\n\
          never add hashtags. Reply with the plain text only — no quotes, no markdown —\n\
-         at most {limit} characters.{proactive}",
+         at most {limit} characters.{proactive}\n\n\
+         {author} wrote ({kind}):\n\"{parent}\"",
         language = persona.language,
         display_name = persona.display_name,
         niche = persona.niche,
