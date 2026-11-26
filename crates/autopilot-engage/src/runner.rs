@@ -618,11 +618,7 @@ struct Execution<'a> {
 impl Execution<'_> {
     /// Perform every planned action, jittered and state-recorded, stopping cleanly
     /// before the runtime budget expires (HB-127).
-    async fn perform_all(
-        &mut self,
-        chosen: &Plan,
-        notes: &mut Vec<String>,
-    ) -> Vec<ExecutedAction> {
+    async fn perform_all(&mut self, chosen: &Plan, notes: &mut Vec<String>) -> Vec<ExecutedAction> {
         let mut executed = Vec::new();
         for (index, action) in chosen.actions.iter().enumerate() {
             let action_margin = match action {
