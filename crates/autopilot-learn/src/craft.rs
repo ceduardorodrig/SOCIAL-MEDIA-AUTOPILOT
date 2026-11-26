@@ -609,8 +609,8 @@ const SIGNATURE_GRAM: usize = 3;
 
 /// Nouns that mark a listicle headline (EN, PT-BR, ES).
 const LISTICLE_NOUNS: [&str; 17] = [
-    "things", "ways", "tips", "reasons", "facts", "lessons", "tricks", "steps", "coisas",
-    "formas", "dicas", "razoes", "razões", "licoes", "lições", "passos", "cosas",
+    "things", "ways", "tips", "reasons", "facts", "lessons", "tricks", "steps", "coisas", "formas",
+    "dicas", "razoes", "razões", "licoes", "lições", "passos", "cosas",
 ];
 
 /// Templated openers that mark machine-written copy (EN, PT-BR, ES). These overlap

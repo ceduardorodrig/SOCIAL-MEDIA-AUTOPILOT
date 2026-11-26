@@ -672,9 +672,18 @@ async fn run_status(args: StatusArgs) -> Result<ExitCode> {
                 if let Some(u) = ev.get("usage") {
                     in_tok += u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                     out_tok += u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    reason_tok += u.get("reasoning_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    cache_read_tok += u.get("cache_read_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    cache_write_tok += u.get("cache_write_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    reason_tok += u
+                        .get("reasoning_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    cache_read_tok += u
+                        .get("cache_read_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    cache_write_tok += u
+                        .get("cache_write_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                 }
             }
             if file_in_window {
@@ -874,21 +883,20 @@ async fn run_personas(command: PersonasCommand) -> Result<ExitCode> {
                         );
                     }
                     let handle = ch.handle.trim().to_ascii_lowercase();
-                    if !handle.is_empty() {
-                        if let Some(prev) = seen_handles
+                    if !handle.is_empty()
+                        && let Some(prev) = seen_handles
                             .insert((ch.platform.as_str(), handle.clone()), p.persona.clone())
-                            && prev != p.persona
-                        {
-                            issues.push((
-                                p.persona.clone(),
-                                ValidationIssue {
-                                    field: format!("channels[{}].handle", ch.platform.as_str()),
-                                    problem: format!(
-                                        "handle `{handle}` is already used by persona `{prev}`"
-                                    ),
-                                },
-                            ));
-                        }
+                        && prev != p.persona
+                    {
+                        issues.push((
+                            p.persona.clone(),
+                            ValidationIssue {
+                                field: format!("channels[{}].handle", ch.platform.as_str()),
+                                problem: format!(
+                                    "handle `{handle}` is already used by persona `{prev}`"
+                                ),
+                            },
+                        ));
                     }
                 }
             }

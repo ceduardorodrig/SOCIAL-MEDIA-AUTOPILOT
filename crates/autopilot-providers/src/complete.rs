@@ -49,6 +49,10 @@ pub struct Completion {
     pub model: String,
     pub text: String,
     pub usage: Option<TokenUsage>,
+    /// Why every provider ahead of this one was passed over, in priority order.
+    /// Empty when the first provider answered. Without it a fallback that saves
+    /// the run also hides the quota cap that made it necessary (HB-116).
+    pub skipped: Vec<String>,
 }
 
 /// Short, bounded pause before re-calling a provider that answered 5xx.
@@ -171,6 +175,7 @@ impl FailureClass {
 #[derive(Debug, Clone)]
 pub struct ProviderFailure {
     pub provider_id: String,
+    pub model: String,
     pub kind: ProviderKind,
     pub class: FailureClass,
     pub status: Option<u16>,
@@ -182,6 +187,7 @@ impl ProviderFailure {
     fn new(cfg: &ProviderConfig, class: FailureClass, message: String) -> Self {
         Self {
             provider_id: cfg.id.clone(),
+            model: cfg.model.clone(),
             kind: cfg.kind,
             class,
             status: None,
@@ -225,10 +231,11 @@ impl fmt::Display for ProviderFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}: {} — kind={}",
+            "{}: {} — kind={}, model={}",
             self.provider_id,
             self.class.headline(),
-            self.kind.as_str()
+            self.kind.as_str(),
+            self.model
         )?;
         if let Some(status) = self.status {
             write!(f, ", HTTP {status}")?;
@@ -338,6 +345,7 @@ pub async fn complete_with_contract<T>(
                         model: provider.model.clone(),
                         text,
                         usage,
+                        skipped: failures.clone(),
                     };
                     match validate(&completion) {
                         Ok(value) => return Ok((completion, value)),
@@ -348,12 +356,15 @@ pub async fn complete_with_contract<T>(
                                 tokio::time::sleep(SERVER_ERROR_BACKOFF).await;
                                 continue;
                             }
-                            failures.push(format!(
-                                "{} ({}): off-contract answer: {err:#} [contract: re-asked once, then advanced; answer: {}]",
-                                completion.provider_id,
-                                completion.model,
-                                answer_preview(&completion.text)
-                            ));
+                            pass_over(
+                                &mut failures,
+                                format!(
+                                    "{} ({}): off-contract answer: {err:#} [contract: re-asked once, then advanced; answer: {}]",
+                                    completion.provider_id,
+                                    completion.model,
+                                    answer_preview(&completion.text)
+                                ),
+                            );
                             break;
                         }
                     }
@@ -366,7 +377,10 @@ pub async fn complete_with_contract<T>(
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    failures.push(format!("{failure} [{}]", failure.class.action_note()));
+                    pass_over(
+                        &mut failures,
+                        format!("{failure} [{}]", failure.class.action_note()),
+                    );
                     break;
                 }
             }
@@ -374,6 +388,13 @@ pub async fn complete_with_contract<T>(
     }
 
     bail!("every provider failed -> {}", failures.join(" | "))
+}
+
+/// Record why a provider was passed over, and say so on stderr (the systemd
+/// journal) at once: the aggregate error only exists when the whole chain fails.
+fn pass_over(failures: &mut Vec<String>, reason: String) {
+    eprintln!("providers: passed over {reason}");
+    failures.push(reason);
 }
 
 /// Extract per-call token usage from `step_finish` events emitted by `opencode run --format json`.
@@ -1185,6 +1206,39 @@ mod tests {
 
         fn as_json(completion: &Completion) -> anyhow::Result<serde_json::Value> {
             serde_json::from_str::<serde_json::Value>(&completion.text).map_err(anyhow::Error::from)
+        }
+
+        #[tokio::test]
+        async fn a_429_names_status_and_model_and_the_chain_advances() {
+            let capped = StubCli::new(
+                "capped",
+                &format!("echo hit >> \"$0.hits\"\necho '{QUOTA_EVENT}'\nexit 1"),
+            );
+            let fallback = counting_stub("after-cap", "ok");
+            warm(&capped).await;
+            warm(&fallback).await;
+            let registry = ProvidersConfig {
+                providers: vec![
+                    pinned(&capped, "opencode-capped", 10),
+                    pinned(&fallback, "opencode-fallback", 20),
+                ],
+            };
+
+            let completion =
+                complete_with_chain(&registry, "hi", JobKind::Triage, Duration::from_secs(5))
+                    .await
+                    .expect("the chain advances past a quota cap");
+
+            assert_eq!(completion.provider_id, "opencode-fallback");
+            assert_eq!(hits(&capped), 1, "a quota cap is not retried");
+            assert_eq!(hits(&fallback), 1);
+            assert_eq!(completion.skipped.len(), 1, "{:?}", completion.skipped);
+            let reason = &completion.skipped[0];
+            assert!(reason.contains("HTTP 429"), "status missing: {reason}");
+            assert!(
+                reason.contains("model=test/model"),
+                "model missing: {reason}"
+            );
         }
 
         #[tokio::test]
