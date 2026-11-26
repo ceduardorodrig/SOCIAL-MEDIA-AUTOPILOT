@@ -840,6 +840,21 @@ pub async fn run(options: RunOptions) -> Result<RunReport> {
     };
 
     let mut topics = stage_harvest(&mut report, &journal, &options, &query).await?;
+    if topics.is_empty() && options.query.is_none() && !options.dry_run {
+        let queries = persona.harvest_queries();
+        let start = rotation_offset(&report.run_id);
+        for offset in 1..queries.len() {
+            if let Some(alt_query) = select_harvest_query(&queries, start + offset)
+                && alt_query != query
+            {
+                let alt_topics = stage_harvest(&mut report, &journal, &options, alt_query).await?;
+                if !alt_topics.is_empty() {
+                    topics = alt_topics;
+                    break;
+                }
+            }
+        }
+    }
 
     // A dry run never calls an LLM, the GPU, the network or a publisher: it only
     // describes the decisions the live run would take.
@@ -1261,7 +1276,8 @@ async fn stage_triage(
                     "no candidate scored >= {} (best {:.2}); nothing to publish",
                     persona.rubric.min_score, best
                 ),
-            ),
+            )
+            .with_usage(completion.usage.clone()),
         )
         .await?;
         return Ok(None);
